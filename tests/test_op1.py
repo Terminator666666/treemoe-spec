@@ -1,0 +1,117 @@
+"""Task 2.1: op1/op3 reference behaviour + Triton parity (12 cases, plan §Task 2.1)."""
+
+import pytest
+import torch
+
+from tests.conftest import make_moe_inputs
+from treemoe.ref.tree_moe_ref import (
+    budget_route_ref,
+    route_and_bucket_ref,
+    tree_moe_forward_ref,
+)
+
+N, E, H, I = 64, 8, 64, 128
+
+
+# ---------------- budget routing (op3) ----------------
+
+@pytest.mark.parametrize("budget", [2, 4, 8])
+def test_budget_route_respects_budget(rng, budget):
+    gates = torch.softmax(torch.randn(N, E, generator=rng), dim=-1)
+    accept = torch.rand(N, generator=rng)
+    ids, g = budget_route_ref(gates, accept, budget)
+    assert ids.unique().numel() <= budget
+    assert torch.allclose(g.sum(-1), torch.ones(N), atol=1e-5)
+
+
+def test_budget_route_b8_is_identity_topk(rng):
+    """B=8 (lossless mode) must reproduce plain top-2 routing."""
+    gates = torch.softmax(torch.randn(N, E, generator=rng), dim=-1)
+    accept = torch.ones(N)  # no degradation branch
+    ids, g = budget_route_ref(gates, accept, 8)
+    ref_g, ref_ids = gates.topk(2, dim=-1)
+    assert torch.equal(ids.sort(-1).values, ref_ids.sort(-1).values)
+    assert torch.allclose(g, torch.softmax(ref_g, dim=-1), atol=1e-5)
+
+
+def test_low_prob_nodes_degrade_to_top1(rng):
+    gates = torch.softmax(torch.randn(N, E, generator=rng), dim=-1)
+    accept = torch.zeros(N)  # everything below tau
+    _, g = budget_route_ref(gates, accept, 8)
+    assert torch.equal(g[:, 1], torch.zeros(N))
+    assert torch.equal(g[:, 0], torch.ones(N))
+
+
+# ---------------- bucketing (kernel A semantics) ----------------
+
+def test_bucket_offsets_and_stability(rng):
+    x, w1, w2, w3, router, accept = make_moe_inputs(N, E, H, I, rng)
+    ids, _, slots, offsets = route_and_bucket_ref(x, router, accept, 8)
+    assert offsets[-1] == 2 * N
+    flat = ids.reshape(-1)
+    for e in range(E):
+        seg = slots[offsets[e] : offsets[e + 1]]
+        assert (flat[seg] == e).all()
+        tokens = seg // 2
+        assert (tokens.diff() >= 0).all()  # DFS order preserved inside expert
+
+
+def test_bucket_all_tokens_one_expert(rng):
+    """Extreme case: router forces every token to experts {0,1}."""
+    x, w1, w2, w3, router, accept = make_moe_inputs(N, E, H, I, rng)
+    router[0] += 100.0
+    router[1] += 50.0
+    _, _, _, offsets = route_and_bucket_ref(x, router, accept, 8)
+    assert offsets[1] - offsets[0] == N and offsets[2] - offsets[1] == N
+    assert offsets[2] == offsets[-1]
+
+
+# ---------------- full forward (ref self-consistency) ----------------
+
+def test_ref_forward_matches_naive_at_b8(rng):
+    """B=8 reference must equal the plain HF-style per-expert loop."""
+    import torch.nn.functional as F
+
+    x, w1, w2, w3, router, _ = make_moe_inputs(N, E, H, I, rng)
+    accept = torch.ones(N)
+    out = tree_moe_forward_ref(x, w1, w2, w3, router, accept, 8)
+
+    logits = F.linear(x, router)
+    gates = torch.softmax(logits, dim=-1)
+    topg, topi = gates.topk(2, dim=-1)
+    topg = topg / topg.sum(-1, keepdim=True)
+    naive = torch.zeros_like(x)
+    for e in range(E):
+        for k in range(2):
+            sel = topi[:, k] == e
+            if sel.any():
+                xe = x[sel]
+                h = F.silu(xe @ w1[e].t()) * (xe @ w3[e].t())
+                naive[sel] += (h @ w2[e].t()) * topg[sel, k : k + 1]
+    assert torch.allclose(out, naive, rtol=1e-4, atol=1e-5)
+
+
+def test_empty_expert_contributes_nothing(rng):
+    x, w1, w2, w3, router, accept = make_moe_inputs(N, E, H, I, rng)
+    router[7] -= 100.0  # expert 7 never routed
+    w1[7] = float("nan")  # would poison output if touched
+    w3[7] = float("nan")
+    out = tree_moe_forward_ref(x, w1, w2, w3, router, torch.ones(N), 7)
+    assert not out.isnan().any()
+
+
+# ---------------- Triton parity (GPU only) ----------------
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("n", [32, 64, 128])
+@pytest.mark.parametrize("budget", [4, 8])
+def test_triton_matches_ref(n, budget):
+    from treemoe.kernels.op1_tree_moe import tree_moe_forward
+
+    g = torch.Generator().manual_seed(7)
+    x, w1, w2, w3, router, accept = make_moe_inputs(n, 8, 4096, 14336, g, dtype=torch.bfloat16)
+    x, w1, w2, w3 = (t.cuda() for t in (x, w1, w2, w3))
+    router, accept = router.cuda(), accept.cuda()
+    out = tree_moe_forward(x, w1, w2, w3, router, accept, budget)
+    ref = tree_moe_forward_ref(x, w1, w2, w3, router, accept, budget)
+    torch.testing.assert_close(out.float(), ref.float(), rtol=1e-3, atol=1e-2)
