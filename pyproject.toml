@@ -1,0 +1,30 @@
+[project]
+name = "treemoe-spec"
+version = "0.1.0"
+description = "TreeMoE-Spec: tree-aware MoE speculative decoding framework (Mixtral-8x7B + EAGLE-2)"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.5",
+    "triton>=3.0",
+    "transformers>=4.44",
+    "safetensors>=0.4",
+    "numpy",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "matplotlib"]
+bench = ["vllm", "megablocks"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: requires a CUDA GPU",
+    "model: requires downloaded Mixtral/EAGLE weights",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["treemoe*"]
