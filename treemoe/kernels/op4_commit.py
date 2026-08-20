@@ -110,7 +110,13 @@ if HAS_TRITON:
             start = tl.load(child_start_ptr + node)
             accepted = -1
             for j in range(0, n_kids):
-                c = tl.load(child_list_ptr + start + j)
+                # .to(int32): keep the loop-carried `accepted`/`node` scalars at a
+                # fixed int32 type — mixing the i64 load into tl.where would flip
+                # the carried type and break the sm_90 compile (found by AOT
+                # compile in benchmarks/static_analysis.py; interpreter mode is
+                # too permissive to catch it). Node ids < 2N=128, int32 is safe;
+                # tl.store casts back to the i64 buffers.
+                c = tl.load(child_list_ptr + start + j).to(tl.int32)
                 tok = tl.load(tree_tokens_ptr + c)
                 hit = (tok == target_top) & (accepted < 0)
                 accepted = tl.where(hit, c, accepted)

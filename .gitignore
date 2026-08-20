@@ -7,3 +7,4 @@ measurements/data/*.pt
 measurements/data/*.png
 checkpoints/
 .pytest_cache/
+build/

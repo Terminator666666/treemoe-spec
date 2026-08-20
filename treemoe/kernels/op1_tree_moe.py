@@ -35,8 +35,13 @@ _INTERPRET = os.getenv("TRITON_INTERPRET", "0") == "1"
 from treemoe.ref.tree_moe_ref import budget_route_ref, tree_moe_forward_ref
 
 BM = 16    # slot rows per block (M is tiny: <=16 tokens/expert typically)
-BN = 128   # intermediate/out columns per block
-BK = 128   # reduction tile
+# Per-GEMM tiles, chosen by GPU-less static analysis (benchmarks/static_analysis.py:
+# AOT compile for sm_90a + ptxas -v register counts -> theoretical occupancy).
+# Both GEMMs are memory-bound streams; occupancy = latency hiding = bandwidth.
+BN1 = 128  # gemm1 N over I=14336
+BK1 = 64   # gemm1 K over H:  BK 128->64 cuts regs 232->168, occ 12%->19%
+BN2 = 64   # gemm2 N over H:  BN 128->64 cuts regs 150->96,  occ 19%->31%
+BK2 = 128  # gemm2 K over I (within split-K segment)
 SPLIT_K = 8
 
 
@@ -431,11 +436,11 @@ def tree_moe_forward(
 
     # per-shape tile params: tiny interpreter configs (H=64, I=128) must not
     # read past the reduction dim; tl.dot still needs K>=16
-    bk = BK if hidden % BK == 0 else hidden
-    bn1 = BN if inter % BN == 0 else inter          # gemm1 N-dim = I
-    bn2 = BN if hidden % BN == 0 else hidden        # gemm2/combine N-dim = H
+    bk1 = BK1 if hidden % BK1 == 0 else hidden
+    bn1 = BN1 if inter % BN1 == 0 else inter        # gemm1 N-dim = I
+    bn2 = BN2 if hidden % BN2 == 0 else hidden      # gemm2/combine N-dim = H
     seg = inter // SPLIT_K
-    bk2 = min(BK, seg) if seg % min(BK, seg) == 0 else seg
+    bk2 = min(BK2, seg) if seg % min(BK2, seg) == 0 else seg
 
     max_bpe = (2 * n + BM - 1) // BM
     # fused Kernel A: single-CTA route+bucket (1 launch vs ~8 torch ops);
@@ -447,9 +452,12 @@ def tree_moe_forward(
             ws.topk_flat, ws.gates_flat, ws.padded_slots,
             ws.block_expert_ids, ws.slot_to_row,
             expert_budget, 0.05,
-            N=n, E=e, EP=16, H=hidden, BK=bk,
+            N=n, E=e, EP=16, H=hidden, BK=bk1,
             MAX_BPE=max_bpe, BLOCK_M=BM, MAX_BLOCKS=ws.max_blocks,
-            num_warps=4,
+            # 32 warps: ptxas shows the O((2N)^2) rank matrix spills 7.6KB/thread
+            # at 4 warps; spreading it over 1024 threads -> regs 255->64,
+            # spill -> ~1KB (static_analysis.py sweep). Single-CTA latency win.
+            num_warps=32,
         )
         gates_flat = ws.gates_flat
         padded_slots, block_expert_ids = ws.padded_slots, ws.block_expert_ids
@@ -466,7 +474,7 @@ def tree_moe_forward(
     grid1 = (max_blocks, inter // bn1)
     _moe_gemm1_kernel[grid1](
         x, w1, w3, ws.h, padded_slots, block_expert_ids,
-        H=hidden, I=inter, BLOCK_M=BM, BLOCK_N=bn1, BLOCK_K=bk,
+        H=hidden, I=inter, BLOCK_M=BM, BLOCK_N=bn1, BLOCK_K=bk1,
         num_warps=4, num_stages=4,
     )
     grid2 = (max_blocks, hidden // bn2, SPLIT_K)
