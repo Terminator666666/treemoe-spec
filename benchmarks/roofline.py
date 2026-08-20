@@ -37,7 +37,7 @@ BYTES_W = 2                 # experts stay native BF16 (project mandate)
 # tree / engine shape
 N = 64          # tree nodes
 D = 6           # tree depth (draft steps)
-SPLIT_K = 8     # deterministic split-K partial factor (op1)
+SPLIT_K = 4     # deterministic split-K partial factor (op1)
 
 # per-layer weight bytes
 EXPERT_B = 3 * I * H * BYTES_W                 # w1+w2+w3 of ONE expert  (352MB)

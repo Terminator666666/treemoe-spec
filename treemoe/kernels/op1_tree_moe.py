@@ -38,11 +38,14 @@ BM = 16    # slot rows per block (M is tiny: <=16 tokens/expert typically)
 # Per-GEMM tiles, chosen by GPU-less static analysis (benchmarks/static_analysis.py:
 # AOT compile for sm_90a + ptxas -v register counts -> theoretical occupancy).
 # Both GEMMs are memory-bound streams; occupancy = latency hiding = bandwidth.
-BN1 = 128  # gemm1 N over I=14336
-BK1 = 64   # gemm1 K over H:  BK 128->64 cuts regs 232->168, occ 12%->19%
-BN2 = 64   # gemm2 N over H:  BN 128->64 cuts regs 150->96,  occ 19%->31%
+BN1 = 64   # gemm1 N over I=14336
+BK1 = 64   # gemm1 K over H (with nw=8/ns=3: regs 232->102, occ 12%->25%)
+BN2 = 32   # gemm2 N over H:  regs 150->56, occ 19%->56%; rows stay 256B coalesced
 BK2 = 128  # gemm2 K over I (within split-K segment)
-SPLIT_K = 8
+# SPLIT_K 8->4 halves the fp32 partial round-trip (1.07 -> 0.54 GB/step at
+# Mixtral shapes, roofline.py) — identical regs/occupancy, and the worst-case
+# grid (B=2: 8 m-blocks x H/BN2 x 4 = 4096 CTAs) still fills 132 SMs
+SPLIT_K = 4
 
 
 # --------------------------------------------------------------------------
@@ -186,11 +189,16 @@ if HAS_TRITON:
         tl.store(slot_to_row_ptr + slots, dest)
 
         # padded_slots as an inverse scatter computed in registers: one plain
-        # store pass, no -1 prefill + barrier (cross-lane store races)
-        pos = tl.arange(0, MAX_BLOCKS * BLOCK_M).to(tl.int64)
-        hit = pos[:, None] == dest[None, :]                   # [R, 2N]
-        val = tl.sum(tl.where(hit, slots[None, :] + 1, 0), axis=1) - 1  # -1 if no slot
-        tl.store(padded_slots_ptr + pos, val.to(tl.int64))
+        # store pass, no -1 prefill + barrier (cross-lane store races).
+        # BLOCKED over the padded-row space: the monolithic [R, 2N] hit matrix
+        # (131072 lanes at R=1024) was the top ptxas spill source (7.6KB/thread
+        # at 4 warps); RB=2N rows per iteration keeps the live set at [2N, 2N]
+        RB: tl.constexpr = 2 * N
+        for r0 in range(0, MAX_BLOCKS * BLOCK_M, RB):
+            pos = (r0 + tl.arange(0, RB)).to(tl.int64)
+            hit = pos[:, None] == dest[None, :]               # [RB, 2N]
+            val = tl.sum(tl.where(hit, slots[None, :] + 1, 0), axis=1) - 1
+            tl.store(padded_slots_ptr + pos, val.to(tl.int64))
 
         # ---- 6. per-block expert ids (blocks past ceil(count/BM) masked -1) ----
         counts = tl.sum((fe[None, :] == offs_e[:, None]).to(tl.int32), axis=1)  # [EP]
@@ -475,7 +483,9 @@ def tree_moe_forward(
     _moe_gemm1_kernel[grid1](
         x, w1, w3, ws.h, padded_slots, block_expert_ids,
         H=hidden, I=inter, BLOCK_M=BM, BLOCK_N=bn1, BLOCK_K=bk1,
-        num_warps=4, num_stages=4,
+        # nw=8/ns=3 (ptxas sweep): 102 regs, zero spill, 25% occupancy — the
+        # zero-spill config with the fewest regs at the 4-CTA/SM tier
+        num_warps=8, num_stages=3,
     )
     grid2 = (max_blocks, hidden // bn2, SPLIT_K)
     if deterministic:

@@ -102,7 +102,7 @@ def _mixtral_specs() -> list[Spec]:
              "H": "constexpr", "I": "constexpr", "BLOCK_M": "constexpr",
              "BLOCK_N": "constexpr", "BLOCK_K": "constexpr"},
             {"H": H, "I": I, "BLOCK_M": BM, "BLOCK_N": BN1, "BLOCK_K": BK1},
-            num_warps=4, num_stages=4, grid=(MAX_BLOCKS, I // BN1),
+            num_warps=8, num_stages=3, grid=(MAX_BLOCKS, I // BN1),
             note="dominant kernel: streams w1+w3 (2/3 of expert bytes)",
         ),
         Spec(
