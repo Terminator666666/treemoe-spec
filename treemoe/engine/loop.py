@@ -67,7 +67,7 @@ class SpecDecodeEngine:
         )
 
         # verification forward over the whole tree (root token occupies slot 0)
-        positions = root_pos + _depths(tree.parent)
+        positions = root_pos + _depths(tree.parent, self.max_depth)
         logits, hidden = self.target.forward(
             tree.tokens.clamp(min=0), positions,
             tree_mask=tree.attn_mask, return_hidden=True,
@@ -79,13 +79,20 @@ class SpecDecodeEngine:
             kv=kv, temperature=self.temperature, max_depth=self.max_depth,
         )
 
-        num = int(res.num_accepted)
-        accepted = [int(t) for t in res.accepted_tokens[:num]]
-        new_tokens = accepted + [int(res.bonus_token)]
+        # next root feature = penultimate hidden at the last accepted node (spec
+        # §3.4 step 6) — pure tensor indexing, stays on GPU. num==0 falls back
+        # to slot 0 (root): accepted_slots[0] is -1 then, clamp restores 0.
+        last_idx = (res.num_accepted - 1).clamp(min=0)
+        next_feature = hidden[res.accepted_slots[last_idx].clamp(min=0)]
+        self._last_token_gpu = res.bonus_token  # generate() reuses, no re-upload
 
-        # next root feature = penultimate hidden at the last accepted node (spec §3.4 step 6)
-        last_slot = int(res.accepted_slots[num - 1]) if num > 0 else 0
-        next_feature = hidden[last_slot]
+        # ONE device->host copy for everything the host actually needs
+        # (token ids for output/EOS). The old code did 3+num tiny syncs.
+        vals = torch.cat([
+            res.num_accepted.view(1), res.bonus_token.view(1), res.accepted_tokens,
+        ]).tolist()
+        num = vals[0]
+        new_tokens = vals[2:2 + num] + [vals[1]]
 
         self.stats.steps += 1
         self.stats.tokens += len(new_tokens)
@@ -101,15 +108,21 @@ class SpecDecodeEngine:
         while len(out) < max_new_tokens:
             new_tokens, feature = self.step(last, feature)
             out.extend(new_tokens)
-            last = torch.tensor(out[-1], device=prompt_ids.device)
+            # new_tokens[-1] is always the bonus token, which step() kept on
+            # GPU — no host->device re-upload per step
+            last = self._last_token_gpu
             if eos_token_id in new_tokens:
                 break
         return out[:max_new_tokens]
 
 
-def _depths(parent: torch.Tensor) -> torch.Tensor:
+def _depths(parent: torch.Tensor, max_depth: int) -> torch.Tensor:
+    """Node depths by level propagation: d[i] = d[parent[i]] + 1 repeated
+    max_depth times (BFS order converges level by level). Pure tensor ops —
+    the old per-element loop cost 2N tiny GPU->CPU syncs per step."""
+    root = parent < 0
+    safe_parent = parent.clamp(min=0)
     d = torch.zeros_like(parent)
-    for i in range(1, parent.shape[0]):
-        p = int(parent[i])
-        d[i] = d[p] + 1 if p >= 0 else 0
+    for _ in range(max_depth):
+        d = torch.where(root, 0, d[safe_parent] + 1)
     return d
