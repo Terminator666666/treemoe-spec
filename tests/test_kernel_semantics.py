@@ -145,3 +145,103 @@ def test_greedy_all_negative_logits():
         logits.argmax(-1), tokens, children, 6
     )
     assert sim_count == 2 and sim_bonus == 7
+
+
+# ---------------- fused Kernel A: register-level algorithm simulation ----------------
+
+def _simulate_fused_route_bucket(x, router, accept, budget, tau=0.05, ep=16):
+    """Line-by-line torch port of _route_bucket_fused_kernel (op1_tree_moe.py)."""
+    n = x.shape[0]
+    e = router.shape[0]
+    max_bpe = (2 * n + BM - 1) // BM
+    max_blocks = e * max_bpe
+
+    logits = torch.full((n, ep), float("-inf"))
+    logits[:, :e] = x.float() @ router.t().float()
+    gates = torch.softmax(logits, dim=-1)                       # pad lanes -> 0
+
+    scores = (accept[:, None] * gates).sum(0)
+    scores[e:] = float("-inf")
+    keep = torch.zeros(ep, dtype=torch.bool)
+    for i in range(e):                                           # first-occurrence top-B
+        cand = torch.where(keep, torch.tensor(float("-inf")), scores)
+        am = int(cand.argmax())
+        if i < budget:
+            keep[am] = True
+
+    mg = torch.where(keep[None, :], gates, torch.zeros(()))
+    i1 = mg.argmax(1)
+    g1 = mg.max(1).values
+    mg2 = mg.clone()
+    mg2[torch.arange(n), i1] = 0.0
+    i2 = mg2.argmax(1)
+    g2 = mg2.max(1).values
+    s = g1 + g2
+    tg1, tg2 = g1 / s, g2 / s
+    degrade = accept < tau
+    tg1 = torch.where(degrade, torch.ones(()), tg1)
+    tg2 = torch.where(degrade, torch.zeros(()), tg2)
+
+    slots = torch.arange(2 * n)
+    fe = torch.stack([i1, i2], dim=1).reshape(-1)                # tl.interleave
+    eq = fe[:, None] == fe[None, :]
+    lower = slots[None, :] < slots[:, None]
+    rank = (eq & lower).sum(1)
+    dest = fe * (max_bpe * BM) + rank
+
+    pos = torch.arange(max_blocks * BM)
+    hit = pos[:, None] == dest[None, :]
+    padded = (hit * (slots[None, :] + 1)).sum(1) - 1             # -1 where no slot
+
+    counts = (fe[None, :] == torch.arange(ep)[:, None]).sum(1)
+    blocks_needed = (counts + BM - 1) // BM
+    blk = torch.arange(max_blocks)
+    need = blocks_needed[blk // max_bpe]
+    used = (blk % max_bpe) < need
+    blk_ids = torch.where(used, blk // max_bpe, torch.full((), -1, dtype=torch.long))
+    topk_flat = torch.stack([i1, i2], dim=1).reshape(-1)
+    gates_flat = torch.stack([tg1, tg2], dim=1).reshape(-1)
+    return topk_flat, gates_flat, padded, blk_ids, dest
+
+
+@pytest.mark.parametrize("budget", [2, 4, 8])
+def test_fused_kernel_a_sim_matches_torch_composition(rng, budget):
+    x, _, _, _, router, accept = make_moe_inputs(N, E, H, I, rng)
+    topk_f, gates_f, padded_f, blk_f, dest_f = _simulate_fused_route_bucket(
+        x, router, accept, budget
+    )
+    ids_t, gates_t, padded_t, blk_t, s2r_t, _ = route_and_bucket(x, router, accept, budget)
+    assert torch.equal(topk_f, ids_t.reshape(-1))
+    assert torch.allclose(gates_f, gates_t.reshape(-1).float(), atol=1e-6)
+    assert torch.equal(padded_f, padded_t)
+    assert torch.equal(blk_f, blk_t)
+    assert torch.equal(dest_f, s2r_t)
+
+
+def test_fused_kernel_a_sim_degrade_branch(rng):
+    x, _, _, _, router, _ = make_moe_inputs(N, E, H, I, rng)
+    accept = torch.zeros(N)  # all below tau -> top-1 gates [1, 0]
+    _, gates_f, _, _, _ = _simulate_fused_route_bucket(x, router, accept, 8)
+    assert torch.equal(gates_f.reshape(N, 2)[:, 0], torch.ones(N))
+    assert torch.equal(gates_f.reshape(N, 2)[:, 1], torch.zeros(N))
+
+
+# ---------------- op4 online softmax: blockwise rescaling simulation ----------------
+
+@pytest.mark.parametrize("vb", [4, 16, 64])
+def test_online_softmax_sim_matches_torch(vb):
+    """Port of the Milakov-Gimelshein online pass in _postprocess_softmax_kernel:
+    running max with sum rescaling must equal torch.softmax on any block size."""
+    g = torch.Generator().manual_seed(3)
+    v = 100  # deliberately not a multiple of vb (exercises the mask path)
+    logits = torch.randn(v, generator=g) * 10
+    vmax, vsum = -1e38, 0.0
+    for v0 in range(0, v, vb):
+        blk = logits[v0 : v0 + vb]
+        nmax = max(vmax, float(blk.max()))
+        vsum = vsum * torch.exp(torch.tensor(vmax - nmax)).item() + float(
+            torch.exp(blk - nmax).sum()
+        )
+        vmax = nmax
+    probs = torch.exp(logits - vmax) / vsum
+    torch.testing.assert_close(probs, torch.softmax(logits, -1), rtol=1e-5, atol=1e-7)

@@ -52,19 +52,22 @@ if HAS_TRITON:
             lg = tl.where(lg > 0, lg / rep_penalty, lg * rep_penalty)
             tl.store(logits_ptr + base + t, lg)
 
-        # pass 1: max
-        vmax = -float("inf")
-        for v0 in range(0, V, VB):
-            offs = v0 + tl.arange(0, VB)
-            x = tl.load(logits_ptr + base + offs, mask=offs < V, other=-float("inf"))
-            vmax = tl.maximum(vmax, tl.max(x / temperature, axis=0))
-        # pass 2: sum
+        # pass 1: ONLINE max+sum (Milakov-Gimelshein; FlashInfer sampling
+        # kernels use the same trick) — one vocab sweep instead of two:
+        # when the running max rises, rescale the accumulated sum.
+        # vmax init is FINITE: -inf would give exp(-inf - -inf) = NaN if a
+        # block is fully masked / all -inf
+        vmax = -1e38
         vsum = 0.0
         for v0 in range(0, V, VB):
             offs = v0 + tl.arange(0, VB)
             x = tl.load(logits_ptr + base + offs, mask=offs < V, other=-float("inf"))
-            vsum += tl.sum(tl.exp(x / temperature - vmax), axis=0)
-        # pass 3: normalize + store
+            x = x / temperature
+            bmax = tl.max(x, axis=0)
+            nmax = tl.maximum(vmax, bmax)
+            vsum = vsum * tl.exp(vmax - nmax) + tl.sum(tl.exp(x - nmax), axis=0)
+            vmax = nmax
+        # pass 2: normalize + store
         for v0 in range(0, V, VB):
             offs = v0 + tl.arange(0, VB)
             x = tl.load(logits_ptr + base + offs, mask=offs < V, other=-float("inf"))

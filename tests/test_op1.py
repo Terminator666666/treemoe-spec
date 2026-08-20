@@ -139,3 +139,37 @@ def test_triton_deterministic_bitwise():
             for _ in range(5)]
     for o in outs[1:]:
         assert torch.equal(o, outs[0])  # bitwise, not allclose
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("budget", [2, 4, 8])
+def test_fused_route_bucket_triton_matches_torch(budget):
+    """Fused single-CTA Kernel A vs the torch composition, on device."""
+    from treemoe.kernels.op1_tree_moe import (
+        BM, _route_bucket_fused_kernel, route_and_bucket,
+    )
+
+    g = torch.Generator().manual_seed(3)
+    n, e, h = 64, 8, 4096
+    x = torch.randn(n, h, generator=g, dtype=torch.bfloat16).cuda()
+    router = (torch.randn(e, h, generator=g, dtype=torch.bfloat16) * 0.1).cuda()
+    accept = torch.rand(n, generator=g).cuda()
+
+    ids_t, gates_t, padded_t, blk_t, s2r_t, max_blocks = route_and_bucket(
+        x, router, accept, budget
+    )
+    topk = torch.zeros(2 * n, dtype=torch.long, device="cuda")
+    gates = torch.zeros(2 * n, dtype=torch.float32, device="cuda")
+    padded = torch.full((max_blocks * BM,), -2, dtype=torch.long, device="cuda")
+    blk = torch.full((max_blocks,), -2, dtype=torch.long, device="cuda")
+    s2r = torch.zeros(2 * n, dtype=torch.long, device="cuda")
+    _route_bucket_fused_kernel[(1,)](
+        x, router, accept, topk, gates, padded, blk, s2r,
+        budget, 0.05, N=n, E=e, EP=16, H=h, BK=128,
+        MAX_BPE=(2 * n + BM - 1) // BM, BLOCK_M=BM, MAX_BLOCKS=max_blocks,
+    )
+    assert torch.equal(topk, ids_t.reshape(-1))
+    torch.testing.assert_close(gates, gates_t.reshape(-1).float(), rtol=1e-3, atol=1e-3)
+    assert torch.equal(padded, padded_t)
+    assert torch.equal(blk, blk_t)
+    assert torch.equal(s2r, s2r_t)

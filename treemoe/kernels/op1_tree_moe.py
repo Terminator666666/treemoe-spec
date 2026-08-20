@@ -94,6 +94,104 @@ def route_and_bucket(
 if HAS_TRITON:
 
     @triton.jit
+    def _route_bucket_fused_kernel(
+        x_ptr, router_ptr, accept_ptr,
+        topk_ids_ptr, gates_flat_ptr, padded_slots_ptr,
+        block_expert_ids_ptr, slot_to_row_ptr,
+        expert_budget, tau,
+        N: tl.constexpr, E: tl.constexpr, EP: tl.constexpr,   # EP = 16 (pow2 pad)
+        H: tl.constexpr, BK: tl.constexpr,
+        MAX_BPE: tl.constexpr, BLOCK_M: tl.constexpr, MAX_BLOCKS: tl.constexpr,
+    ):
+        """Kernel A v2: the whole route+bucket pipeline in ONE program.
+
+        Production precedent: vLLM fuses topk_softmax and moe_align_block_size
+        into single CUDA kernels (csrc/moe/) instead of chains of torch ops —
+        at decode batch sizes launch overhead rivals the math. This replaces
+        ~8 kernel launches per layer with 1.
+
+        Serial-friendly sizes: N<=128 nodes, E=8 experts; the O((2N)^2) stable
+        rank is a 128x128 vectorized comparison, trivial for one CTA.
+        """
+        offs_n = tl.arange(0, N)                  # tree nodes (N = pow2 tree size)
+        offs_e = tl.arange(0, EP)
+        e_valid = offs_e < E
+
+        # ---- 1. router GEMM, fp32 accumulate (HPC-Ops finding) ----
+        acc = tl.zeros((N, EP), dtype=tl.float32)
+        for k0 in range(0, H, BK):
+            ks = k0 + tl.arange(0, BK)
+            x_t = tl.load(x_ptr + offs_n[:, None] * H + ks[None, :]).to(tl.float32)
+            w_t = tl.load(router_ptr + offs_e[:, None] * H + ks[None, :],
+                          mask=e_valid[:, None], other=0.0).to(tl.float32)
+            acc += tl.dot(x_t, tl.trans(w_t))
+        logits = tl.where(e_valid[None, :], acc, -float("inf"))
+
+        # ---- 2. row softmax ----
+        rmax = tl.max(logits, axis=1)
+        expl = tl.exp(logits - rmax[:, None])
+        gates = expl / tl.sum(expl, axis=1)[:, None]          # [N, EP]
+
+        # ---- 3. op3 budget routing: acceptance-weighted expert demand ----
+        accept = tl.load(accept_ptr + offs_n).to(tl.float32)  # [N]
+        scores = tl.sum(accept[:, None] * gates, axis=0)      # [EP]
+        scores = tl.where(e_valid, scores, -float("inf"))
+        keep = tl.zeros((EP,), dtype=tl.int1)
+        for i in tl.static_range(E):                          # top-B, first-occurrence ties
+            cand = tl.where(keep, -float("inf"), scores)
+            am = tl.argmax(cand, axis=0)
+            keep = keep | ((offs_e == am) & (i < expert_budget))
+
+        # ---- 4. in-budget top-2 + p/(p1+p2) renorm + tau degradation ----
+        mg = tl.where(keep[None, :], gates, 0.0)
+        i1 = tl.argmax(mg, axis=1)                            # [N]
+        g1 = tl.max(mg, axis=1)
+        mg2 = tl.where(offs_e[None, :] == i1[:, None], 0.0, mg)
+        i2 = tl.argmax(mg2, axis=1)
+        g2 = tl.max(mg2, axis=1)
+        s = g1 + g2
+        tg1 = g1 / s
+        tg2 = g2 / s
+        degrade = accept < tau
+        tg1 = tl.where(degrade, 1.0, tg1)
+        tg2 = tl.where(degrade, 0.0, tg2)
+
+        # slot layout: slot 2t = (t, k=0), slot 2t+1 = (t, k=1)
+        tl.store(topk_ids_ptr + offs_n * 2, i1.to(tl.int64))
+        tl.store(topk_ids_ptr + offs_n * 2 + 1, i2.to(tl.int64))
+        tl.store(gates_flat_ptr + offs_n * 2, tg1)
+        tl.store(gates_flat_ptr + offs_n * 2 + 1, tg2)
+
+        # ---- 5. stable (expert, DFS) bucketing via O((2N)^2) rank ----
+        # fe stays in registers (tl.interleave): same-CTA global store->load
+        # reread is an L1-coherence hazard production kernels avoid
+        slots = tl.arange(0, 2 * N)
+        fe = tl.interleave(i1, i2).to(tl.int32)               # [2N] expert per slot
+        eq = fe[:, None] == fe[None, :]
+        lower = slots[None, :] < slots[:, None]
+        rank = tl.sum((eq & lower).to(tl.int32), axis=1)      # stable in-expert rank
+        dest = fe.to(tl.int64) * (MAX_BPE * BLOCK_M) + rank.to(tl.int64)
+        tl.store(slot_to_row_ptr + slots, dest)
+
+        # padded_slots as an inverse scatter computed in registers: one plain
+        # store pass, no -1 prefill + barrier (cross-lane store races)
+        pos = tl.arange(0, MAX_BLOCKS * BLOCK_M).to(tl.int64)
+        hit = pos[:, None] == dest[None, :]                   # [R, 2N]
+        val = tl.sum(tl.where(hit, slots[None, :] + 1, 0), axis=1) - 1  # -1 if no slot
+        tl.store(padded_slots_ptr + pos, val.to(tl.int64))
+
+        # ---- 6. per-block expert ids (blocks past ceil(count/BM) masked -1) ----
+        counts = tl.sum((fe[None, :] == offs_e[:, None]).to(tl.int32), axis=1)  # [EP]
+        blocks_needed = (counts + BLOCK_M - 1) // BLOCK_M
+        blk = tl.arange(0, MAX_BLOCKS)
+        blk_e = blk // MAX_BPE
+        need = tl.sum(tl.where(blk_e[:, None] == offs_e[None, :],
+                               blocks_needed[None, :], 0), axis=1)
+        used = (blk % MAX_BPE) < need
+        tl.store(block_expert_ids_ptr + blk,
+                 tl.where(used, blk_e, -1).to(tl.int64))
+
+    @triton.jit
     def _moe_gemm1_kernel(
         x_ptr, w1_ptr, w3_ptr, h_ptr,
         padded_slots_ptr, block_expert_ids_ptr,
@@ -252,10 +350,17 @@ class _Workspace:
 
     def __init__(self, n: int, e: int, hidden: int, inter: int, device):
         max_blocks = e * ((2 * n + BM - 1) // BM)
+        self.max_blocks = max_blocks
         self.rows = max_blocks * BM
         self.h = torch.zeros(self.rows, inter, dtype=torch.bfloat16, device=device)
         self.out_f32 = torch.zeros(n, hidden, dtype=torch.float32, device=device)
         self.partial = None  # lazily allocated for deterministic mode
+        # fused Kernel A outputs (static, rewritten every step)
+        self.topk_flat = torch.zeros(2 * n, dtype=torch.long, device=device)
+        self.gates_flat = torch.zeros(2 * n, dtype=torch.float32, device=device)
+        self.padded_slots = torch.full((self.rows,), -1, dtype=torch.long, device=device)
+        self.block_expert_ids = torch.full((max_blocks,), -1, dtype=torch.long, device=device)
+        self.slot_to_row = torch.zeros(2 * n, dtype=torch.long, device=device)
 
     def get_partial(self, hidden: int, device):
         if self.partial is None:
@@ -300,15 +405,37 @@ def tree_moe_forward(
     if ws is None:
         ws = _ws_cache[key] = _Workspace(n, e, hidden, inter, x.device)
 
-    _topk_ids, topk_gates, padded_slots, block_expert_ids, slot_to_row, max_blocks = route_and_bucket(
-        x, router_weight, node_accept_prob, expert_budget
-    )
-    gates_flat = topk_gates.reshape(-1).float().contiguous()   # index by slot id
+    max_bpe = (2 * n + BM - 1) // BM
+    # fused Kernel A: single-CTA route+bucket (1 launch vs ~8 torch ops);
+    # register footprint of the O((2N)^2) rank limits it to N<=64, E<=16
+    use_fused_a = (n & (n - 1)) == 0 and n <= 64 and e <= 16 and hidden % BK == 0
+    if use_fused_a:
+        _route_bucket_fused_kernel[(1,)](
+            x, router_weight, node_accept_prob,
+            ws.topk_flat, ws.gates_flat, ws.padded_slots,
+            ws.block_expert_ids, ws.slot_to_row,
+            expert_budget, 0.05,
+            N=n, E=e, EP=16, H=hidden, BK=BK,
+            MAX_BPE=max_bpe, BLOCK_M=BM, MAX_BLOCKS=ws.max_blocks,
+            num_warps=4,
+        )
+        gates_flat = ws.gates_flat
+        padded_slots, block_expert_ids = ws.padded_slots, ws.block_expert_ids
+        slot_to_row, max_blocks = ws.slot_to_row, ws.max_blocks
+    else:
+        _topk_ids, topk_gates, padded_slots, block_expert_ids, slot_to_row, max_blocks = route_and_bucket(
+            x, router_weight, node_accept_prob, expert_budget
+        )
+        gates_flat = topk_gates.reshape(-1).float().contiguous()   # index by slot id
 
+    # num_warps=4/num_stages=4: vLLM fused_moe production default for M<=32
+    # decode — "smallest batches are memory-latency bound, a deeper pipeline
+    # hides the weight loads" (vllm fused_moe.py get_default_config)
     grid1 = (max_blocks, inter // BN)
     _moe_gemm1_kernel[grid1](
         x, w1, w3, ws.h, padded_slots, block_expert_ids,
         H=hidden, I=inter, BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK,
+        num_warps=4, num_stages=4,
     )
     grid2 = (max_blocks, hidden // BN, SPLIT_K)
     if deterministic:
@@ -317,6 +444,7 @@ def tree_moe_forward(
             ws.h, w2, partial, gates_flat, padded_slots, block_expert_ids,
             R=ws.rows, H=hidden, I=inter,
             BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK, SPLIT=SPLIT_K,
+            num_warps=4, num_stages=4,
         )
         _combine_kernel[(n, hidden // BN)](
             partial, slot_to_row, ws.out_f32,
@@ -327,6 +455,7 @@ def tree_moe_forward(
         _moe_gemm2_kernel[grid2](
             ws.h, w2, ws.out_f32, gates_flat, padded_slots, block_expert_ids,
             H=hidden, I=inter, BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK, SPLIT=SPLIT_K,
+            num_warps=4, num_stages=4,
         )
     result = ws.out_f32.to(x.dtype)
     if out is not None:
