@@ -79,7 +79,12 @@ def route_and_bucket(
     blk_local = blk_idx % max_blocks_per_expert
     used = blk_local < blocks_per_expert[blk_expert]
     block_expert_ids[used] = blk_expert[used]
-    return topk_ids, topk_gates, padded_slots, block_expert_ids, max_blocks
+
+    # inverse permutation: slot id (token*2+k) -> padded row, for the
+    # deterministic combine kernel (fixed-order reduction, no atomics)
+    slot_to_row = torch.empty(2 * n, dtype=torch.long, device=device)
+    slot_to_row[order] = dest
+    return topk_ids, topk_gates, padded_slots, block_expert_ids, slot_to_row, max_blocks
 
 
 # --------------------------------------------------------------------------
@@ -173,6 +178,70 @@ if HAS_TRITON:
             acc, mask=m_mask[:, None],
         )
 
+    @triton.jit
+    def _moe_gemm2_det_kernel(
+        h_ptr, w2_ptr, partial_ptr, gates_ptr,
+        padded_slots_ptr, block_expert_ids_ptr,
+        R: tl.constexpr,           # padded rows = max_blocks * BLOCK_M
+        H: tl.constexpr, I: tl.constexpr,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+        SPLIT: tl.constexpr,
+    ):
+        """Deterministic variant: split-k partials go to a private workspace row
+        (plain store, no atomics); _combine_kernel reduces them in fixed order.
+        fp32 addition is non-associative, so atomic accumulation order flips
+        bits run-to-run and can flip argmax at near-ties — unacceptable for the
+        lossless spec==AR red line."""
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        pid_s = tl.program_id(2)
+        expert = tl.load(block_expert_ids_ptr + pid_m)
+        if expert < 0:
+            return
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        slots = tl.load(padded_slots_ptr + offs_m)
+        m_mask = slots >= 0
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        offs_k = tl.arange(0, BLOCK_K)
+
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        seg = I // SPLIT
+        w_base = expert.to(tl.int64) * H * I
+        for k0 in range(pid_s * seg, (pid_s + 1) * seg, BLOCK_K):
+            hk = k0 + offs_k
+            h_tile = tl.load(
+                h_ptr + offs_m[:, None].to(tl.int64) * I + hk[None, :],
+                mask=m_mask[:, None], other=0.0,
+            )
+            w2_t = tl.load(w2_ptr + w_base + offs_n[:, None] * I + hk[None, :])
+            acc += tl.dot(h_tile.to(tl.bfloat16), tl.trans(w2_t))
+
+        gate = tl.load(gates_ptr + slots, mask=m_mask, other=0.0)
+        acc = acc * gate[:, None]
+        dst = (pid_s.to(tl.int64) * R + offs_m[:, None]) * H + offs_n[None, :]
+        tl.store(partial_ptr + dst, acc, mask=m_mask[:, None])
+
+    @triton.jit
+    def _combine_kernel(
+        partial_ptr, slot_to_row_ptr, out_ptr,
+        R: tl.constexpr, H: tl.constexpr,
+        BLOCK_N: tl.constexpr, SPLIT: tl.constexpr,
+    ):
+        """out[t] = sum_s partial[s, row(2t)] + sum_s partial[s, row(2t+1)],
+        fixed iteration order -> bitwise deterministic across runs."""
+        t = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        r0 = tl.load(slot_to_row_ptr + 2 * t)
+        r1 = tl.load(slot_to_row_ptr + 2 * t + 1)
+        acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+        for s in range(0, SPLIT):
+            acc += tl.load(partial_ptr + (s * R + r0) * H + offs_n)  # r0 int64 promotes
+        for s in range(0, SPLIT):
+            acc += tl.load(partial_ptr + (s * R + r1) * H + offs_n)
+        tl.store(out_ptr + t.to(tl.int64) * H + offs_n, acc)
+
 
 # --------------------------------------------------------------------------
 # Host wrapper
@@ -183,8 +252,19 @@ class _Workspace:
 
     def __init__(self, n: int, e: int, hidden: int, inter: int, device):
         max_blocks = e * ((2 * n + BM - 1) // BM)
-        self.h = torch.zeros(max_blocks * BM, inter, dtype=torch.bfloat16, device=device)
+        self.rows = max_blocks * BM
+        self.h = torch.zeros(self.rows, inter, dtype=torch.bfloat16, device=device)
         self.out_f32 = torch.zeros(n, hidden, dtype=torch.float32, device=device)
+        self.partial = None  # lazily allocated for deterministic mode
+
+    def get_partial(self, hidden: int, device):
+        if self.partial is None:
+            # [SPLIT_K, rows, H] fp32; only rows of real slots are touched, so
+            # HBM traffic ~ SPLIT_K * 2N rows, not the full allocation
+            self.partial = torch.empty(
+                SPLIT_K, self.rows, hidden, dtype=torch.float32, device=device
+            )
+        return self.partial
 
 
 _ws_cache: dict[tuple, _Workspace] = {}
@@ -199,8 +279,15 @@ def tree_moe_forward(
     node_accept_prob: torch.Tensor,
     expert_budget: int,
     out: torch.Tensor | None = None,
+    deterministic: bool = True,
 ) -> torch.Tensor:
-    """Spec §3.1 entry point. Falls back to the reference on CPU / no Triton."""
+    """Spec §3.1 entry point. Falls back to the reference on CPU / no Triton.
+
+    deterministic=True (default): split-k partials + fixed-order combine,
+    bitwise reproducible (required by the lossless red-line test); costs one
+    extra fp32 partial round-trip (~SPLIT_K*2N*H*8B per layer).
+    deterministic=False: atomic_add fast path for benchmarking.
+    """
     if not HAS_TRITON or not x.is_cuda:
         return tree_moe_forward_ref(
             x, w1, w2, w3, router_weight, node_accept_prob, expert_budget
@@ -213,22 +300,34 @@ def tree_moe_forward(
     if ws is None:
         ws = _ws_cache[key] = _Workspace(n, e, hidden, inter, x.device)
 
-    _topk_ids, topk_gates, padded_slots, block_expert_ids, max_blocks = route_and_bucket(
+    _topk_ids, topk_gates, padded_slots, block_expert_ids, slot_to_row, max_blocks = route_and_bucket(
         x, router_weight, node_accept_prob, expert_budget
     )
     gates_flat = topk_gates.reshape(-1).float().contiguous()   # index by slot id
 
-    ws.out_f32.zero_()
     grid1 = (max_blocks, inter // BN)
     _moe_gemm1_kernel[grid1](
         x, w1, w3, ws.h, padded_slots, block_expert_ids,
         H=hidden, I=inter, BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK,
     )
     grid2 = (max_blocks, hidden // BN, SPLIT_K)
-    _moe_gemm2_kernel[grid2](
-        ws.h, w2, ws.out_f32, gates_flat, padded_slots, block_expert_ids,
-        H=hidden, I=inter, BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK, SPLIT=SPLIT_K,
-    )
+    if deterministic:
+        partial = ws.get_partial(hidden, x.device)
+        _moe_gemm2_det_kernel[grid2](
+            ws.h, w2, partial, gates_flat, padded_slots, block_expert_ids,
+            R=ws.rows, H=hidden, I=inter,
+            BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK, SPLIT=SPLIT_K,
+        )
+        _combine_kernel[(n, hidden // BN)](
+            partial, slot_to_row, ws.out_f32,
+            R=ws.rows, H=hidden, BLOCK_N=BN, SPLIT=SPLIT_K,
+        )
+    else:
+        ws.out_f32.zero_()
+        _moe_gemm2_kernel[grid2](
+            ws.h, w2, ws.out_f32, gates_flat, padded_slots, block_expert_ids,
+            H=hidden, I=inter, BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK, SPLIT=SPLIT_K,
+        )
     result = ws.out_f32.to(x.dtype)
     if out is not None:
         out.copy_(result)

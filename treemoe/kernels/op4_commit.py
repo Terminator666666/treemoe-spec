@@ -72,14 +72,16 @@ if HAS_TRITON:
                      mask=offs < V)
 
     @triton.jit
-    def _argmax_kernel(probs_ptr, out_ptr, V: tl.constexpr, VB: tl.constexpr):
+    def _argmax_kernel(x_ptr, out_ptr, V: tl.constexpr, VB: tl.constexpr):
+        # first-occurrence argmax over arbitrary values (logits OR probs):
+        # init/padding must be -inf, not -1 — logits can be all-negative
         node = tl.program_id(0)
         base = node.to(tl.int64) * V
-        best_v = -1.0
+        best_v = -float("inf")
         best_i = 0
         for v0 in range(0, V, VB):
             offs = v0 + tl.arange(0, VB)
-            x = tl.load(probs_ptr + base + offs, mask=offs < V, other=-1.0)
+            x = tl.load(x_ptr + base + offs, mask=offs < V, other=-float("inf"))
             m = tl.max(x, axis=0)
             i = tl.argmax(x, axis=0)
             best_i = tl.where(m > best_v, v0 + i, best_i)
@@ -163,15 +165,21 @@ def fused_verify_commit(
     else:
         n, v = target_logits.shape
         device = target_logits.device
-        probs = torch.empty_like(target_logits)
-        prev = prev_tokens if prev_tokens is not None else torch.zeros(1, dtype=torch.long, device=device)
-        _postprocess_softmax_kernel[(n,)](
-            target_logits, probs, prev, V=v, VB=VBLOCK,
-            temperature=max(temperature, 1.0) if temperature == 0.0 else temperature,
-            rep_penalty=rep_penalty, num_prev=prev.numel() if rep_penalty != 1.0 else 0,
-        )
         argmax = torch.empty(n, dtype=torch.int32, device=device)
-        _argmax_kernel[(n,)](probs, argmax, V=v, VB=VBLOCK)
+        if rep_penalty == 1.0:
+            # greedy fast path: softmax is monotone, so argmax(logits) ==
+            # argmax(softmax(logits)) exactly — skip the 3-pass softmax
+            # (saves 3 vocab sweeps of HBM traffic) and stay bitwise-aligned
+            # with the AR baseline's logits.argmax()
+            _argmax_kernel[(n,)](target_logits, argmax, V=v, VB=VBLOCK)
+        else:
+            probs = torch.empty_like(target_logits)
+            prev = prev_tokens if prev_tokens is not None else torch.zeros(1, dtype=torch.long, device=device)
+            _postprocess_softmax_kernel[(n,)](
+                target_logits, probs, prev, V=v, VB=VBLOCK,
+                temperature=1.0, rep_penalty=rep_penalty, num_prev=prev.numel(),
+            )
+            _argmax_kernel[(n,)](probs, argmax, V=v, VB=VBLOCK)
 
         # flatten children adjacency once per tree shape (static metadata)
         counts = torch.tensor([len(c) for c in children], dtype=torch.int32, device=device)

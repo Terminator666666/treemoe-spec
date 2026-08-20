@@ -31,7 +31,7 @@ def test_budget_route_b8_is_identity_topk(rng):
     ids, g = budget_route_ref(gates, accept, 8)
     ref_g, ref_ids = gates.topk(2, dim=-1)
     assert torch.equal(ids.sort(-1).values, ref_ids.sort(-1).values)
-    assert torch.allclose(g, torch.softmax(ref_g, dim=-1), atol=1e-5)
+    assert torch.allclose(g, ref_g / ref_g.sum(-1, keepdim=True), atol=1e-5)
 
 
 def test_low_prob_nodes_degrade_to_top1(rng):
@@ -57,10 +57,16 @@ def test_bucket_offsets_and_stability(rng):
 
 
 def test_bucket_all_tokens_one_expert(rng):
-    """Extreme case: router forces every token to experts {0,1}."""
+    """Extreme case: router forces every token to experts {0,1}.
+
+    Sign-proof construction: bias-free logit = w.x flips with x's sign, so
+    instead pin x[:,0] > 0 and give experts 0/1 the only nonzero weights.
+    """
     x, w1, w2, w3, router, accept = make_moe_inputs(N, E, H, I, rng)
-    router[0] += 100.0
-    router[1] += 50.0
+    x[:, 0] = x[:, 0].abs() + 1.0
+    router.zero_()
+    router[0, 0] = 2.0  # logit0 = 2*x0 > logit1 = x0 > 0 = others
+    router[1, 0] = 1.0
     _, _, _, offsets = route_and_bucket_ref(x, router, accept, 8)
     assert offsets[1] - offsets[0] == N and offsets[2] - offsets[1] == N
     assert offsets[2] == offsets[-1]
@@ -93,7 +99,9 @@ def test_ref_forward_matches_naive_at_b8(rng):
 
 def test_empty_expert_contributes_nothing(rng):
     x, w1, w2, w3, router, accept = make_moe_inputs(N, E, H, I, rng)
-    router[7] -= 100.0  # expert 7 never routed
+    x[:, 0] = x[:, 0].abs() + 1.0
+    router[7].zero_()
+    router[7, 0] = -100.0  # logit7 <= -100: expert 7 never routed (sign-proof)
     w1[7] = float("nan")  # would poison output if touched
     w3[7] = float("nan")
     out = tree_moe_forward_ref(x, w1, w2, w3, router, torch.ones(N), 7)
@@ -115,3 +123,19 @@ def test_triton_matches_ref(n, budget):
     out = tree_moe_forward(x, w1, w2, w3, router, accept, budget)
     ref = tree_moe_forward_ref(x, w1, w2, w3, router, accept, budget)
     torch.testing.assert_close(out.float(), ref.float(), rtol=1e-3, atol=1e-2)
+
+
+@pytest.mark.gpu
+def test_triton_deterministic_bitwise():
+    """deterministic=True must be bitwise reproducible across runs (fp32
+    addition is non-associative; the atomic fast path is not)."""
+    from treemoe.kernels.op1_tree_moe import tree_moe_forward
+
+    g = torch.Generator().manual_seed(11)
+    x, w1, w2, w3, router, accept = make_moe_inputs(64, 8, 4096, 14336, g, dtype=torch.bfloat16)
+    x, w1, w2, w3 = (t.cuda() for t in (x, w1, w2, w3))
+    router, accept = router.cuda(), accept.cuda()
+    outs = [tree_moe_forward(x, w1, w2, w3, router, accept, 8, deterministic=True).clone()
+            for _ in range(5)]
+    for o in outs[1:]:
+        assert torch.equal(o, outs[0])  # bitwise, not allclose

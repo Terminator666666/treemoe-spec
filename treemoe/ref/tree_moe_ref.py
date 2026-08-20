@@ -31,9 +31,11 @@ def budget_route_ref(
     keep_mask = torch.zeros(e, dtype=torch.bool, device=gates.device)
     keep_mask[keep] = True
 
-    masked_gates = gates.masked_fill(~keep_mask, float("-inf"))
+    masked_gates = gates.masked_fill(~keep_mask, 0.0)
     topk_gates, topk_ids = masked_gates.topk(2, dim=-1)               # within K
-    topk_gates = torch.softmax(topk_gates, dim=-1)                    # renormalize (sum=1)
+    # HF Mixtral semantics: p_k / (p_1 + p_2), NOT softmax (these are already
+    # probabilities; softmax would re-exponentiate and break B=8 losslessness)
+    topk_gates = topk_gates / topk_gates.sum(-1, keepdim=True)
 
     degrade = node_accept_prob < top1_threshold                       # [N]
     topk_gates = torch.where(

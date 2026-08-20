@@ -52,14 +52,21 @@ def tree_verify_ref(
 
     node = 0  # root slot: its target_logits give the dist for its children
     while True:
-        p = torch.softmax(_postprocess(target_logits[node], temperature), dim=-1)
+        if temperature == 0.0:
+            # greedy: argmax directly on logits (softmax is monotone; this is
+            # bitwise-identical to the AR baseline's logits.argmax())
+            greedy_tok = int(target_logits[node].argmax())
+            p = None
+            residual = None
+        else:
+            p = torch.softmax(_postprocess(target_logits[node], temperature), dim=-1)
+            residual = p.clone()
         kids = children[node]
         accepted_child = -1
-        residual = p.clone()
         for c in kids:
             tok = int(tree_tokens[c])
             if temperature == 0.0:
-                ok = tok == int(p.argmax())
+                ok = tok == greedy_tok
             else:
                 q = draft_probs[c]  # already a probability distribution
                 ratio = (residual[tok] / q[tok].clamp_min(1e-20)).clamp(max=1.0)
@@ -77,7 +84,7 @@ def tree_verify_ref(
             continue
         # all children rejected (or leaf): sample bonus from residual / argmax
         if temperature == 0.0:
-            bonus = p.argmax()
+            bonus = target_logits[node].argmax()
         else:
             bonus = torch.multinomial(residual, 1, generator=generator).squeeze(0)
         break
