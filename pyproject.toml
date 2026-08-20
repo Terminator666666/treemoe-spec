@@ -20,6 +20,7 @@ testpaths = ["tests"]
 markers = [
     "gpu: requires a CUDA GPU",
     "model: requires downloaded Mixtral/EAGLE weights",
+    "interpret: real Triton kernels on CPU, needs TRITON_INTERPRET=1 before import",
 ]
 
 [build-system]

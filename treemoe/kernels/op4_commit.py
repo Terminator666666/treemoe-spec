@@ -19,6 +19,8 @@ can be injected explicitly.
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 try:
@@ -28,6 +30,8 @@ try:
     HAS_TRITON = True
 except ImportError:
     HAS_TRITON = False
+
+_INTERPRET = os.getenv("TRITON_INTERPRET", "0") == "1"
 
 from treemoe.ref.verify_ref import VerifyResult, tree_verify_ref
 
@@ -158,8 +162,13 @@ def fused_verify_commit(
 ) -> VerifyResult:
     """GPU-fused path when Triton + CUDA available (greedy mode kernelized);
     sampling mode currently routes through the reference (kernel v2 milestone).
+    TRITON_INTERPRET=1 runs the same kernels on CPU via the interpreter.
     """
-    use_kernel = HAS_TRITON and target_logits.is_cuda and temperature == 0.0
+    use_kernel = (
+        HAS_TRITON
+        and (target_logits.is_cuda or _INTERPRET)
+        and temperature == 0.0
+    )
     if not use_kernel:
         res = tree_verify_ref(
             target_logits, draft_probs, tree_tokens, tree_parent, children,

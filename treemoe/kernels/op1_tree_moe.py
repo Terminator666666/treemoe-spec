@@ -14,6 +14,8 @@ to one expert); padding blocks carry expert_id = -1 and exit immediately
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -24,6 +26,11 @@ try:
     HAS_TRITON = True
 except ImportError:  # CPU-only dev box: reference path still importable
     HAS_TRITON = False
+
+# Triton interpreter (TRITON_INTERPRET=1) executes kernels instruction-by-
+# instruction on CPU via numpy — lets us run the REAL kernels on GPU-less
+# boxes. Must be set before import; eviction hints become no-ops there.
+_INTERPRET = os.getenv("TRITON_INTERPRET", "0") == "1"
 
 from treemoe.ref.tree_moe_ref import budget_route_ref, tree_moe_forward_ref
 
@@ -216,22 +223,30 @@ if HAS_TRITON:
         w_base = expert.to(tl.int64) * I * H
         for k0 in range(0, H, BLOCK_K):
             xk = k0 + offs_k
+            # x rows are re-read by every n-block CTA of this expert -> pin in
+            # L2 (PTX ld.global.L2::evict_last)
             x_tile = tl.load(
                 x_ptr + tokens[:, None] * H + xk[None, :],
                 mask=m_mask[:, None], other=0.0,
+                eviction_policy="evict_last",
             )
             w_off = w_base + offs_n[:, None] * H + xk[None, :]
-            w1_t = tl.load(w1_ptr + w_off)                        # [BN, BK]
-            w3_t = tl.load(w3_ptr + w_off)
+            # weights stream through exactly once per step -> evict_first
+            # (ld.global.L2::evict_first): must NOT flush x/h tiles or the
+            # next layer's experts that op2 has L2-warmed
+            w1_t = tl.load(w1_ptr + w_off, eviction_policy="evict_first")
+            w3_t = tl.load(w3_ptr + w_off, eviction_policy="evict_first")
             acc1 += tl.dot(x_tile, tl.trans(w1_t))
             acc3 += tl.dot(x_tile, tl.trans(w3_t))
 
         h = acc1 * tl.sigmoid(acc1) * acc3                        # SiLU(a)⊙b, fp32
-        # store to workspace in padded-row layout: row = global slot-block row
+        # store to workspace in padded-row layout: row = global slot-block row;
+        # gemm2 reads h back immediately -> keep resident (st.global evict_last)
         tl.store(
             h_ptr + offs_m[:, None].to(tl.int64) * I + offs_n[None, :],
-            h.to(tl.bfloat16),
+            h.to(h_ptr.dtype.element_ty),
             mask=m_mask[:, None],
+            eviction_policy="evict_last",
         )
 
     @triton.jit
@@ -264,9 +279,11 @@ if HAS_TRITON:
             h_tile = tl.load(
                 h_ptr + offs_m[:, None].to(tl.int64) * I + hk[None, :],
                 mask=m_mask[:, None], other=0.0,
+                eviction_policy="evict_last",   # h reused by all pid_n CTAs
             )
-            w2_t = tl.load(w2_ptr + w_base + offs_n[:, None] * I + hk[None, :])
-            acc += tl.dot(h_tile.to(tl.bfloat16), tl.trans(w2_t))
+            w2_t = tl.load(w2_ptr + w_base + offs_n[:, None] * I + hk[None, :],
+                           eviction_policy="evict_first")  # streamed once
+            acc += tl.dot(h_tile, tl.trans(w2_t))
 
         gate = tl.load(gates_ptr + slots, mask=m_mask, other=0.0)  # [BM] fp32
         acc = acc * gate[:, None]
@@ -311,14 +328,18 @@ if HAS_TRITON:
             h_tile = tl.load(
                 h_ptr + offs_m[:, None].to(tl.int64) * I + hk[None, :],
                 mask=m_mask[:, None], other=0.0,
+                eviction_policy="evict_last",
             )
-            w2_t = tl.load(w2_ptr + w_base + offs_n[:, None] * I + hk[None, :])
-            acc += tl.dot(h_tile.to(tl.bfloat16), tl.trans(w2_t))
+            w2_t = tl.load(w2_ptr + w_base + offs_n[:, None] * I + hk[None, :],
+                           eviction_policy="evict_first")
+            acc += tl.dot(h_tile, tl.trans(w2_t))
 
         gate = tl.load(gates_ptr + slots, mask=m_mask, other=0.0)
         acc = acc * gate[:, None]
         dst = (pid_s.to(tl.int64) * R + offs_m[:, None]) * H + offs_n[None, :]
-        tl.store(partial_ptr + dst, acc, mask=m_mask[:, None])
+        # combine kernel reads partials right back -> keep resident in L2
+        tl.store(partial_ptr + dst, acc, mask=m_mask[:, None],
+                 eviction_policy="evict_last")
 
     @triton.jit
     def _combine_kernel(
@@ -348,11 +369,11 @@ if HAS_TRITON:
 class _Workspace:
     """Static buffers reused across steps (CUDA Graph friendly)."""
 
-    def __init__(self, n: int, e: int, hidden: int, inter: int, device):
+    def __init__(self, n: int, e: int, hidden: int, inter: int, device, dtype):
         max_blocks = e * ((2 * n + BM - 1) // BM)
         self.max_blocks = max_blocks
         self.rows = max_blocks * BM
-        self.h = torch.zeros(self.rows, inter, dtype=torch.bfloat16, device=device)
+        self.h = torch.zeros(self.rows, inter, dtype=dtype, device=device)
         self.out_f32 = torch.zeros(n, hidden, dtype=torch.float32, device=device)
         self.partial = None  # lazily allocated for deterministic mode
         # fused Kernel A outputs (static, rewritten every step)
@@ -392,30 +413,41 @@ def tree_moe_forward(
     bitwise reproducible (required by the lossless red-line test); costs one
     extra fp32 partial round-trip (~SPLIT_K*2N*H*8B per layer).
     deterministic=False: atomic_add fast path for benchmarking.
+
+    Under TRITON_INTERPRET=1 the Triton kernels execute on CPU (numpy
+    interpreter) — the real kernel code paths, minus tensor cores.
     """
-    if not HAS_TRITON or not x.is_cuda:
+    if not HAS_TRITON or not (x.is_cuda or _INTERPRET):
         return tree_moe_forward_ref(
             x, w1, w2, w3, router_weight, node_accept_prob, expert_budget
         )
 
     n, hidden = x.shape
     e, inter, _ = w1.shape
-    key = (n, e, hidden, inter, x.device.index)
+    key = (n, e, hidden, inter, x.device.index if x.is_cuda else -1)
     ws = _ws_cache.get(key)
     if ws is None:
-        ws = _ws_cache[key] = _Workspace(n, e, hidden, inter, x.device)
+        ws = _ws_cache[key] = _Workspace(n, e, hidden, inter, x.device, x.dtype)
+
+    # per-shape tile params: tiny interpreter configs (H=64, I=128) must not
+    # read past the reduction dim; tl.dot still needs K>=16
+    bk = BK if hidden % BK == 0 else hidden
+    bn1 = BN if inter % BN == 0 else inter          # gemm1 N-dim = I
+    bn2 = BN if hidden % BN == 0 else hidden        # gemm2/combine N-dim = H
+    seg = inter // SPLIT_K
+    bk2 = min(BK, seg) if seg % min(BK, seg) == 0 else seg
 
     max_bpe = (2 * n + BM - 1) // BM
     # fused Kernel A: single-CTA route+bucket (1 launch vs ~8 torch ops);
     # register footprint of the O((2N)^2) rank limits it to N<=64, E<=16
-    use_fused_a = (n & (n - 1)) == 0 and n <= 64 and e <= 16 and hidden % BK == 0
+    use_fused_a = (n & (n - 1)) == 0 and 16 <= n <= 64 and e <= 16
     if use_fused_a:
         _route_bucket_fused_kernel[(1,)](
             x, router_weight, node_accept_prob,
             ws.topk_flat, ws.gates_flat, ws.padded_slots,
             ws.block_expert_ids, ws.slot_to_row,
             expert_budget, 0.05,
-            N=n, E=e, EP=16, H=hidden, BK=BK,
+            N=n, E=e, EP=16, H=hidden, BK=bk,
             MAX_BPE=max_bpe, BLOCK_M=BM, MAX_BLOCKS=ws.max_blocks,
             num_warps=4,
         )
@@ -431,30 +463,30 @@ def tree_moe_forward(
     # num_warps=4/num_stages=4: vLLM fused_moe production default for M<=32
     # decode — "smallest batches are memory-latency bound, a deeper pipeline
     # hides the weight loads" (vllm fused_moe.py get_default_config)
-    grid1 = (max_blocks, inter // BN)
+    grid1 = (max_blocks, inter // bn1)
     _moe_gemm1_kernel[grid1](
         x, w1, w3, ws.h, padded_slots, block_expert_ids,
-        H=hidden, I=inter, BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK,
+        H=hidden, I=inter, BLOCK_M=BM, BLOCK_N=bn1, BLOCK_K=bk,
         num_warps=4, num_stages=4,
     )
-    grid2 = (max_blocks, hidden // BN, SPLIT_K)
+    grid2 = (max_blocks, hidden // bn2, SPLIT_K)
     if deterministic:
         partial = ws.get_partial(hidden, x.device)
         _moe_gemm2_det_kernel[grid2](
             ws.h, w2, partial, gates_flat, padded_slots, block_expert_ids,
             R=ws.rows, H=hidden, I=inter,
-            BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK, SPLIT=SPLIT_K,
+            BLOCK_M=BM, BLOCK_N=bn2, BLOCK_K=bk2, SPLIT=SPLIT_K,
             num_warps=4, num_stages=4,
         )
-        _combine_kernel[(n, hidden // BN)](
+        _combine_kernel[(n, hidden // bn2)](
             partial, slot_to_row, ws.out_f32,
-            R=ws.rows, H=hidden, BLOCK_N=BN, SPLIT=SPLIT_K,
+            R=ws.rows, H=hidden, BLOCK_N=bn2, SPLIT=SPLIT_K,
         )
     else:
         ws.out_f32.zero_()
         _moe_gemm2_kernel[grid2](
             ws.h, w2, ws.out_f32, gates_flat, padded_slots, block_expert_ids,
-            H=hidden, I=inter, BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK, SPLIT=SPLIT_K,
+            H=hidden, I=inter, BLOCK_M=BM, BLOCK_N=bn2, BLOCK_K=bk2, SPLIT=SPLIT_K,
             num_warps=4, num_stages=4,
         )
     result = ws.out_f32.to(x.dtype)
