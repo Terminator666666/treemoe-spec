@@ -40,18 +40,20 @@ BM = 16    # slot rows per block (M is tiny: <=16 tokens/expert typically)
 # Both GEMMs are memory-bound streams; occupancy = latency hiding = bandwidth.
 BN1 = 64   # gemm1 N over I=14336
 BK1 = 64   # gemm1 K over H (u32-packed loads: regs 102->80, occ 25%->38%)
-BN2 = 32   # gemm2 N over H: rows stay 256B coalesced
-BK2 = 32   # gemm2 K over I (within split-K segment). With u32-packed weight
-           # loads BK=128 ballooned the unpack live range (116 regs, 25% occ);
-           # BK=32/nw4/ns4 -> 55 regs, zero spill, 56% occ, loads stay LDG.E.64
-# SPLIT_K 8->4 halves the fp32 partial round-trip (1.07 -> 0.54 GB/step at
-# Mixtral shapes, roofline.py) — identical regs/occupancy, and the worst-case
-# grid (B=2: 8 m-blocks x H/BN2 x 4 = 4096 CTAs) still fills 132 SMs
-SPLIT_K = 4
+BN2 = 64   # gemm2 N over H
+BK2 = 128  # gemm2 K over I (within split-K segment). 4090 sweep
+           # (benchmarks/sweep_op1.py, 108 configs): BK2 dominates -- 128 is
+           # 1.30x faster than the ptxas-chosen 32 despite lower occupancy
+           # (116 regs). A streaming kernel needs bytes-in-flight, not
+           # occupancy: BK=32 kept only ~8KB/CTA in flight vs gemm1's ~48KB.
+           # On-silicon: gemm2 484 -> ~935 GB/s, whole op1 at 89% of peak.
+# SPLIT_K=2 (sweep): larger K segments per CTA beat extra parallelism, and it
+# halves the det-path fp32 partial round-trip as a bonus
+SPLIT_K = 2
 # launch configs as module constants so benchmarks/sweep_op1.py can patch
-# them for on-silicon tuning (4090 profile: gemm1 92% of peak, gemm2 48%)
+# them for on-silicon tuning
 GEMM1_WARPS, GEMM1_STAGES = 8, 3   # ptxas sweep: 80 regs, zero spill, 38% occ
-GEMM2_WARPS, GEMM2_STAGES = 4, 4   # vLLM fused_moe default for small-M decode
+GEMM2_WARPS, GEMM2_STAGES = 8, 3   # 4090 sweep top-1 (ties within noise)
 
 
 # --------------------------------------------------------------------------

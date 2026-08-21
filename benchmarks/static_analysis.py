@@ -106,7 +106,8 @@ def _mixtral_specs() -> list[Spec]:
              "BLOCK_N": "constexpr", "BLOCK_K": "constexpr", "PACK_W": "constexpr"},
             {"H": H, "I": I, "BLOCK_M": BM, "BLOCK_N": BN1, "BLOCK_K": BK1,
              "PACK_W": 1},
-            num_warps=8, num_stages=3, grid=(MAX_BLOCKS, I // BN1),
+            num_warps=op1.GEMM1_WARPS, num_stages=op1.GEMM1_STAGES,
+            grid=(MAX_BLOCKS, I // BN1),
             note="dominant kernel: streams w1+w3 (2/3 of expert bytes)",
         ),
         Spec(
@@ -118,7 +119,8 @@ def _mixtral_specs() -> list[Spec]:
              "SPLIT": "constexpr", "PACK_W": "constexpr"},
             {"R": ROWS, "H": H, "I": I, "BLOCK_M": BM, "BLOCK_N": BN2,
              "BLOCK_K": min(BK2, I // SPLIT_K), "SPLIT": SPLIT_K, "PACK_W": 1},
-            num_warps=4, num_stages=4, grid=(MAX_BLOCKS, H // BN2, SPLIT_K),
+            num_warps=op1.GEMM2_WARPS, num_stages=op1.GEMM2_STAGES,
+            grid=(MAX_BLOCKS, H // BN2, SPLIT_K),
             note="streams w2 (1/3 of expert bytes)",
         ),
         Spec(
@@ -130,7 +132,8 @@ def _mixtral_specs() -> list[Spec]:
              "PACK_W": "constexpr"},
             {"H": H, "I": I, "BLOCK_M": BM, "BLOCK_N": BN2,
              "BLOCK_K": min(BK2, I // SPLIT_K), "SPLIT": SPLIT_K, "PACK_W": 1},
-            num_warps=4, num_stages=4, grid=(MAX_BLOCKS, H // BN2, SPLIT_K),
+            num_warps=op1.GEMM2_WARPS, num_stages=op1.GEMM2_STAGES,
+            grid=(MAX_BLOCKS, H // BN2, SPLIT_K),
         ),
         Spec(
             "op1 combine (fixed-order reduce)", op1._combine_kernel,
