@@ -51,6 +51,22 @@ def bench_ours(x, w1, w2, w3, router, accept, budget, deterministic=True):
                                           deterministic=deterministic))
 
 
+def profile_ours(x, w1, w2, w3, router, accept, budget, deterministic=False):
+    """Per-kernel CUDA time breakdown (torch.profiler; no ncu perms needed)."""
+    from torch.profiler import ProfilerActivity, profile
+
+    from treemoe.kernels.op1_tree_moe import tree_moe_forward
+
+    for _ in range(5):  # warmup + compile
+        tree_moe_forward(x, w1, w2, w3, router, accept, budget, deterministic=deterministic)
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for _ in range(20):
+            tree_moe_forward(x, w1, w2, w3, router, accept, budget, deterministic=deterministic)
+        torch.cuda.synchronize()
+    print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=12))
+
+
 def bench_vllm(x, w1, w2, w3, router):
     try:
         from vllm.model_executor.layers.fused_moe import fused_moe
@@ -71,6 +87,8 @@ def main() -> None:
     ap.add_argument("--budget", type=int, default=8)
     ap.add_argument("--peak-gbs", type=float, default=None,
                     help="HBM peak GB/s for utilization %% (auto-detected for known cards)")
+    ap.add_argument("--profile", action="store_true",
+                    help="print a per-kernel CUDA time breakdown per tree size (atomic path)")
     args = ap.parse_args()
     assert torch.cuda.is_available(), "kernel benchmark requires a GPU"
     peak = args.peak_gbs or detect_peak_gbs()
@@ -101,6 +119,8 @@ def main() -> None:
         ratio = f"{t_ours / t_vllm:.2f}" if t_vllm else "n/a"
         print(f"{n:>5} {t_det:>10.1f} {t_ours:>11.1f} {gbs:>8.0f} {util:>6} "
               f"{t_vllm or float('nan'):>10.1f} {ratio:>7}")
+        if args.profile:
+            profile_ours(x, w1, w2, w3, router, accept, args.budget)
         if n == 64 and t_vllm:
             gate = t_ours <= 0.8 * t_vllm
             print(f"  gate(N=64, <=0.8x vLLM): {'PASS' if gate else 'FAIL (check dram bytes)'}")
