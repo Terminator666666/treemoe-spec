@@ -10,6 +10,11 @@ Components:
                      in host pinned memory; predicted experts are copied H2D on
                      a side stream into a ring buffer, >=4 layers ahead
                      (352MB @ PCIe Gen5 ~ 5.5 ms per expert-layer, spec §3.2).
+  LayerPrefetcher  - engine integration of the offload path: depth-buffered
+                     stacked [E,I,H] staging that op1 consumes directly (no
+                     D2D re-gather), copied ahead of compute on a side stream.
+                     4090 measured (bench_op2): pinned H2D 23.8 GB/s, compute
+                     slowdown under active prefetch +5.8%, lead ~4.1*B layers.
 """
 
 from __future__ import annotations
@@ -119,3 +124,104 @@ class HostExpertPool:
             self.slots[i]["w3"].copy_(host_w3[expert], non_blocking=True)
             self.slots[i]["w2"].copy_(host_w2[expert], non_blocking=True)
             self.events[i].record(self.stream)
+
+
+class LayerPrefetcher:
+    """Ahead-of-time H2D staging of offloaded layers (engine side of spec §3.2).
+
+    Each of the `depth` buffers is a stacked w1/w2/w3 triple shaped like one
+    layer's experts, so op1's expert-stationary kernel consumes it directly —
+    the H2D copy lands in place, no D2D re-gather. Copies run on a side stream
+    ahead of the compute stream; two event rings order overwrite-after-use
+    (free) and use-after-copy (ready).
+
+    Bitmap mode (`set_bitmap`, [L, E] bool from RouterPredictor.predict_bitmap):
+    only predicted experts' rows are copied; unpredicted rows keep stale data,
+    which is only sound when routing is restricted to the predicted set (op3
+    budget) — same lossy contract as op3. `bitmap=None` copies every row and
+    is bitwise equivalent to MixtralForward's synchronous staging path.
+
+    On CPU tensors (tiny-config tests) copies degrade to synchronous — the
+    buffer-cycling logic is identical and testable without a GPU.
+    """
+
+    def __init__(self, layers, depth: int = 2):
+        self.layers = layers
+        self.offload_ids = [i for i, lw in enumerate(layers) if not lw.experts_on_gpu]
+        self.depth = max(1, min(depth, max(1, len(self.offload_ids))))
+        self._bufs: list[dict[str, torch.Tensor]] | None = None
+        self._buf_of: dict[int, int] = {}   # layer idx -> buffer slot (this pass)
+        self._queue: list[int] = []         # offloaded layers not yet scheduled
+        self._bitmap: torch.Tensor | None = None
+        self._cuda = False
+        self._stream = None
+        self._ready: list[torch.cuda.Event] = []
+        self._free: list[torch.cuda.Event] = []
+
+    def set_bitmap(self, bitmap: torch.Tensor | None) -> None:
+        """[L, E] bool, rows to copy per layer; None = all (lossless). Moved to
+        CPU here (one sync), so per-layer scheduling stays sync-free."""
+        self._bitmap = None if bitmap is None else bitmap.detach().to("cpu", torch.bool)
+
+    def _ensure_buffers(self, lw) -> None:
+        dev = lw.router.device
+        self._cuda = dev.type == "cuda"
+        self._bufs = [
+            {k: torch.empty_like(getattr(lw, k), device=dev) for k in ("w1", "w2", "w3")}
+            for _ in range(self.depth)
+        ]
+        if self._cuda:
+            self._stream = torch.cuda.Stream()
+            self._ready = [torch.cuda.Event() for _ in range(self.depth)]
+            self._free = [torch.cuda.Event() for _ in range(self.depth)]
+
+    def begin(self) -> None:
+        """Start a forward pass: schedule the first `depth` offloaded layers."""
+        if not self.offload_ids:
+            return
+        if self._bufs is None:
+            self._ensure_buffers(self.layers[self.offload_ids[0]])
+        self._buf_of.clear()
+        self._queue = list(self.offload_ids)
+        for _ in range(min(self.depth, len(self._queue))):
+            self._schedule_next()
+
+    def _schedule_next(self) -> None:
+        layer_idx = self._queue.pop(0)
+        slot = len(self._buf_of) % self.depth
+        self._buf_of[layer_idx] = slot
+        lw, buf = self.layers[layer_idx], self._bufs[slot]
+        rows = (None if self._bitmap is None
+                else self._bitmap[layer_idx].nonzero().flatten().tolist())
+
+        def copy_rows():
+            for k in ("w1", "w2", "w3"):
+                src, dst = getattr(lw, k), buf[k]
+                if rows is None:
+                    dst.copy_(src, non_blocking=True)
+                else:
+                    for e in rows:
+                        dst[e].copy_(src[e], non_blocking=True)
+
+        if self._cuda:
+            with torch.cuda.stream(self._stream):
+                self._free[slot].wait(self._stream)   # overwrite-after-use
+                copy_rows()
+                self._ready[slot].record(self._stream)
+        else:
+            copy_rows()
+
+    def acquire(self, layer_idx: int) -> dict[str, torch.Tensor]:
+        """Return the staged w1/w2/w3 for this layer, ordered after its copy."""
+        slot = self._buf_of[layer_idx]
+        if self._cuda:
+            self._ready[slot].wait(torch.cuda.current_stream())  # use-after-copy
+        return self._bufs[slot]
+
+    def release(self, layer_idx: int) -> None:
+        """Mark the layer consumed (compute enqueued) and refill the pipeline."""
+        slot = self._buf_of[layer_idx]
+        if self._cuda:
+            self._free[slot].record(torch.cuda.current_stream())
+        if self._queue:
+            self._schedule_next()

@@ -4,7 +4,8 @@ M1 milestone: correct but slow, all reference paths.
 Op injection points:
   * moe_fn        -> treemoe.kernels.op1.tree_moe_forward (Task 2.5)
   * verify/commit -> treemoe.kernels.op4.fused_verify_commit (Task 3.1)
-  * prefetcher    -> treemoe.kernels.op2 (Task 4.2)
+  * prefetcher    -> op2 LayerPrefetcher, wired via MixtralForward(prefetcher=...)
+                     (Task 4.2 done; RouterPredictor bitmap pending 4.1 training)
 Graph capture wraps step() (Task 3.2, engine/graph.py).
 """
 

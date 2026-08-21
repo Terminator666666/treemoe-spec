@@ -9,7 +9,9 @@ cover RouterPredictor semantics; gpu-marked tests cover the H2D ring buffer
 import pytest
 import torch
 
-from treemoe.kernels.op2_prefetch import HostExpertPool, RouterPredictor, l2_warm
+from treemoe.kernels.op2_prefetch import (
+    HostExpertPool, LayerPrefetcher, RouterPredictor, l2_warm,
+)
 
 N, L, E, H = 6, 4, 8, 32
 
@@ -109,6 +111,149 @@ def test_pool_ring_eviction_order():
     torch.cuda.synchronize()
     assert torch.equal(pool.lookup(0, 1)["w1"].cpu(), w1[1])
     assert torch.equal(pool.lookup(0, 2)["w1"].cpu(), w1[2])
+
+
+# ---------------- LayerPrefetcher (engine integration, CPU) ----------------
+
+def _offload_all(w):
+    import dataclasses
+    return dataclasses.replace(
+        w, layers=[dataclasses.replace(lw, experts_on_gpu=False) for lw in w.layers])
+
+
+def _forward_pair(cfg, w, rng, prefetcher):
+    """(resident logits, prefetched-offload logits) on the same weights."""
+    from treemoe.model.kv_cache import PagedKVCache
+    from treemoe.model.mixtral import MixtralForward, naive_moe
+
+    ids = torch.randint(0, cfg.vocab_size, (5,), generator=rng)
+    pos = torch.arange(5)
+    kv1 = PagedKVCache(cfg, num_blocks=8, device="cpu", dtype=cfg.dtype)
+    resident = MixtralForward(w, kv1, moe_fn=naive_moe).forward(ids, pos)
+    kv2 = PagedKVCache(cfg, num_blocks=8, device="cpu", dtype=cfg.dtype)
+    off = MixtralForward(_offload_all(w), kv2, moe_fn=naive_moe,
+                         prefetcher=prefetcher).forward(ids, pos)
+    return resident, off
+
+
+def test_layer_prefetcher_forward_matches_resident(tiny_config, rng):
+    from test_parity import random_weights
+
+    w = random_weights(tiny_config, rng)
+    pf = LayerPrefetcher(_offload_all(w).layers, depth=2)
+    resident, off = _forward_pair(tiny_config, w, rng, pf)
+    assert torch.equal(resident, off)          # bitwise: staging is a pure copy
+
+
+def test_layer_prefetcher_cycles_buffers_and_partial_offload(tiny_config, rng):
+    """More offloaded layers than buffers (depth=2, 4 offloaded) + one resident
+    layer in the middle: buffer reuse ordering and subset mapping."""
+    import dataclasses
+
+    from test_parity import random_weights
+    from treemoe.model.kv_cache import PagedKVCache
+    from treemoe.model.mixtral import MixtralForward, naive_moe
+
+    cfg = dataclasses.replace(tiny_config, num_layers=5)
+    w = random_weights(cfg, rng)
+    ids = torch.randint(0, cfg.vocab_size, (5,), generator=rng)
+    pos = torch.arange(5)
+    kv1 = PagedKVCache(cfg, num_blocks=8, device="cpu", dtype=cfg.dtype)
+    resident = MixtralForward(w, kv1, moe_fn=naive_moe).forward(ids, pos)
+
+    w_off = dataclasses.replace(w, layers=[
+        dataclasses.replace(lw, experts_on_gpu=(i == 2)) for i, lw in enumerate(w.layers)])
+    pf = LayerPrefetcher(w_off.layers, depth=2)
+    assert pf.offload_ids == [0, 1, 3, 4]
+    kv2 = PagedKVCache(cfg, num_blocks=8, device="cpu", dtype=cfg.dtype)
+    off = MixtralForward(w_off, kv2, moe_fn=naive_moe, prefetcher=pf).forward(ids, pos)
+    assert torch.equal(resident, off)
+    # two forward passes reuse the same buffers correctly
+    kv3 = PagedKVCache(cfg, num_blocks=8, device="cpu", dtype=cfg.dtype)
+    off2 = MixtralForward(w_off, kv3, moe_fn=naive_moe, prefetcher=pf).forward(ids, pos)
+    assert torch.equal(resident, off2)
+
+
+def test_layer_prefetcher_bitmap_copies_only_predicted_rows(rng):
+    """Bitmap mode copies exactly the predicted rows; unpredicted rows keep the
+    previous buffer occupant's data (stale by contract, spec §3.2 / op3)."""
+    from treemoe.model.weights import LayerWeights
+
+    E_, I_, H_ = 4, 6, 8
+
+    def lw():
+        return LayerWeights(
+            input_layernorm=torch.ones(H_), post_attn_layernorm=torch.ones(H_),
+            attn={}, router=torch.zeros(E_, H_),
+            w1=torch.randn(E_, I_, H_, generator=rng),
+            w2=torch.randn(E_, H_, I_, generator=rng),
+            w3=torch.randn(E_, I_, H_, generator=rng),
+            experts_on_gpu=False)
+
+    layers = [lw(), lw()]
+    pf = LayerPrefetcher(layers, depth=1)
+
+    pf.begin()                                  # bitmap=None: full copies
+    assert torch.equal(pf.acquire(0)["w1"], layers[0].w1)
+    pf.release(0)
+    assert torch.equal(pf.acquire(1)["w2"], layers[1].w2)
+    pf.release(1)
+
+    bm = torch.ones(2, E_, dtype=torch.bool)
+    bm[1] = False
+    bm[1, 0] = True                             # layer 1: only expert 0 predicted
+    pf.set_bitmap(bm)
+    pf.begin()
+    pf.acquire(0)                               # full copy: buffer holds layer 0
+    pf.release(0)
+    got = pf.acquire(1)                         # depth=1: same buffer, row-copy
+    assert torch.equal(got["w1"][0], layers[1].w1[0])   # predicted row is fresh
+    assert torch.equal(got["w1"][1], layers[0].w1[1])   # unpredicted row: stale
+
+
+@pytest.mark.gpu
+def test_layer_prefetcher_gpu_forward_matches_resident(tiny_config, rng):
+    """Real side-stream + event ordering: pinned-host offload forward must be
+    bitwise identical to the resident forward on GPU."""
+    import dataclasses
+
+    from test_parity import random_weights
+    from treemoe.model.kv_cache import PagedKVCache
+    from treemoe.model.mixtral import MixtralForward, naive_moe
+
+    def mv(t):
+        return t.cuda()
+
+    w0 = random_weights(tiny_config, rng)
+    layers_gpu = [dataclasses.replace(
+        lw, input_layernorm=mv(lw.input_layernorm),
+        post_attn_layernorm=mv(lw.post_attn_layernorm),
+        attn={k: mv(v) for k, v in lw.attn.items()}, router=mv(lw.router),
+        w1=mv(lw.w1), w2=mv(lw.w2), w3=mv(lw.w3)) for lw in w0.layers]
+    w = dataclasses.replace(w0, embed_tokens=mv(w0.embed_tokens),
+                            final_norm=mv(w0.final_norm), lm_head=mv(w0.lm_head),
+                            layers=layers_gpu)
+    ids = torch.randint(0, tiny_config.vocab_size, (5,), generator=rng).cuda()
+    pos = torch.arange(5, device="cuda")
+
+    kv1 = PagedKVCache(tiny_config, num_blocks=8, device="cuda", dtype=tiny_config.dtype)
+    resident = MixtralForward(w, kv1, moe_fn=naive_moe).forward(ids, pos)
+
+    def pin(t):
+        try:
+            return t.pin_memory()
+        except RuntimeError:
+            return t
+
+    layers_off = [dataclasses.replace(
+        lw_gpu, w1=pin(lw_cpu.w1), w2=pin(lw_cpu.w2), w3=pin(lw_cpu.w3),
+        experts_on_gpu=False) for lw_gpu, lw_cpu in zip(layers_gpu, w0.layers)]
+    w_off = dataclasses.replace(w, layers=layers_off)
+    pf = LayerPrefetcher(w_off.layers, depth=2)
+    kv2 = PagedKVCache(tiny_config, num_blocks=8, device="cuda", dtype=tiny_config.dtype)
+    off = MixtralForward(w_off, kv2, moe_fn=naive_moe, prefetcher=pf).forward(ids, pos)
+    torch.cuda.synchronize()
+    assert torch.equal(resident, off)
 
 
 # ---------------- l2_warm (GPU) ----------------

@@ -68,11 +68,15 @@ def naive_moe(x: torch.Tensor, lw: LayerWeights, _layer_idx: int) -> torch.Tenso
 
 
 class MixtralForward:
-    def __init__(self, weights: MixtralWeights, kv: PagedKVCache, moe_fn: Optional[MoEFn] = None):
+    def __init__(self, weights: MixtralWeights, kv: PagedKVCache,
+                 moe_fn: Optional[MoEFn] = None, prefetcher=None):
         self.w = weights
         self.cfg = weights.config
         self.kv = kv
         self.moe_fn: MoEFn = moe_fn or naive_moe
+        # op2 LayerPrefetcher (spec §3.2): ahead-of-time side-stream staging of
+        # offloaded layers; None falls back to synchronous _stage_experts
+        self.prefetcher = prefetcher
         self.rope_cos, self.rope_sin = build_rope_cache(self.cfg, weights.embed_tokens.device.type)
         # reusable GPU staging buffers for layout="offload" layers (one layer's
         # experts = 2.82GB at Mixtral shapes) -- allocated on first use
@@ -156,12 +160,24 @@ class MixtralForward:
         is_tree = tree_mask is not None
         x = F.embedding(token_ids, self.w.embed_tokens)
         penultimate = x
+        if self.prefetcher is not None:
+            self.prefetcher.begin()
         for layer_idx, lw in enumerate(self.w.layers):
             h = rms_norm(x, lw.input_layernorm, cfg.rms_eps)
             x = x + self._attention(lw, layer_idx, h, positions, tree_mask, is_tree)
             h = rms_norm(x, lw.post_attn_layernorm, cfg.rms_eps)
-            moe_lw = lw if lw.experts_on_gpu else self._stage_experts(lw)
+            use_prefetch = self.prefetcher is not None and not lw.experts_on_gpu
+            if lw.experts_on_gpu:
+                moe_lw = lw
+            elif use_prefetch:
+                buf = self.prefetcher.acquire(layer_idx)
+                moe_lw = replace(lw, w1=buf["w1"], w2=buf["w2"], w3=buf["w3"],
+                                 experts_on_gpu=True)
+            else:
+                moe_lw = self._stage_experts(lw)
             x = x + self.moe_fn(h, moe_lw, layer_idx)
+            if use_prefetch:
+                self.prefetcher.release(layer_idx)
             if layer_idx == cfg.num_layers - 2:
                 penultimate = x  # EAGLE-2 draft feature source (spec §3.2)
         x = rms_norm(x, self.w.final_norm, cfg.rms_eps)
