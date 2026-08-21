@@ -44,10 +44,11 @@ def timed(fn, iters: int = 50, warmup: int = 10) -> float:
     return (time.perf_counter() - t0) / iters * 1e6  # us
 
 
-def bench_ours(x, w1, w2, w3, router, accept, budget):
+def bench_ours(x, w1, w2, w3, router, accept, budget, deterministic=True):
     from treemoe.kernels.op1_tree_moe import tree_moe_forward
 
-    return timed(lambda: tree_moe_forward(x, w1, w2, w3, router, accept, budget))
+    return timed(lambda: tree_moe_forward(x, w1, w2, w3, router, accept, budget,
+                                          deterministic=deterministic))
 
 
 def bench_vllm(x, w1, w2, w3, router):
@@ -82,22 +83,24 @@ def main() -> None:
     w3 = torch.randn(E, I, H, device="cuda", dtype=torch.bfloat16, generator=g) * 0.02
     router = torch.randn(E, H, device="cuda", dtype=torch.bfloat16, generator=g) * 0.1
 
-    print(f"{'N':>5} {'ours(us)':>10} {'GB/s':>8} {'util':>6} {'vllm(us)':>10} {'ratio':>7}")
+    print(f"{'N':>5} {'det(us)':>10} {'atomic(us)':>11} {'GB/s':>8} {'util':>6} {'vllm(us)':>10} {'ratio':>7}")
     for n in args.tree_sizes:
         x = torch.randn(n, H, device="cuda", dtype=torch.bfloat16, generator=g)
         accept = torch.rand(n, device="cuda", generator=g)
-        t_ours = bench_ours(x, w1, w2, w3, router, accept, args.budget)
+        # deterministic=True is the red-line path (fp32 partial round-trip +
+        # combine launch); deterministic=False (atomic) is the production
+        # perf path -- GB/s, util and the vLLM gate are measured on it
+        t_det = bench_ours(x, w1, w2, w3, router, accept, args.budget, deterministic=True)
+        t_ours = bench_ours(x, w1, w2, w3, router, accept, args.budget, deterministic=False)
         t_vllm = bench_vllm(x, w1, w2, w3, router)
-        # dominant traffic: full weight stream (all experts touched at these
-        # budgets) + fp32 split-K partial round-trip (see roofline.py)
-        from treemoe.kernels.op1_tree_moe import SPLIT_K
-        rows = E * ((2 * n + 15) // 16) * 16
-        part = 2 * SPLIT_K * rows * H * 4          # write + read back, fp32
-        byts = w1.nbytes + w2.nbytes + w3.nbytes + part
+        # dominant traffic on the atomic path: the full weight stream (all
+        # experts touched at these budgets); h workspace is MBs, negligible
+        byts = w1.nbytes + w2.nbytes + w3.nbytes
         gbs = byts / (t_ours * 1e-6) / 1e9
         util = f"{gbs / peak:5.0%}" if peak else "   n/a"
         ratio = f"{t_ours / t_vllm:.2f}" if t_vllm else "n/a"
-        print(f"{n:>5} {t_ours:>10.1f} {gbs:>8.0f} {util:>6} {t_vllm or float('nan'):>10.1f} {ratio:>7}")
+        print(f"{n:>5} {t_det:>10.1f} {t_ours:>11.1f} {gbs:>8.0f} {util:>6} "
+              f"{t_vllm or float('nan'):>10.1f} {ratio:>7}")
         if n == 64 and t_vllm:
             gate = t_ours <= 0.8 * t_vllm
             print(f"  gate(N=64, <=0.8x vLLM): {'PASS' if gate else 'FAIL (check dram bytes)'}")
