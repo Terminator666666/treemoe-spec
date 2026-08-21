@@ -74,37 +74,40 @@ def main() -> None:
         return
     pool = HostExpertPool(num_slots=4, expert_shape=(I, H))
 
-    def timed(fn, iters=30):
+    # Per-stream timing with CUDA events: a device-wide synchronize would wait
+    # for the side-stream copies too and report copy-bound wall time instead of
+    # the actual compute slowdown.
+    ITERS = 30
+
+    def timed_compute(prefetch_backlog: int = 0):
         for _ in range(5):
-            fn()
+            fwd()
         torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        for _ in range(iters):
-            fn()
-        torch.cuda.synchronize()
-        return (time.perf_counter() - t0) / iters * 1e6
+        if prefetch_backlog:  # issue after the sync so copies overlap the timed region
+            for k in range(prefetch_backlog):
+                pool.prefetch(k // E % 32, k % E, hw1, hw2, hw3)
+        e0 = torch.cuda.Event(enable_timing=True)
+        e1 = torch.cuda.Event(enable_timing=True)
+        e0.record()
+        for _ in range(ITERS):
+            fwd()
+        e1.record()
+        e1.synchronize()  # waits for the main stream only
+        return e0.elapsed_time(e1) / ITERS * 1e3  # us
 
-    t_alone = timed(fwd)
+    t_alone = timed_compute()
+    # enough unique-key prefetches (dedup never skips) to outlast the compute window
+    n_pref = int(ITERS * t_alone / 1e3 / per_expert_ms) + 4
+    t_busy = timed_compute(prefetch_backlog=n_pref)
+    torch.cuda.synchronize()  # drain the side stream before reporting
 
-    step = [0]
-    def fwd_with_prefetch():
-        # 2 experts/step, unique (layer, expert) keys so dedup never skips
-        for j in (0, 1):
-            k = step[0] * 2 + j
-            pool.prefetch(k // E % 32, k % E, hw1, hw2, hw3)
-        step[0] += 1
-        fwd()
-    t_both = timed(fwd_with_prefetch)
-
-    copied_gb = 2 * EXPERT_MB / 1024              # 2 experts per step
-    eff_copy = copied_gb / (t_both * 1e-6)        # GB/s sustained during compute
-    print(f"\nop1 alone:            {t_alone:8.1f} us")
-    print(f"op1 + 2-expert prefetch: {t_both:8.1f} us  "
-          f"(compute slowdown {t_both / t_alone - 1:+.1%})")
-    print(f"effective prefetch bandwidth under compute: {eff_copy:.1f} GB/s "
-          f"(idle-bus pinned: {pinned:.1f})")
-    print(f"=> to hide B experts/layer behind a ~{t_alone/1e3:.1f}ms MoE layer, "
-          f"prefetch must run ~{per_expert_ms * 2 / (t_alone / 1e3):.1f} layers ahead per expert-pair")
+    print(f"\nop1 alone:                {t_alone:8.1f} us")
+    print(f"op1 under active prefetch: {t_busy:8.1f} us  "
+          f"(compute slowdown {t_busy / t_alone - 1:+.1%})")
+    print(f"({n_pref} experts = {n_pref * EXPERT_MB / 1024:.1f} GB streamed on the side stream "
+          f"during the timed region)")
+    print(f"=> to hide B experts/layer behind a ~{t_busy/1e3:.1f}ms MoE layer, "
+          f"prefetch must run ~{per_expert_ms / (t_busy / 1e3):.1f}*B layers ahead")
 
 
 if __name__ == "__main__":
