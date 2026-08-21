@@ -87,25 +87,70 @@ def test_tree_forward_equals_path_forward(tiny_model, tiny_config, rng):
     torch.testing.assert_close(tree_logits[-1], ar_logits[-1], rtol=1e-3, atol=1e-4)
 
 
+def test_offload_staging_matches_resident(tiny_config, rng):
+    """layout="offload" staging path must produce identical logits to the
+    resident path (staging is a pure copy; validated here on CPU)."""
+    import dataclasses
+
+    w = random_weights(tiny_config, rng)
+    ids = torch.randint(0, tiny_config.vocab_size, (5,), generator=rng)
+    pos = torch.arange(5)
+
+    kv1 = PagedKVCache(tiny_config, num_blocks=8, device="cpu", dtype=tiny_config.dtype)
+    resident = MixtralForward(w, kv1, moe_fn=naive_moe).forward(ids, pos)
+
+    w_off = dataclasses.replace(
+        w, layers=[dataclasses.replace(lw, experts_on_gpu=False) for lw in w.layers])
+    kv2 = PagedKVCache(tiny_config, num_blocks=8, device="cpu", dtype=tiny_config.dtype)
+    staged = MixtralForward(w_off, kv2, moe_fn=naive_moe).forward(ids, pos)
+
+    assert torch.equal(resident, staged)  # bitwise: staging is a pure copy
+
+
 @pytest.mark.model
 @pytest.mark.gpu
 def test_ar_logits_match_hf():
-    """M1 anchor (plan Task 1.2): 32 greedy steps identical to HF Mixtral."""
+    """M1 anchor (plan Task 1.2): 32 greedy steps identical to HF Mixtral.
+
+    Runs on 24GB cards (e.g. 4090) via sequential offload: HF generates first
+    with accelerate CPU-offload, is freed, then our forward re-runs with
+    layout="offload" (experts pinned in host RAM, staged per layer). Slow
+    (~minutes) but numerically identical -- computation stays on-GPU BF16.
+    Needs host RAM >= ~110GB. Cards >= 120GB take the original resident path.
+    """
+    import gc
+
     transformers = pytest.importorskip("transformers")
     from treemoe.model.weights import load_mixtral_weights
 
     model_dir = "checkpoints/mixtral-8x7b-instruct"
     tok = transformers.AutoTokenizer.from_pretrained(model_dir)
-    hf = transformers.AutoModelForCausalLM.from_pretrained(
-        model_dir, torch_dtype=torch.bfloat16, device_map="cuda"
-    )
-    cfg = MixtralConfig()
-    w = load_mixtral_weights(model_dir, cfg)
-    kv = PagedKVCache(cfg, num_blocks=64)
-    ours = MixtralForward(w, kv)
+    total_gb = torch.cuda.get_device_properties(0).total_memory / 2**30
+    resident = total_gb >= 120
 
+    # ---- phase 1: HF reference tokens, then free everything ----
+    hf = transformers.AutoModelForCausalLM.from_pretrained(
+        model_dir, torch_dtype=torch.bfloat16,
+        device_map="cuda" if resident else "auto",
+        max_memory=None if resident else {0: f"{int(total_gb) - 6}GiB",
+                                          "cpu": "200GiB"},
+    )
     ids = tok("The capital of France is", return_tensors="pt").input_ids[0].cuda()
     hf_out = hf.generate(ids.unsqueeze(0), do_sample=False, max_new_tokens=32)[0, ids.shape[0]:]
+    hf_tokens = hf_out.tolist()
+    del hf
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # ---- phase 2: our forward on the same prompt ----
+    cfg = MixtralConfig()
+    w = load_mixtral_weights(
+        model_dir, cfg,
+        layout="full" if resident else "offload",
+        offload_layers=None if resident else set(range(cfg.num_layers)),
+    )
+    kv = PagedKVCache(cfg, num_blocks=64)
+    ours = MixtralForward(w, kv)
 
     pos = torch.arange(ids.shape[0], device="cuda")
     logits = ours.forward(ids, pos)
@@ -116,4 +161,4 @@ def test_ar_logits_match_hf():
         p = torch.tensor([kv.seq_len], device="cuda")
         logits = ours.forward(cur.unsqueeze(0), p)
         cur = logits[-1].argmax()
-    assert our_tokens == hf_out.tolist()
+    assert our_tokens == hf_tokens

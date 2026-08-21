@@ -10,6 +10,7 @@ Design goals over speed (this is the M1 correctness anchor, plan Task 1.2):
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Callable, Optional
 
 import torch
@@ -73,6 +74,28 @@ class MixtralForward:
         self.kv = kv
         self.moe_fn: MoEFn = moe_fn or naive_moe
         self.rope_cos, self.rope_sin = build_rope_cache(self.cfg, weights.embed_tokens.device.type)
+        # reusable GPU staging buffers for layout="offload" layers (one layer's
+        # experts = 2.82GB at Mixtral shapes) -- allocated on first use
+        self._staging: Optional[dict[str, torch.Tensor]] = None
+
+    def _stage_experts(self, lw: LayerWeights) -> LayerWeights:
+        """Copy pinned-host expert weights into a reusable GPU staging buffer.
+
+        Correctness-only path for small-VRAM cards (e.g. 4090-24G red-line
+        runs): synchronous per-layer PCIe copy, ~6s/forward at Mixtral shapes.
+        The performance path is op2's ring-buffer prefetcher (config B)."""
+        dev = lw.router.device
+        if self._staging is None:
+            self._staging = {
+                "w1": torch.empty_like(lw.w1, device=dev),
+                "w2": torch.empty_like(lw.w2, device=dev),
+                "w3": torch.empty_like(lw.w3, device=dev),
+            }
+        self._staging["w1"].copy_(lw.w1, non_blocking=True)
+        self._staging["w2"].copy_(lw.w2, non_blocking=True)
+        self._staging["w3"].copy_(lw.w3, non_blocking=True)
+        return replace(lw, w1=self._staging["w1"], w2=self._staging["w2"],
+                       w3=self._staging["w3"], experts_on_gpu=True)
 
     # ---------------- attention ----------------
 
@@ -137,7 +160,8 @@ class MixtralForward:
             h = rms_norm(x, lw.input_layernorm, cfg.rms_eps)
             x = x + self._attention(lw, layer_idx, h, positions, tree_mask, is_tree)
             h = rms_norm(x, lw.post_attn_layernorm, cfg.rms_eps)
-            x = x + self.moe_fn(h, lw, layer_idx)
+            moe_lw = lw if lw.experts_on_gpu else self._stage_experts(lw)
+            x = x + self.moe_fn(h, moe_lw, layer_idx)
             if layer_idx == cfg.num_layers - 2:
                 penultimate = x  # EAGLE-2 draft feature source (spec §3.2)
         x = rms_norm(x, self.w.final_norm, cfg.rms_eps)

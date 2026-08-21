@@ -100,7 +100,12 @@ def load_mixtral_weights(
         w2 = _stack_experts(get, i, "w2", config.num_experts)
         w3 = _stack_experts(get, i, "w3", config.num_experts)
         if expert_device == "cpu":
-            w1, w2, w3 = w1.pin_memory(), w2.pin_memory(), w3.pin_memory()
+            try:
+                w1, w2, w3 = w1.pin_memory(), w2.pin_memory(), w3.pin_memory()
+            except RuntimeError:
+                # not enough lockable host memory: keep pageable (slower H2D
+                # copies but functionally identical)
+                pass
         else:
             w1, w2, w3 = w1.to(device), w2.to(device), w3.to(device)
         layers.append(

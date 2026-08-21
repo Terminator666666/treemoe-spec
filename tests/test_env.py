@@ -12,8 +12,11 @@ MODEL = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 def test_mixtral_forward_one_token():
     transformers = pytest.importorskip("transformers")
     tok = transformers.AutoTokenizer.from_pretrained(MODEL)
+    total_gb = torch.cuda.get_device_properties(0).total_memory / 2**30
     model = transformers.AutoModelForCausalLM.from_pretrained(
-        MODEL, torch_dtype=torch.bfloat16, device_map="auto"
+        MODEL, torch_dtype=torch.bfloat16, device_map="auto",
+        # cap GPU usage so accelerate offloads to host RAM on small cards
+        max_memory={0: f"{int(total_gb) - 6}GiB", "cpu": "200GiB"},
     )
     ids = tok("hello", return_tensors="pt").input_ids.to(model.device)
     out = model(ids)
