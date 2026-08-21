@@ -511,11 +511,14 @@ def tree_moe_forward(
     # u32-packed weight loads need 16-bit elements and even strides/tiles
     pack_w = int(w1.element_size() == 2 and hidden % 2 == 0 and inter % 2 == 0
                  and bk1 % 2 == 0 and bk2 % 2 == 0)
+    if os.getenv("TREEMOE_PACK_W") == "0":  # debug: force plain weight loads
+        pack_w = 0
 
     max_bpe = (2 * n + BM - 1) // BM
     # fused Kernel A: single-CTA route+bucket (1 launch vs ~8 torch ops);
     # register footprint of the O((2N)^2) rank limits it to N<=64, E<=16
-    use_fused_a = (n & (n - 1)) == 0 and 16 <= n <= 64 and e <= 16
+    use_fused_a = ((n & (n - 1)) == 0 and 16 <= n <= 64 and e <= 16
+                   and os.getenv("TREEMOE_FUSED_A") != "0")  # debug: force torch routing
     if use_fused_a:
         _route_bucket_fused_kernel[(1,)](
             x, router_weight, node_accept_prob,
