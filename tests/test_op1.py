@@ -114,6 +114,14 @@ def test_empty_expert_contributes_nothing(rng):
 @pytest.mark.parametrize("n", [32, 64, 128])
 @pytest.mark.parametrize("budget", [4, 8])
 def test_triton_matches_ref(n, budget):
+    """Kernel error vs an fp32 golden must stay within 2x the bf16 reference's
+    own error (FlashAttention-style criterion).
+
+    Fixed absolute tolerances are wrong at real shapes: with H=4096/I=14336
+    bf16 accumulation, kernel and cuBLAS reference legitimately differ by
+    ~1 ulp of the output magnitude (0.125 at |y|~16-32), as measured on a
+    4090 (diag_op1.py: all 4 fused/packed combos gave identical max|d|).
+    """
     from treemoe.kernels.op1_tree_moe import tree_moe_forward
 
     g = torch.Generator().manual_seed(7)
@@ -122,7 +130,14 @@ def test_triton_matches_ref(n, budget):
     router, accept = router.cuda(), accept.cuda()
     out = tree_moe_forward(x, w1, w2, w3, router, accept, budget)
     ref = tree_moe_forward_ref(x, w1, w2, w3, router, accept, budget)
-    torch.testing.assert_close(out.float(), ref.float(), rtol=1e-3, atol=1e-2)
+    golden = tree_moe_forward_ref(
+        x.float(), w1.float(), w2.float(), w3.float(), router.float(), accept, budget
+    )
+    err_out = (out.float() - golden).abs().max().item()
+    err_ref = (ref.float() - golden).abs().max().item()
+    assert err_out <= 2 * err_ref + 1e-4, (
+        f"kernel err {err_out:.4f} > 2x reference err {err_ref:.4f} + 1e-4"
+    )
 
 
 @pytest.mark.gpu
