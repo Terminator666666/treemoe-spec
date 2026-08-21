@@ -48,6 +48,10 @@ BK2 = 32   # gemm2 K over I (within split-K segment). With u32-packed weight
 # Mixtral shapes, roofline.py) — identical regs/occupancy, and the worst-case
 # grid (B=2: 8 m-blocks x H/BN2 x 4 = 4096 CTAs) still fills 132 SMs
 SPLIT_K = 4
+# launch configs as module constants so benchmarks/sweep_op1.py can patch
+# them for on-silicon tuning (4090 profile: gemm1 92% of peak, gemm2 48%)
+GEMM1_WARPS, GEMM1_STAGES = 8, 3   # ptxas sweep: 80 regs, zero spill, 38% occ
+GEMM2_WARPS, GEMM2_STAGES = 4, 4   # vLLM fused_moe default for small-M decode
 
 
 # --------------------------------------------------------------------------
@@ -548,9 +552,7 @@ def tree_moe_forward(
     _moe_gemm1_kernel[grid1](
         x, w1, w3, ws.h, padded_slots, block_expert_ids,
         H=hidden, I=inter, BLOCK_M=BM, BLOCK_N=bn1, BLOCK_K=bk1, PACK_W=pack_w,
-        # nw=8/ns=3 (ptxas sweep): 80 regs, zero spill, 38% occupancy — the
-        # zero-spill config with the fewest regs at the 6-CTA/SM tier
-        num_warps=8, num_stages=3,
+        num_warps=GEMM1_WARPS, num_stages=GEMM1_STAGES,
     )
     grid2 = (max_blocks, hidden // bn2, SPLIT_K)
     if deterministic:
@@ -559,7 +561,7 @@ def tree_moe_forward(
             ws.h, w2, partial, gates_flat, padded_slots, block_expert_ids,
             R=ws.rows, H=hidden, I=inter,
             BLOCK_M=BM, BLOCK_N=bn2, BLOCK_K=bk2, SPLIT=SPLIT_K, PACK_W=pack_w,
-            num_warps=4, num_stages=4,
+            num_warps=GEMM2_WARPS, num_stages=GEMM2_STAGES,
         )
         _combine_kernel[(n, hidden // bn2)](
             partial, slot_to_row, ws.out_f32,
@@ -571,7 +573,7 @@ def tree_moe_forward(
             ws.h, w2, ws.out_f32, gates_flat, padded_slots, block_expert_ids,
             H=hidden, I=inter, BLOCK_M=BM, BLOCK_N=bn2, BLOCK_K=bk2, SPLIT=SPLIT_K,
             PACK_W=pack_w,
-            num_warps=4, num_stages=4,
+            num_warps=GEMM2_WARPS, num_stages=GEMM2_STAGES,
         )
     result = ws.out_f32.to(x.dtype)
     if out is not None:
