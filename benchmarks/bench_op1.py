@@ -9,7 +9,11 @@ Baselines are optional imports; missing ones are reported and skipped.
 from __future__ import annotations
 
 import argparse
+import sys
 import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 

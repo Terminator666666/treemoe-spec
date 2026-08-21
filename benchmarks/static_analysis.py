@@ -25,6 +25,9 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 # point Triton at the pip-installed ptxas (CPU-only triton wheel may not bundle one)
 _PTXAS_CANDIDATES = glob.glob(
