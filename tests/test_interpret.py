@@ -46,6 +46,19 @@ def test_op1_atomic_path_interpreted(rng):
     torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-5)
 
 
+def test_op1_packed_weight_path_interpreted(rng):
+    """16-bit weights take the PACK_W=1 branch (u32-packed loads + bit-unpack);
+    validates the little-endian unpack numerics end-to-end vs the reference.
+    fp16, not bf16: the interpreter's torch-bf16 -> numpy bridge is broken
+    (numpy has no bf16), garbling packed AND unpacked paths equally; fp16
+    executes the identical packed code path and is bit-exact vs unpacked."""
+    x, w1, w2, w3, router, accept = make_moe_inputs(N, E, H, I, rng,
+                                                    dtype=torch.float16)
+    out = tree_moe_forward(x, w1, w2, w3, router, accept, 4, deterministic=True)
+    ref = tree_moe_forward_ref(x, w1, w2, w3, router, accept, 4)
+    torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+
+
 def test_op1_degrade_branch_interpreted(rng):
     x, w1, w2, w3, router, _ = make_moe_inputs(N, E, H, I, rng)
     accept = torch.zeros(N)  # all nodes below tau -> top-1 gates

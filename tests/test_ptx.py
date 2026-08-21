@@ -78,11 +78,14 @@ def test_memory_bound_kernels_meet_occupancy_floor(compiled):
 
 
 def test_eviction_hints_survive_to_ptx(compiled):
+    # Note: the u32-packed weight loads (SASS vectorization round) drop
+    # evict_first — an accepted trade (8x fewer load instructions beats an L2
+    # hint on a 23.8GB/step stream that could never fit 50MB L2 anyway). The
+    # evict_last hints on reused x/h tiles are the ones that matter; guard them.
     for name in ("op1 GEMM1 (w1/w3 + SiLU)",
                  "op1 GEMM2 det (split-K partials)"):
         s, build = compiled[name]
         ptx = _ptx(build, name)
-        assert "evict_first" in ptx, f"{name}: weight-stream hint dropped"
         assert "evict_last" in ptx, f"{name}: reuse hint dropped"
 
 
@@ -90,3 +93,41 @@ def test_kernel_a_uses_wgmma(compiled):
     s, build = compiled["op1 Kernel A (fused route+bucket)"]
     ptx = _ptx(build, s.name)
     assert "wgmma" in ptx, "router GEMM lost Hopper wgmma (N=64 m-tile)"
+
+
+def _nvdisasm():
+    import glob
+    hits = glob.glob("/usr/local/lib/python3*/dist-packages/nvidia/*/bin/nvdisasm") \
+        + glob.glob(os.path.expanduser("~/.local/lib/python3*/site-packages/nvidia/*/bin/nvdisasm"))
+    return hits[0] if hits else None
+
+
+def test_weight_streams_vectorized_in_sass(compiled):
+    """SASS audit found Triton 3.7 lowers mma B-operand global loads in the
+    dot layout -> 16-bit scalar LDG.E.U16 (8x instruction bloat on the
+    dominant 23.8GB/step weight stream). The u32-packed load pattern forces
+    >=32-bit lanes; lock that in at the SASS level."""
+    import subprocess
+    nvd = _nvdisasm()
+    if nvd is None:
+        pytest.skip("nvdisasm not found (pip install nvidia-cuda-nvdisasm)")
+    ptxas = os.environ["TRITON_PTXAS_PATH"]
+    for name in ("op1 GEMM1 (w1/w3 + SiLU)",
+                 "op1 GEMM2 det (split-K partials)",
+                 "op1 GEMM2 atomic (fast path)"):
+        s, build = compiled[name]
+        safe = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_")
+        ptx_path = os.path.join(build, safe + ".ptx")
+        cubin = os.path.join(build, safe + ".cubin")
+        subprocess.run([ptxas, "-arch=sm_90a", "-O3", "-o", cubin, ptx_path],
+                       check=True, capture_output=True)
+        sass = subprocess.run([nvd, "-c", cubin], check=True,
+                              capture_output=True, text=True).stdout
+        loads = re.findall(r"LDG\.E[A-Z0-9.]*", sass)
+        wide = [l for l in loads if ".64" in l or ".128" in l]
+        # the u16 stragglers are the handful of x/h edge loads, not the
+        # weight stream; the weight stream must appear as wide loads
+        assert wide, f"{name}: no vectorized global loads in SASS ({loads})"
+        narrow_w = [l for l in loads if "U16" in l and ".EF" in l]
+        assert not narrow_w, (
+            f"{name}: weight stream regressed to scalar 16-bit loads: {narrow_w}")

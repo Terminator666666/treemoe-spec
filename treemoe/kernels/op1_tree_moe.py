@@ -39,9 +39,11 @@ BM = 16    # slot rows per block (M is tiny: <=16 tokens/expert typically)
 # AOT compile for sm_90a + ptxas -v register counts -> theoretical occupancy).
 # Both GEMMs are memory-bound streams; occupancy = latency hiding = bandwidth.
 BN1 = 64   # gemm1 N over I=14336
-BK1 = 64   # gemm1 K over H (with nw=8/ns=3: regs 232->102, occ 12%->25%)
-BN2 = 32   # gemm2 N over H:  regs 150->56, occ 19%->56%; rows stay 256B coalesced
-BK2 = 128  # gemm2 K over I (within split-K segment)
+BK1 = 64   # gemm1 K over H (u32-packed loads: regs 102->80, occ 25%->38%)
+BN2 = 32   # gemm2 N over H: rows stay 256B coalesced
+BK2 = 32   # gemm2 K over I (within split-K segment). With u32-packed weight
+           # loads BK=128 ballooned the unpack live range (116 regs, 25% occ);
+           # BK=32/nw4/ns4 -> 55 regs, zero spill, 56% occ, loads stay LDG.E.64
 # SPLIT_K 8->4 halves the fp32 partial round-trip (1.07 -> 0.54 GB/step at
 # Mixtral shapes, roofline.py) — identical regs/occupancy, and the worst-case
 # grid (B=2: 8 m-blocks x H/BN2 x 4 = 4096 CTAs) still fills 132 SMs
@@ -217,6 +219,7 @@ if HAS_TRITON:
         padded_slots_ptr, block_expert_ids_ptr,
         H: tl.constexpr, I: tl.constexpr,
         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+        PACK_W: tl.constexpr,   # 1 iff weights are 16-bit (u32-packed loads)
     ):
         pid_m = tl.program_id(0)   # slot block (expert-major -> expert-stationary)
         pid_n = tl.program_id(1)   # intermediate-dim block
@@ -230,12 +233,25 @@ if HAS_TRITON:
         tokens = tl.where(m_mask, slots // 2, 0)
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         offs_k = tl.arange(0, BLOCK_K)
+        offs_k2 = tl.arange(0, BLOCK_K // 2)   # one u32 lane = 2 bf16
 
         acc1 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         acc3 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        # SASS audit (nvdisasm): Triton 3.7 lowers mma B-operand loads in the
+        # dot layout -> 16-bit scalar LDG.E.U16, regardless of hints/tile/
+        # orientation. Reinterpreting the (16-bit) weight stream as u32 pairs
+        # forces >=32-bit lanes: LDG.E.U16 x32 -> LDG.E.64 x4 per tile in SASS
+        # (8x fewer load instructions), regs 102->80. Unpack is 2 shifts+ands
+        # in-register -- free next to a DRAM-bound stream. Trade-off: Triton
+        # drops the evict_first hint on this path (acceptable: a 23.8GB/step
+        # stream never fits 50MB L2; evict_last on reused x/h is kept).
         w_base = expert.to(tl.int64) * I * H
+        if PACK_W:
+            w1_u32 = w1_ptr.to(tl.pointer_type(tl.uint32), bitcast=True)
+            w3_u32 = w3_ptr.to(tl.pointer_type(tl.uint32), bitcast=True)
         for k0 in range(0, H, BLOCK_K):
             xk = k0 + offs_k
+            xk = tl.max_contiguous(tl.multiple_of(xk, BLOCK_K), BLOCK_K)
             # x rows are re-read by every n-block CTA of this expert -> pin in
             # L2 (PTX ld.global.L2::evict_last)
             x_tile = tl.load(
@@ -243,12 +259,25 @@ if HAS_TRITON:
                 mask=m_mask[:, None], other=0.0,
                 eviction_policy="evict_last",
             )
-            w_off = w_base + offs_n[:, None] * H + xk[None, :]
-            # weights stream through exactly once per step -> evict_first
-            # (ld.global.L2::evict_first): must NOT flush x/h tiles or the
-            # next layer's experts that op2 has L2-warmed
-            w1_t = tl.load(w1_ptr + w_off, eviction_policy="evict_first")
-            w3_t = tl.load(w3_ptr + w_off, eviction_policy="evict_first")
+            if PACK_W:
+                k32 = k0 // 2 + offs_k2
+                k32 = tl.max_contiguous(tl.multiple_of(k32, BLOCK_K // 2), BLOCK_K // 2)
+                w_off32 = w_base // 2 + offs_n[:, None] * (H // 2) + k32[None, :]
+                w1_32 = tl.load(w1_u32 + w_off32, eviction_policy="evict_first")
+                w3_32 = tl.load(w3_u32 + w_off32, eviction_policy="evict_first")
+                # little-endian: low half = element 2k, high half = element 2k+1
+                w1_t = tl.interleave(
+                    (w1_32 & 0xFFFF).to(tl.uint16).to(w1_ptr.dtype.element_ty, bitcast=True),
+                    (w1_32 >> 16).to(tl.uint16).to(w1_ptr.dtype.element_ty, bitcast=True),
+                )
+                w3_t = tl.interleave(
+                    (w3_32 & 0xFFFF).to(tl.uint16).to(w3_ptr.dtype.element_ty, bitcast=True),
+                    (w3_32 >> 16).to(tl.uint16).to(w3_ptr.dtype.element_ty, bitcast=True),
+                )
+            else:  # 32-bit weights (interpreter parity tests): loads already wide
+                w_off = w_base + offs_n[:, None] * H + xk[None, :]
+                w1_t = tl.load(w1_ptr + w_off, eviction_policy="evict_first")
+                w3_t = tl.load(w3_ptr + w_off, eviction_policy="evict_first")
             acc1 += tl.dot(x_tile, tl.trans(w1_t))
             acc3 += tl.dot(x_tile, tl.trans(w3_t))
 
@@ -268,7 +297,7 @@ if HAS_TRITON:
         padded_slots_ptr, block_expert_ids_ptr,
         H: tl.constexpr, I: tl.constexpr,
         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-        SPLIT: tl.constexpr,
+        SPLIT: tl.constexpr, PACK_W: tl.constexpr,
     ):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)   # output(H)-dim block
@@ -283,19 +312,34 @@ if HAS_TRITON:
         tokens = tl.where(m_mask, slots // 2, 0)
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         offs_k = tl.arange(0, BLOCK_K)
+        offs_k2 = tl.arange(0, BLOCK_K // 2)
 
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         seg = I // SPLIT
+        # u32-packed weight stream: see _moe_gemm1_kernel SASS-audit note
         w_base = expert.to(tl.int64) * H * I
+        if PACK_W:
+            w2_u32 = w2_ptr.to(tl.pointer_type(tl.uint32), bitcast=True)
         for k0 in range(pid_s * seg, (pid_s + 1) * seg, BLOCK_K):
             hk = k0 + offs_k
+            hk = tl.max_contiguous(tl.multiple_of(hk, BLOCK_K), BLOCK_K)
             h_tile = tl.load(
                 h_ptr + offs_m[:, None].to(tl.int64) * I + hk[None, :],
                 mask=m_mask[:, None], other=0.0,
                 eviction_policy="evict_last",   # h reused by all pid_n CTAs
             )
-            w2_t = tl.load(w2_ptr + w_base + offs_n[:, None] * I + hk[None, :],
-                           eviction_policy="evict_first")  # streamed once
+            if PACK_W:
+                k32 = k0 // 2 + offs_k2
+                k32 = tl.max_contiguous(tl.multiple_of(k32, BLOCK_K // 2), BLOCK_K // 2)
+                w2_32 = tl.load(w2_u32 + w_base // 2 + offs_n[:, None] * (I // 2) + k32[None, :],
+                                eviction_policy="evict_first")
+                w2_t = tl.interleave(
+                    (w2_32 & 0xFFFF).to(tl.uint16).to(w2_ptr.dtype.element_ty, bitcast=True),
+                    (w2_32 >> 16).to(tl.uint16).to(w2_ptr.dtype.element_ty, bitcast=True),
+                )
+            else:
+                w2_t = tl.load(w2_ptr + w_base + offs_n[:, None] * I + hk[None, :],
+                               eviction_policy="evict_first")  # streamed once
             acc += tl.dot(h_tile, tl.trans(w2_t))
 
         gate = tl.load(gates_ptr + slots, mask=m_mask, other=0.0)  # [BM] fp32
@@ -313,7 +357,7 @@ if HAS_TRITON:
         R: tl.constexpr,           # padded rows = max_blocks * BLOCK_M
         H: tl.constexpr, I: tl.constexpr,
         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-        SPLIT: tl.constexpr,
+        SPLIT: tl.constexpr, PACK_W: tl.constexpr,
     ):
         """Deterministic variant: split-k partials go to a private workspace row
         (plain store, no atomics); _combine_kernel reduces them in fixed order.
@@ -332,19 +376,34 @@ if HAS_TRITON:
         m_mask = slots >= 0
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         offs_k = tl.arange(0, BLOCK_K)
+        offs_k2 = tl.arange(0, BLOCK_K // 2)
 
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         seg = I // SPLIT
+        # u32-packed weight stream: see _moe_gemm1_kernel SASS-audit note
         w_base = expert.to(tl.int64) * H * I
+        if PACK_W:
+            w2_u32 = w2_ptr.to(tl.pointer_type(tl.uint32), bitcast=True)
         for k0 in range(pid_s * seg, (pid_s + 1) * seg, BLOCK_K):
             hk = k0 + offs_k
+            hk = tl.max_contiguous(tl.multiple_of(hk, BLOCK_K), BLOCK_K)
             h_tile = tl.load(
                 h_ptr + offs_m[:, None].to(tl.int64) * I + hk[None, :],
                 mask=m_mask[:, None], other=0.0,
                 eviction_policy="evict_last",
             )
-            w2_t = tl.load(w2_ptr + w_base + offs_n[:, None] * I + hk[None, :],
-                           eviction_policy="evict_first")
+            if PACK_W:
+                k32 = k0 // 2 + offs_k2
+                k32 = tl.max_contiguous(tl.multiple_of(k32, BLOCK_K // 2), BLOCK_K // 2)
+                w2_32 = tl.load(w2_u32 + w_base // 2 + offs_n[:, None] * (I // 2) + k32[None, :],
+                                eviction_policy="evict_first")
+                w2_t = tl.interleave(
+                    (w2_32 & 0xFFFF).to(tl.uint16).to(w2_ptr.dtype.element_ty, bitcast=True),
+                    (w2_32 >> 16).to(tl.uint16).to(w2_ptr.dtype.element_ty, bitcast=True),
+                )
+            else:
+                w2_t = tl.load(w2_ptr + w_base + offs_n[:, None] * I + hk[None, :],
+                               eviction_policy="evict_first")
             acc += tl.dot(h_tile, tl.trans(w2_t))
 
         gate = tl.load(gates_ptr + slots, mask=m_mask, other=0.0)
@@ -437,7 +496,7 @@ def tree_moe_forward(
 
     n, hidden = x.shape
     e, inter, _ = w1.shape
-    key = (n, e, hidden, inter, x.device.index if x.is_cuda else -1)
+    key = (n, e, hidden, inter, x.device.index if x.is_cuda else -1, x.dtype)
     ws = _ws_cache.get(key)
     if ws is None:
         ws = _ws_cache[key] = _Workspace(n, e, hidden, inter, x.device, x.dtype)
@@ -449,6 +508,9 @@ def tree_moe_forward(
     bn2 = BN2 if hidden % BN2 == 0 else hidden      # gemm2/combine N-dim = H
     seg = inter // SPLIT_K
     bk2 = min(BK2, seg) if seg % min(BK2, seg) == 0 else seg
+    # u32-packed weight loads need 16-bit elements and even strides/tiles
+    pack_w = int(w1.element_size() == 2 and hidden % 2 == 0 and inter % 2 == 0
+                 and bk1 % 2 == 0 and bk2 % 2 == 0)
 
     max_bpe = (2 * n + BM - 1) // BM
     # fused Kernel A: single-CTA route+bucket (1 launch vs ~8 torch ops);
@@ -482,9 +544,9 @@ def tree_moe_forward(
     grid1 = (max_blocks, inter // bn1)
     _moe_gemm1_kernel[grid1](
         x, w1, w3, ws.h, padded_slots, block_expert_ids,
-        H=hidden, I=inter, BLOCK_M=BM, BLOCK_N=bn1, BLOCK_K=bk1,
-        # nw=8/ns=3 (ptxas sweep): 102 regs, zero spill, 25% occupancy — the
-        # zero-spill config with the fewest regs at the 4-CTA/SM tier
+        H=hidden, I=inter, BLOCK_M=BM, BLOCK_N=bn1, BLOCK_K=bk1, PACK_W=pack_w,
+        # nw=8/ns=3 (ptxas sweep): 80 regs, zero spill, 38% occupancy — the
+        # zero-spill config with the fewest regs at the 6-CTA/SM tier
         num_warps=8, num_stages=3,
     )
     grid2 = (max_blocks, hidden // bn2, SPLIT_K)
@@ -493,7 +555,7 @@ def tree_moe_forward(
         _moe_gemm2_det_kernel[grid2](
             ws.h, w2, partial, gates_flat, padded_slots, block_expert_ids,
             R=ws.rows, H=hidden, I=inter,
-            BLOCK_M=BM, BLOCK_N=bn2, BLOCK_K=bk2, SPLIT=SPLIT_K,
+            BLOCK_M=BM, BLOCK_N=bn2, BLOCK_K=bk2, SPLIT=SPLIT_K, PACK_W=pack_w,
             num_warps=4, num_stages=4,
         )
         _combine_kernel[(n, hidden // bn2)](
@@ -505,6 +567,7 @@ def tree_moe_forward(
         _moe_gemm2_kernel[grid2](
             ws.h, w2, ws.out_f32, gates_flat, padded_slots, block_expert_ids,
             H=hidden, I=inter, BLOCK_M=BM, BLOCK_N=bn2, BLOCK_K=bk2, SPLIT=SPLIT_K,
+            PACK_W=pack_w,
             num_warps=4, num_stages=4,
         )
     result = ws.out_f32.to(x.dtype)
