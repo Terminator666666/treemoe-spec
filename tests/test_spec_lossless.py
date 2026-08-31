@@ -130,8 +130,7 @@ def test_spec_lossless_with_eagle_draft(engine_pair, rng):
         assert draft._ck.shape[0] == target.kv.seq_len - 1
 
 
-def test_eagle_tree_mask_chain_equals_causal(tiny_config):
-    # a linear chain stepped one node per level with explicit ancestor masks
+def test_eagle_tree_mask_chain_equals_causal(tiny_config):    # a linear chain stepped one node per level with explicit ancestor masks
     # must reproduce the same features/logits as one causal batch: the tree
     # topology mask is exactly "ancestors + self".
     from treemoe.model.eagle import EagleDraftModel
@@ -166,6 +165,69 @@ def test_accept_length_stat_updates(engine_pair, rng):
     eng.generate(prompt, max_new_tokens=10)
     assert eng.stats.steps >= 1
     assert eng.stats.mean_accept_len >= 1.0  # bonus token guarantees >=1/step
+
+
+@pytest.mark.gpu
+def test_spec_lossless_vs_ar_gpu_kernel_commit(tiny_config):
+    """Red line on real silicon: CUDA + temperature 0 selects use_kernel=True in
+    fused_verify_commit, so this exercises the Triton argmax/greedy-verify and
+    _kv_commit_kernel [root]+accepted path (grid max_depth+1) that CPU runs
+    can only reach via the interpreter. Both drafts, 40 tokens, multi-seed."""
+    from dataclasses import replace
+
+    from treemoe.model.eagle import EagleDraftModel
+
+    cfg = replace(tiny_config)  # tiny fp32 shapes, but on CUDA
+    w = random_weights(cfg, torch.Generator().manual_seed(21))
+    w = replace(
+        w,
+        embed_tokens=w.embed_tokens.cuda(), final_norm=w.final_norm.cuda(),
+        lm_head=w.lm_head.cuda(),
+        layers=[replace(
+            lw,
+            input_layernorm=lw.input_layernorm.cuda(),
+            post_attn_layernorm=lw.post_attn_layernorm.cuda(),
+            attn={k: v.cuda() for k, v in lw.attn.items()},
+            router=lw.router.cuda(),
+            w1=lw.w1.cuda(), w2=lw.w2.cuda(), w3=lw.w3.cuda(),
+        ) for lw in w.layers],
+    )
+    ew = random_eagle_weights(cfg, torch.Generator().manual_seed(22))
+    ew = replace(
+        ew,
+        fc=ew.fc.cuda(),
+        attn={k: v.cuda() for k, v in ew.attn.items()},
+        input_layernorm=ew.input_layernorm.cuda(),
+        post_attn_layernorm=ew.post_attn_layernorm.cuda(),
+        mlp_gate=ew.mlp_gate.cuda(), mlp_up=ew.mlp_up.cuda(),
+        mlp_down=ew.mlp_down.cuda(),
+    )
+
+    def fresh():
+        kv = PagedKVCache(cfg, num_blocks=16, device="cuda", dtype=cfg.dtype)
+        return MixtralForward(w, kv, moe_fn=naive_moe)
+
+    def ar(prompt, n):
+        m = fresh()
+        logits = m.forward(prompt, torch.arange(prompt.shape[0], device="cuda"))
+        out = [int(logits[-1].argmax())]
+        while len(out) < n:
+            logits = m.forward(torch.tensor([out[-1]], device="cuda"),
+                               torch.tensor([m.kv.seq_len], device="cuda"))
+            out.append(int(logits[-1].argmax()))
+        return out
+
+    for seed in (1, 7):
+        g = torch.Generator().manual_seed(seed)
+        prompt = torch.randint(0, cfg.vocab_size, (5,), generator=g).cuda()
+        base = ar(prompt.clone(), 40)
+        for draft in (TinyDraft(cfg.vocab_size),
+                      EagleDraftModel(ew, cfg, w.embed_tokens, w.lm_head)):
+            eng = SpecDecodeEngine(fresh(), draft, tree_size=8, max_depth=3,
+                                   expert_budget=8)
+            spec = eng.generate(prompt.clone(), max_new_tokens=40,
+                                eos_token_id=-1)
+            assert spec == base, f"seed {seed} draft {type(draft).__name__}"
 
 
 def test_analyze_tree_group_simulation():
