@@ -39,6 +39,22 @@ def test_full_op1_pipeline_interpreted(rng, budget):
     torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-5)
 
 
+def test_op1_two_phase_routing_interpreted(rng):
+    """route_experts + tree_moe_forward(routing=...) on the interpreter:
+    bitwise-equal to the single-call path; expert_ids() exposes the routed
+    set for the op2 prefetch-repair contract."""
+    from treemoe.kernels.op1_tree_moe import route_experts
+
+    x, w1, w2, w3, router, accept = make_moe_inputs(N, E, H, I, rng)
+    inline = tree_moe_forward(x, w1, w2, w3, router, accept, 4, deterministic=True).clone()
+    routing = route_experts(x, router, accept, 4, I)
+    ids = routing.expert_ids()
+    assert ids and all(0 <= e < E for e in ids)
+    two_phase = tree_moe_forward(x, w1, w2, w3, router, accept, 4,
+                                 deterministic=True, routing=routing)
+    torch.testing.assert_close(inline, two_phase, rtol=0, atol=0)
+
+
 def test_op1_atomic_path_interpreted(rng):
     x, w1, w2, w3, router, accept = make_moe_inputs(N, E, H, I, rng)
     out = tree_moe_forward(x, w1, w2, w3, router, accept, 8, deterministic=False)

@@ -211,6 +211,79 @@ def test_layer_prefetcher_bitmap_copies_only_predicted_rows(rng):
     assert torch.equal(got["w1"][1], layers[0].w1[1])   # unpredicted row: stale
 
 
+def _repairing_moe_fn(pf):
+    """naive_moe wrapper implementing the exact-offload contract: derive the
+    routed expert set (same math as naive_moe's own top-2) and repair the
+    staged buffer BEFORE the expert weights are read."""
+    import torch.nn.functional as F
+
+    from treemoe.model.mixtral import naive_moe
+
+    def fn(x, lw, layer_idx):
+        gates = torch.softmax(F.linear(x.float(), lw.router.float()), dim=-1)
+        ids = set(gates.topk(2, dim=-1).indices.flatten().tolist())
+        pf.repair(layer_idx, ids)
+        return naive_moe(x, lw, layer_idx)
+
+    return fn
+
+
+def test_layer_prefetcher_repair_makes_bitmap_lossless(tiny_config, rng):
+    """Exact-offload contract (cf. DualDeadline 2026): a deliberately terrible
+    bitmap (expert 0 only) + repair() must still be bitwise identical to the
+    resident forward — mispredictions become on-demand copies, not errors."""
+    from test_parity import random_weights
+    from treemoe.model.kv_cache import PagedKVCache
+    from treemoe.model.mixtral import MixtralForward, naive_moe
+
+    w = random_weights(tiny_config, rng)
+    ids = torch.randint(0, tiny_config.vocab_size, (5,), generator=rng)
+    pos = torch.arange(5)
+
+    kv1 = PagedKVCache(tiny_config, num_blocks=8, device="cpu", dtype=tiny_config.dtype)
+    resident = MixtralForward(w, kv1, moe_fn=naive_moe).forward(ids, pos)
+
+    w_off = _offload_all(w)
+    pf = LayerPrefetcher(w_off.layers, depth=2)
+    bm = torch.zeros(tiny_config.num_layers, tiny_config.num_experts, dtype=torch.bool)
+    bm[:, 0] = True                             # predict only expert 0 everywhere
+    pf.set_bitmap(bm)
+    kv2 = PagedKVCache(tiny_config, num_blocks=8, device="cpu", dtype=tiny_config.dtype)
+    off = MixtralForward(w_off, kv2, moe_fn=_repairing_moe_fn(pf), prefetcher=pf).forward(ids, pos)
+
+    assert pf.repair_misses > 0                 # the bad bitmap really missed
+    assert torch.equal(resident, off)           # ...and repair kept it lossless
+
+
+def test_layer_prefetcher_auto_bitmap_temporal(tiny_config, rng):
+    """Zero-training temporal predictor: pass 2's bitmap = pass 1's observed
+    expert sets. Both passes must stay bitwise exact, and pass 2 must actually
+    restrict copies (2 tokens x top-2 => <=4 of 8 experts staged)."""
+    from test_parity import random_weights
+    from treemoe.model.kv_cache import PagedKVCache
+    from treemoe.model.mixtral import MixtralForward, naive_moe
+
+    w = random_weights(tiny_config, rng)
+    w_off = _offload_all(w)
+    pf = LayerPrefetcher(w_off.layers, depth=2, auto_bitmap=True)
+    moe_fn = _repairing_moe_fn(pf)
+
+    for step in range(2):
+        ids = torch.randint(0, tiny_config.vocab_size, (2,), generator=rng)
+        pos = torch.arange(2)
+        kv1 = PagedKVCache(tiny_config, num_blocks=8, device="cpu", dtype=tiny_config.dtype)
+        resident = MixtralForward(w, kv1, moe_fn=naive_moe).forward(ids, pos)
+        kv2 = PagedKVCache(tiny_config, num_blocks=8, device="cpu", dtype=tiny_config.dtype)
+        off = MixtralForward(w_off, kv2, moe_fn=moe_fn, prefetcher=pf).forward(ids, pos)
+        assert torch.equal(resident, off), f"pass {step} diverged"
+        if step == 0:
+            assert all(s is None for s in pf._staged_rows.values())  # no history yet
+        else:
+            # temporal bitmap = pass-1 usage: <=4 experts/layer staged up-front
+            assert pf._bitmap is not None and (pf._bitmap.sum(-1) <= 4).all()
+            assert all(s is not None for s in pf._staged_rows.values())
+
+
 @pytest.mark.gpu
 def test_layer_prefetcher_gpu_forward_matches_resident(tiny_config, rng):
     """Real side-stream + event ordering: pinned-host offload forward must be

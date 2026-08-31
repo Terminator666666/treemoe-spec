@@ -136,23 +136,38 @@ class LayerPrefetcher:
     (free) and use-after-copy (ready).
 
     Bitmap mode (`set_bitmap`, [L, E] bool from RouterPredictor.predict_bitmap):
-    only predicted experts' rows are copied; unpredicted rows keep stale data,
-    which is only sound when routing is restricted to the predicted set (op3
-    budget) — same lossy contract as op3. `bitmap=None` copies every row and
-    is bitwise equivalent to MixtralForward's synchronous staging path.
+    only predicted experts' rows are copied. On its own this is lossy
+    (unpredicted rows keep stale data); consumers that call `repair()` with
+    the routed expert set between routing and the expert GEMMs make it EXACT:
+    predicted hits overlap with compute for free, mispredictions cost an
+    on-demand copy on the compute stream (cf. DualDeadline 2026's exact
+    offloaded-MoE prefetching). `bitmap=None` copies every row and is bitwise
+    equivalent to MixtralForward's synchronous staging path.
+
+    auto_bitmap=True is a zero-training predictor (cf. MoE-SpeQ 2025): the
+    bitmap for each pass is the expert set repair() observed in the previous
+    pass — consecutive spec-decode steps extend the same sequence, so routing
+    has strong temporal locality. First pass falls back to full copies.
+    Requires repair()-calling consumers (it both records usage and restores
+    exactness on misses).
 
     On CPU tensors (tiny-config tests) copies degrade to synchronous — the
     buffer-cycling logic is identical and testable without a GPU.
     """
 
-    def __init__(self, layers, depth: int = 2):
+    def __init__(self, layers, depth: int = 2, auto_bitmap: bool = False):
         self.layers = layers
         self.offload_ids = [i for i, lw in enumerate(layers) if not lw.experts_on_gpu]
         self.depth = max(1, min(depth, max(1, len(self.offload_ids))))
+        self.auto_bitmap = auto_bitmap
         self._bufs: list[dict[str, torch.Tensor]] | None = None
         self._buf_of: dict[int, int] = {}   # layer idx -> buffer slot (this pass)
         self._queue: list[int] = []         # offloaded layers not yet scheduled
         self._bitmap: torch.Tensor | None = None
+        self._staged_rows: dict[int, set[int] | None] = {}  # None = all rows
+        self._used_prev: dict[int, set[int]] = {}  # repair() observations, last pass
+        self._used_cur: dict[int, set[int]] = {}
+        self.repair_misses = 0              # cumulative mispredicted experts
         self._cuda = False
         self._stream = None
         self._ready: list[torch.cuda.Event] = []
@@ -181,6 +196,13 @@ class LayerPrefetcher:
             return
         if self._bufs is None:
             self._ensure_buffers(self.layers[self.offload_ids[0]])
+        if self._used_cur:
+            self._used_prev = self._used_cur
+        self._used_cur = {}
+        if self.auto_bitmap:
+            num_experts = self.layers[self.offload_ids[0]].w1.shape[0]
+            self.set_bitmap(self.temporal_bitmap(num_experts))
+        self._staged_rows.clear()
         self._buf_of.clear()
         self._queue = list(self.offload_ids)
         for _ in range(min(self.depth, len(self._queue))):
@@ -193,6 +215,7 @@ class LayerPrefetcher:
         lw, buf = self.layers[layer_idx], self._bufs[slot]
         rows = (None if self._bitmap is None
                 else self._bitmap[layer_idx].nonzero().flatten().tolist())
+        self._staged_rows[layer_idx] = None if rows is None else set(rows)
 
         def copy_rows():
             for k in ("w1", "w2", "w3"):
@@ -217,6 +240,44 @@ class LayerPrefetcher:
         if self._cuda:
             self._ready[slot].wait(torch.cuda.current_stream())  # use-after-copy
         return self._bufs[slot]
+
+    def repair(self, layer_idx: int, expert_ids) -> int:
+        """Exact-offload contract: make the staged buffer correct for the
+        experts routing actually selected (e.g. op1 Routing.expert_ids()).
+        Call AFTER routing, BEFORE the expert GEMMs — the on-demand copies
+        run on the current stream, so subsequent kernels are ordered after
+        them. Also records usage for auto_bitmap. Returns #misses copied."""
+        ids = {int(i) for i in expert_ids}
+        self._used_cur[layer_idx] = ids
+        staged = self._staged_rows.get(layer_idx)
+        if staged is None:      # full copy this pass: nothing can be stale
+            return 0
+        missing = sorted(ids - staged)
+        if missing:
+            slot = self._buf_of[layer_idx]
+            if self._cuda:
+                self._ready[slot].wait(torch.cuda.current_stream())
+            lw, buf = self.layers[layer_idx], self._bufs[slot]
+            for k in ("w1", "w2", "w3"):
+                src, dst = getattr(lw, k), buf[k]
+                for e in missing:
+                    dst[e].copy_(src[e], non_blocking=True)
+            staged.update(missing)
+            self.repair_misses += len(missing)
+        return len(missing)
+
+    def temporal_bitmap(self, num_experts: int) -> torch.Tensor | None:
+        """Zero-training expert predictor: per-layer expert sets observed by
+        repair() in the previous pass. Layers without an observation get an
+        all-ones row (full copy). None until any history exists."""
+        if not self._used_prev:
+            return None
+        bitmap = torch.ones(len(self.layers), num_experts, dtype=torch.bool)
+        for li, used in self._used_prev.items():
+            row = torch.zeros(num_experts, dtype=torch.bool)
+            row[sorted(used)] = True
+            bitmap[li] = row
+        return bitmap
 
     def release(self, layer_idx: int) -> None:
         """Mark the layer consumed (compute enqueued) and refill the pipeline."""

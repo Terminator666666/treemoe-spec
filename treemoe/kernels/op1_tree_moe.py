@@ -486,52 +486,50 @@ class _Workspace:
 _ws_cache: dict[tuple, _Workspace] = {}
 
 
-def tree_moe_forward(
+class Routing:
+    """Phase-1 result of tree_moe_forward: routing + bucketing, no expert
+    weights touched. Lets an offload engine learn WHICH experts this layer
+    needs before the GEMMs read the weights, so a lossy prefetch can be
+    repaired into an exact one (cf. DualDeadline 2026 / MoE-SpeQ 2025)."""
+
+    __slots__ = ("ws", "gates_flat", "padded_slots", "block_expert_ids",
+                 "slot_to_row", "max_blocks")
+
+    def __init__(self, ws, gates_flat, padded_slots, block_expert_ids,
+                 slot_to_row, max_blocks):
+        self.ws = ws
+        self.gates_flat = gates_flat
+        self.padded_slots = padded_slots
+        self.block_expert_ids = block_expert_ids
+        self.slot_to_row = slot_to_row
+        self.max_blocks = max_blocks
+
+    def expert_ids(self) -> list[int]:
+        """Experts actually routed this layer. ONE small D2H sync
+        (max_blocks int64s) -- the price of the exact-offload contract."""
+        ids = self.block_expert_ids[: self.max_blocks].tolist()
+        return sorted({int(i) for i in ids if i >= 0})
+
+
+def route_experts(
     x: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    w3: torch.Tensor,
     router_weight: torch.Tensor,
     node_accept_prob: torch.Tensor,
     expert_budget: int,
-    out: torch.Tensor | None = None,
-    deterministic: bool = True,
-) -> torch.Tensor:
-    """Spec §3.1 entry point. Falls back to the reference on CPU / no Triton.
-
-    deterministic=True (default): split-k partials + fixed-order combine,
-    bitwise reproducible (required by the lossless red-line test); costs one
-    extra fp32 partial round-trip (~SPLIT_K*2N*H*8B per layer).
-    deterministic=False: atomic_add fast path for benchmarking.
-
-    Under TRITON_INTERPRET=1 the Triton kernels execute on CPU (numpy
-    interpreter) — the real kernel code paths, minus tensor cores.
-    """
-    if not HAS_TRITON or not (x.is_cuda or _INTERPRET):
-        return tree_moe_forward_ref(
-            x, w1, w2, w3, router_weight, node_accept_prob, expert_budget
-        )
-
+    inter: int,
+) -> Routing:
+    """Phase 1 of tree_moe_forward: op3 budget routing + bucketing (fused
+    Kernel A or the torch fallback). Needs only the resident router weights;
+    `inter` is the FFN intermediate size (host-known, avoids touching w1).
+    Pass the result to tree_moe_forward(routing=...) to run the GEMMs."""
     n, hidden = x.shape
-    e, inter, _ = w1.shape
+    e = router_weight.shape[0]
     key = (n, e, hidden, inter, x.device.index if x.is_cuda else -1, x.dtype)
     ws = _ws_cache.get(key)
     if ws is None:
         ws = _ws_cache[key] = _Workspace(n, e, hidden, inter, x.device, x.dtype)
 
-    # per-shape tile params: tiny interpreter configs (H=64, I=128) must not
-    # read past the reduction dim; tl.dot still needs K>=16
     bk1 = BK1 if hidden % BK1 == 0 else hidden
-    bn1 = BN1 if inter % BN1 == 0 else inter        # gemm1 N-dim = I
-    bn2 = BN2 if hidden % BN2 == 0 else hidden      # gemm2/combine N-dim = H
-    seg = inter // SPLIT_K
-    bk2 = min(BK2, seg) if seg % min(BK2, seg) == 0 else seg
-    # u64-packed weight loads need 16-bit elements and strides/tiles % 4
-    pack_w = int(w1.element_size() == 2 and hidden % 4 == 0 and inter % 4 == 0
-                 and bk1 % 4 == 0 and bk2 % 4 == 0)
-    if os.getenv("TREEMOE_PACK_W") == "0":  # debug: force plain weight loads
-        pack_w = 0
-
     max_bpe = (2 * n + BM - 1) // BM
     # fused Kernel A: single-CTA route+bucket (1 launch vs ~8 torch ops).
     # N<=64: zero spill (nw=32, 64 regs). N=128: the O((2N)^2) rank matrix
@@ -553,14 +551,68 @@ def tree_moe_forward(
             # spill -> ~1KB (static_analysis.py sweep). Single-CTA latency win.
             num_warps=32,
         )
-        gates_flat = ws.gates_flat
-        padded_slots, block_expert_ids = ws.padded_slots, ws.block_expert_ids
-        slot_to_row, max_blocks = ws.slot_to_row, ws.max_blocks
-    else:
-        _topk_ids, topk_gates, padded_slots, block_expert_ids, slot_to_row, max_blocks = route_and_bucket(
-            x, router_weight, node_accept_prob, expert_budget
+        return Routing(ws, ws.gates_flat, ws.padded_slots,
+                       ws.block_expert_ids, ws.slot_to_row, ws.max_blocks)
+    _topk_ids, topk_gates, padded_slots, block_expert_ids, slot_to_row, max_blocks = route_and_bucket(
+        x, router_weight, node_accept_prob, expert_budget
+    )
+    gates_flat = topk_gates.reshape(-1).float().contiguous()   # index by slot id
+    return Routing(ws, gates_flat, padded_slots, block_expert_ids,
+                   slot_to_row, max_blocks)
+
+
+def tree_moe_forward(
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w3: torch.Tensor,
+    router_weight: torch.Tensor,
+    node_accept_prob: torch.Tensor,
+    expert_budget: int,
+    out: torch.Tensor | None = None,
+    deterministic: bool = True,
+    routing: Routing | None = None,
+) -> torch.Tensor:
+    """Spec §3.1 entry point. Falls back to the reference on CPU / no Triton.
+
+    deterministic=True (default): split-k partials + fixed-order combine,
+    bitwise reproducible (required by the lossless red-line test); costs one
+    extra fp32 partial round-trip (~SPLIT_K*2N*H*8B per layer).
+    deterministic=False: atomic_add fast path for benchmarking.
+
+    Under TRITON_INTERPRET=1 the Triton kernels execute on CPU (numpy
+    interpreter) — the real kernel code paths, minus tensor cores.
+
+    routing: pre-computed phase-1 handle from route_experts() (two-phase
+    offload path); None runs routing inline (identical launches).
+    """
+    if not HAS_TRITON or not (x.is_cuda or _INTERPRET):
+        return tree_moe_forward_ref(
+            x, w1, w2, w3, router_weight, node_accept_prob, expert_budget
         )
-        gates_flat = topk_gates.reshape(-1).float().contiguous()   # index by slot id
+
+    n, hidden = x.shape
+    e, inter, _ = w1.shape
+    if routing is None:
+        routing = route_experts(x, router_weight, node_accept_prob,
+                                expert_budget, inter)
+    ws = routing.ws
+    gates_flat = routing.gates_flat
+    padded_slots, block_expert_ids = routing.padded_slots, routing.block_expert_ids
+    slot_to_row, max_blocks = routing.slot_to_row, routing.max_blocks
+
+    # per-shape tile params: tiny interpreter configs (H=64, I=128) must not
+    # read past the reduction dim; tl.dot still needs K>=16
+    bk1 = BK1 if hidden % BK1 == 0 else hidden
+    bn1 = BN1 if inter % BN1 == 0 else inter        # gemm1 N-dim = I
+    bn2 = BN2 if hidden % BN2 == 0 else hidden      # gemm2/combine N-dim = H
+    seg = inter // SPLIT_K
+    bk2 = min(BK2, seg) if seg % min(BK2, seg) == 0 else seg
+    # u64-packed weight loads need 16-bit elements and strides/tiles % 4
+    pack_w = int(w1.element_size() == 2 and hidden % 4 == 0 and inter % 4 == 0
+                 and bk1 % 4 == 0 and bk2 % 4 == 0)
+    if os.getenv("TREEMOE_PACK_W") == "0":  # debug: force plain weight loads
+        pack_w = 0
 
     # num_warps=4/num_stages=4: vLLM fused_moe production default for M<=32
     # decode — "smallest batches are memory-latency bound, a deeper pipeline

@@ -191,3 +191,25 @@ def test_fused_route_bucket_triton_matches_torch(n, budget):
     assert torch.equal(padded, padded_t)
     assert torch.equal(blk, blk_t)
     assert torch.equal(s2r, s2r_t)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("budget", [2, 8])
+def test_two_phase_routing_matches_inline(budget):
+    """route_experts() + tree_moe_forward(routing=...) must be bitwise equal
+    to the single-call path (deterministic mode), and expert_ids() must expose
+    the routed set for the op2 prefetch-repair contract."""
+    from treemoe.kernels.op1_tree_moe import route_experts, tree_moe_forward
+
+    g = torch.Generator().manual_seed(21)
+    e, h, i = 8, 4096, 14336
+    x, w1, w2, w3, router, accept = make_moe_inputs(64, e, h, i, g, dtype=torch.bfloat16)
+    x, w1, w2, w3 = (t.cuda() for t in (x, w1, w2, w3))
+    router, accept = router.cuda(), accept.cuda()
+
+    inline = tree_moe_forward(x, w1, w2, w3, router, accept, budget).clone()
+    routing = route_experts(x, router, accept, budget, i)
+    ids = routing.expert_ids()
+    assert ids and all(0 <= eid < e for eid in ids) and len(ids) <= e
+    two_phase = tree_moe_forward(x, w1, w2, w3, router, accept, budget, routing=routing)
+    assert torch.equal(inline, two_phase)
