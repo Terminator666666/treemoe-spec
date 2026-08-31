@@ -174,10 +174,11 @@ def _mixtral_specs() -> list[Spec]:
              "dest_block_ptr": i64, "dest_off_ptr": i64, "num_accepted_ptr": i64,
              "tree_block": "constexpr", "BLOCK_SIZE": "constexpr",
              "KVH_HD": "constexpr", "stride_layer": "constexpr",
-             "stride_block": "constexpr", "stride_slot": "constexpr"},
+             "stride_block": "constexpr", "stride_slot": "constexpr",
+             "PACK": "constexpr"},
             {"tree_block": 0, "BLOCK_SIZE": 64, "KVH_HD": 8 * 128,
              "stride_layer": 256 * 64 * 1024, "stride_block": 64 * 1024,
-             "stride_slot": 1024},
+             "stride_slot": 1024, "PACK": 1},
             num_warps=4, num_stages=1, grid=(32, 6),
         ),
     ]

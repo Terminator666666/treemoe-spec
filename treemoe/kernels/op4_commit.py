@@ -137,6 +137,7 @@ if HAS_TRITON:
         tree_block: tl.constexpr, BLOCK_SIZE: tl.constexpr,
         KVH_HD: tl.constexpr,  # num_kv_heads * head_dim
         stride_layer: tl.constexpr, stride_block: tl.constexpr, stride_slot: tl.constexpr,
+        PACK: tl.constexpr,    # 1 iff 16-bit elems and strides/KVH_HD % 4 == 0
     ):
         layer = tl.program_id(0)
         j = tl.program_id(1)         # accepted-path position (grid = max_depth)
@@ -146,11 +147,24 @@ if HAS_TRITON:
         src_slot = tl.load(accepted_slots_ptr + j)
         dblk = tl.load(dest_block_ptr + j)
         doff = tl.load(dest_off_ptr + j)
-        offs = tl.arange(0, KVH_HD)
-        src = layer.to(tl.int64) * stride_layer + tree_block * stride_block + src_slot * stride_slot
-        dst = layer.to(tl.int64) * stride_layer + dblk * stride_block + doff * stride_slot
-        tl.store(k_ptr + dst + offs, tl.load(k_ptr + src + offs))
-        tl.store(v_ptr + dst + offs, tl.load(v_ptr + src + offs))
+        src0 = (layer.to(tl.int64) * stride_layer + tree_block * stride_block
+                + src_slot * stride_slot)
+        dst0 = (layer.to(tl.int64) * stride_layer + dblk * stride_block
+                + doff * stride_slot)
+        if PACK:
+            # SASS audit: bf16 element loads lower to scalar LDG.E.U16 at 256B
+            # strides (1/16 sector utilization). Slot strides are multiples of
+            # 4 elements, so copy through a u64 view: 4 elements per lane,
+            # pure bit-copy (no numeric interpretation at all).
+            k64 = k_ptr.to(tl.pointer_type(tl.uint64), bitcast=True)
+            v64 = v_ptr.to(tl.pointer_type(tl.uint64), bitcast=True)
+            offs4 = tl.arange(0, KVH_HD // 4)
+            tl.store(k64 + dst0 // 4 + offs4, tl.load(k64 + src0 // 4 + offs4))
+            tl.store(v64 + dst0 // 4 + offs4, tl.load(v64 + src0 // 4 + offs4))
+        else:
+            offs = tl.arange(0, KVH_HD)
+            tl.store(k_ptr + dst0 + offs, tl.load(k_ptr + src0 + offs))
+            tl.store(v_ptr + dst0 + offs, tl.load(v_ptr + src0 + offs))
 
 
 def fused_verify_commit(
@@ -233,12 +247,15 @@ def fused_verify_commit(
             dest_block = table[dest_pos // kv.block_size].to(torch.int32)
             dest_off = (dest_pos % kv.block_size).to(torch.int32)
             kvh_hd = kv.k.shape[3] * kv.k.shape[4]
+            strides = (kv.k.stride(0), kv.k.stride(1), kv.k.stride(2))
+            pack = int(kv.k.element_size() == 2 and kvh_hd % 4 == 0
+                       and all(s % 4 == 0 for s in strides))
             _kv_commit_kernel[(kv.k.shape[0], m_max)](
                 kv.k, kv.v, res.accepted_slots.to(torch.int32), dest_block, dest_off,
                 res.num_accepted.to(torch.int32),
                 tree_block=kv.tree_block, BLOCK_SIZE=kv.block_size, KVH_HD=kvh_hd,
-                stride_layer=kv.k.stride(0), stride_block=kv.k.stride(1),
-                stride_slot=kv.k.stride(2),
+                stride_layer=strides[0], stride_block=strides[1],
+                stride_slot=strides[2], PACK=pack,
             )
             kv.seq_len += int(res.num_accepted)  # graph mode keeps this on-GPU
         else:

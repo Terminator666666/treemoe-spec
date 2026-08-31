@@ -11,13 +11,17 @@ bytes-in-flight is what a streaming kernel needs. Sweep on hardware:
   python benchmarks/sweep_op1.py            # gemm2 sweep (the sick one)
   python benchmarks/sweep_op1.py --gemm 1   # gemm1 sweep
 Each config is correctness-checked against the bf16 reference first.
+Timing is the median of event-timed reps; a config only "beats" the default
+if it clears AsmEvo's variance-aware commit margin (arXiv:2608.20711 Eq.2):
+  speedup >= 1 + max(eps, k*cv)
+which stops clock jitter on an unlocked 4090 from promoting noise.
 """
 from __future__ import annotations
 
 import argparse
 import itertools
+import statistics
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -25,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 
 E, H, I = 8, 4096, 14336
+EPS, K_CV = 0.002, 0.85   # AsmEvo defaults
 
 
 def make_inputs(n: int):
@@ -68,7 +73,8 @@ def main() -> None:
     names, grid = combos
     defaults = {k: getattr(op1, k) for k in names}
 
-    def run(cfg: dict) -> float:
+    def run(cfg: dict) -> tuple[float, float]:
+        """-> (median_us, cv) via CUDA events (immune to host jitter)."""
         for k, v in cfg.items():
             setattr(op1, k, v)
         op1._ws_cache.clear()
@@ -80,41 +86,56 @@ def main() -> None:
         if err > err_tol:
             raise ValueError(f"wrong result, max|d|={err:.3f}")
         torch.cuda.synchronize()
-        t0 = time.perf_counter()
+        times = []
         for _ in range(args.iters):
+            t0 = torch.cuda.Event(enable_timing=True)
+            t1 = torch.cuda.Event(enable_timing=True)
+            t0.record()
             fwd()
-        torch.cuda.synchronize()
-        return (time.perf_counter() - t0) / args.iters * 1e6
+            t1.record()
+            t1.synchronize()
+            times.append(t0.elapsed_time(t1) * 1e3)  # us
+        med = statistics.median(times)
+        cv = statistics.pstdev(times) / med if med else 0.0
+        return med, cv
 
     print(f"device: {torch.cuda.get_device_name(0)}  sweeping gemm{args.gemm} "
           f"(N={args.n}, budget={args.budget}, atomic path)")
-    print("  ".join(f"{k:>12}" for k in names) + f" {'us':>10}")
+    print("  ".join(f"{k:>12}" for k in names) + f" {'us':>10} {'cv':>6}")
     results = []
     for vals in grid:
         cfg = dict(zip(names, vals))
         if args.gemm == 2 and (I // cfg["SPLIT_K"]) % cfg["BK2"] != 0:
             continue  # split segment must be divisible by the K tile
         try:
-            t = run(cfg)
+            t, cv = run(cfg)
         except Exception as e:
             print("  ".join(f"{v:>12}" for v in vals) + f"     FAIL  {str(e)[:60]}")
             continue
-        results.append((t, cfg))
-        print("  ".join(f"{v:>12}" for v in vals) + f" {t:>10.1f}")
+        results.append((t, cv, cfg))
+        print("  ".join(f"{v:>12}" for v in vals) + f" {t:>10.1f} {cv:>6.1%}")
 
     for k, v in defaults.items():  # restore
         setattr(op1, k, v)
     op1._ws_cache.clear()
 
-    results.sort()
+    results.sort(key=lambda r: r[0])
     print("\ntop 5:")
-    for t, cfg in results[:5]:
-        print(f"  {t:>8.1f}us  {cfg}")
+    for t, cv, cfg in results[:5]:
+        print(f"  {t:>8.1f}us (cv {cv:.1%})  {cfg}")
     base = dict(defaults)
-    tb = next((t for t, c in results if all(c[k] == base[k] for k in c)), None)
-    if tb and results:
-        print(f"\ncurrent default: {tb:.1f}us -> best: {results[0][0]:.1f}us "
-              f"({tb / results[0][0]:.2f}x)")
+    hit = next(((t, cv) for t, cv, c in results
+                if all(c[k] == base[k] for k in c)), None)
+    if hit and results:
+        tb, cvb = hit
+        best_t, best_cv, best_cfg = results[0]
+        margin = 1 + max(EPS, K_CV * max(cvb, best_cv))
+        speedup = tb / best_t
+        verdict = ("COMMIT (clears variance-aware margin)"
+                   if speedup >= margin else
+                   "keep default (inside noise margin -- AsmEvo Eq.2)")
+        print(f"\ncurrent default: {tb:.1f}us -> best: {best_t:.1f}us "
+              f"({speedup:.3f}x, margin {margin:.3f}x) => {verdict}")
 
 
 if __name__ == "__main__":
