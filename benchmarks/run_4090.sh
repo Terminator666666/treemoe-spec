@@ -37,7 +37,10 @@ python benchmarks/bench_cpu_expert.py
 if [ -d checkpoints/mixtral-8x7b-instruct ]; then
   E2E_W=""
 else
-  E2E_W="--random-weights"   # streaming/hit-rate numbers valid; accept_len is not
+  # random weights: streaming/hit-rate numbers valid, accept_len is not.
+  # Small workload: offload passes are PCIe-bound (~1s each) and a random
+  # draft accepts ~nothing, so the full sweep would take hours.
+  E2E_W="--random-weights --num-prompts 3 --max-new-tokens 32 --budgets 4 8"
 fi
 python benchmarks/bench_e2e.py --layout offload --prefetch-depth 2 $E2E_W
 python benchmarks/bench_e2e.py --layout offload --prefetch-depth 2 --no-auto-bitmap $E2E_W

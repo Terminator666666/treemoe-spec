@@ -19,9 +19,13 @@ def run_config(engine_factory, budget: int, tree_size: int, prompts: list[torch.
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     total_tokens = 0
-    for p in prompts:
+    for i, p in enumerate(prompts):
         out = eng.generate(p, max_new_tokens=max_new_tokens)
         total_tokens += len(out)
+        el = time.perf_counter() - t0
+        print(f"  B={budget} N={tree_size} prompt {i + 1}/{len(prompts)} "
+              f"({el:.0f}s elapsed, {el / total_tokens * 1e3:.0f}ms/tok)",
+              file=sys.stderr, flush=True)
     torch.cuda.synchronize()
     wall = time.perf_counter() - t0
     r = {
@@ -43,6 +47,7 @@ def main() -> None:
     ap.add_argument("--budgets", type=int, nargs="+", default=[3, 4, 5, 6, 8])
     ap.add_argument("--tree-sizes", type=int, nargs="+", default=[64])
     ap.add_argument("--num-prompts", type=int, default=20)
+    ap.add_argument("--max-new-tokens", type=int, default=128)
     ap.add_argument("--layout", choices=["resident", "offload"], default="resident",
                     help="offload: all expert weights pinned in host RAM, streamed "
                          "by op2 LayerPrefetcher with exact bitmap repair")
@@ -135,12 +140,14 @@ def main() -> None:
         draft = EagleDraftModel(eagle_w, cfg, weights.embed_tokens, weights.lm_head)
         return SpecDecodeEngine(target, draft, tree_size=tree_size, expert_budget=budget), pf
 
-    print(f"{'B':>3} {'N':>5} {'TPOT(ms)':>10} {'accept_len':>11} {'hit_rate':>9}")
+    print(f"{'B':>3} {'N':>5} {'TPOT(ms)':>10} {'accept_len':>11} {'hit_rate':>9}",
+          flush=True)
     for n in args.tree_sizes:
         for b in args.budgets:
-            r = run_config(factory, b, n, prompts)
+            r = run_config(factory, b, n, prompts,
+                           max_new_tokens=args.max_new_tokens)
             print(f"{r['budget']:>3} {r['tree_size']:>5} {r['tpot_ms']:>10.2f} "
-                  f"{r['accept_len']:>11.2f} {r['hit_rate']:>9.3f}")
+                  f"{r['accept_len']:>11.2f} {r['hit_rate']:>9.3f}", flush=True)
 
 
 if __name__ == "__main__":
