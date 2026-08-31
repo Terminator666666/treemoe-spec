@@ -76,6 +76,13 @@ class SpecDecodeEngine:
             device=last_token.device.type,
         )
 
+        # op2 draft-guided router hint (spec §3.2): the tree's draft features
+        # approximate the target's hidden trajectory, so each layer's own
+        # router predicts which experts the verification pass will stage.
+        pf = getattr(self.target, "prefetcher", None)
+        if pf is not None and hasattr(pf, "router_hint"):
+            pf.router_hint(tree.features, self.expert_budget)
+
         # verification forward over the whole tree (root token occupies slot 0)
         positions = root_pos + _depths(tree.parent, self.max_depth)
         logits, hidden = self.target.forward(

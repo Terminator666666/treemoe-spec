@@ -160,6 +160,9 @@ class LayerPrefetcher:
         self.offload_ids = [i for i, lw in enumerate(layers) if not lw.experts_on_gpu]
         self.depth = max(1, min(depth, max(1, len(self.offload_ids))))
         self.auto_bitmap = auto_bitmap
+        self.use_router_hint = True         # gate for the draft-guided hint
+        self._hint: torch.Tensor | None = None
+        self._routers: torch.Tensor | None = None  # [L, E, H] fp32 cache
         self._bufs: list[dict[str, torch.Tensor]] | None = None
         self._buf_of: dict[int, int] = {}   # layer idx -> buffer slot (this pass)
         self._queue: list[int] = []         # offloaded layers not yet scheduled
@@ -177,6 +180,28 @@ class LayerPrefetcher:
         """[L, E] bool, rows to copy per layer; None = all (lossless). Moved to
         CPU here (one sync), so per-layer scheduling stays sync-free."""
         self._bitmap = None if bitmap is None else bitmap.detach().to("cpu", torch.bool)
+
+    def router_hint(self, features: torch.Tensor, budget: int) -> None:
+        """Draft-guided router pre-execution (spec §3.2 headline path).
+
+        Runs every layer's own router over the draft tree's EAGLE features
+        (which approximate the target's hidden trajectory), keeps the
+        top-`budget` experts per layer by aggregated softmax demand. Same
+        idea as MoE-SpeQ'25's draft-predicted prefetch, but training-free:
+        the predictor IS the target's router. begin() ORs the hint with the
+        temporal bitmap; prediction only affects staging, repair() keeps
+        every pass exact. Gated behind auto_bitmap so the --no-auto-bitmap
+        full-copy baseline stays prediction-free."""
+        if not (self.auto_bitmap and self.use_router_hint and self.offload_ids):
+            return
+        if self._routers is None:
+            self._routers = torch.stack([lw.router for lw in self.layers]).float()
+        logits = torch.einsum("nh,leh->nle", features.float(), self._routers)
+        demand = torch.softmax(logits, dim=-1).sum(0)                # [L, E]
+        keep = demand.topk(min(budget, demand.shape[-1]), dim=-1).indices
+        hint = torch.zeros(demand.shape, dtype=torch.bool)
+        hint.scatter_(1, keep.cpu(), True)
+        self._hint = hint
 
     def _ensure_buffers(self, lw) -> None:
         dev = lw.router.device
@@ -200,8 +225,17 @@ class LayerPrefetcher:
             self._used_prev = self._used_cur
         self._used_cur = {}
         if self.auto_bitmap:
-            num_experts = self.layers[self.offload_ids[0]].w1.shape[0]
-            self.set_bitmap(self.temporal_bitmap(num_experts))
+            if self._hint is not None:
+                # union of both zero-training predictors: the hint covers what
+                # the fresh tree's routing will likely need, the temporal set
+                # covers what the last pass actually used
+                bm = self._hint.clone()
+                for li, used in self._used_prev.items():
+                    bm[li, sorted(used)] = True
+                self.set_bitmap(bm)
+            else:
+                num_experts = self.layers[self.offload_ids[0]].w1.shape[0]
+                self.set_bitmap(self.temporal_bitmap(num_experts))
         self._staged_rows.clear()
         self._buf_of.clear()
         self._queue = list(self.offload_ids)

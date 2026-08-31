@@ -284,6 +284,70 @@ def test_layer_prefetcher_auto_bitmap_temporal(tiny_config, rng):
             assert all(s is not None for s in pf._staged_rows.values())
 
 
+def test_layer_prefetcher_router_hint_stages_top_budget(rng):
+    """router_hint stages exactly the top-budget experts per layer by the
+    layer's own router demand over the draft features (first pass: no
+    temporal history to OR in). Disabled hint falls back to full copies."""
+    from treemoe.model.weights import LayerWeights
+
+    E_, I_, H_ = 4, 6, 8
+
+    def lw():
+        return LayerWeights(
+            input_layernorm=torch.ones(H_), post_attn_layernorm=torch.ones(H_),
+            attn={}, router=torch.randn(E_, H_, generator=rng),
+            w1=torch.randn(E_, I_, H_, generator=rng),
+            w2=torch.randn(E_, H_, I_, generator=rng),
+            w3=torch.randn(E_, I_, H_, generator=rng),
+            experts_on_gpu=False)
+
+    layers = [lw(), lw()]
+    feats = torch.randn(3, H_, generator=rng)
+
+    pf = LayerPrefetcher(layers, depth=2, auto_bitmap=True)
+    pf.router_hint(feats, budget=2)
+    pf.begin()
+    for li in (0, 1):
+        logits = feats.float() @ layers[li].router.float().t()
+        want = set(torch.softmax(logits, -1).sum(0).topk(2).indices.tolist())
+        assert pf._staged_rows[li] == want
+
+    pf2 = LayerPrefetcher(layers, depth=2, auto_bitmap=True)
+    pf2.use_router_hint = False
+    pf2.router_hint(feats, budget=2)
+    pf2.begin()
+    assert all(s is None for s in pf2._staged_rows.values())
+
+
+def test_spec_engine_offload_router_hint_lossless(tiny_config, rng):
+    """Engine wiring red line: spec decode over an offloaded target with the
+    draft-guided router hint (deliberately restrictive top-3 of 8) + repair
+    must equal AR greedy on resident weights, token for token."""
+    from test_parity import random_weights
+    from test_spec_lossless import TinyDraft, ar_greedy
+    from treemoe.engine.loop import SpecDecodeEngine
+    from treemoe.model.kv_cache import PagedKVCache
+    from treemoe.model.mixtral import MixtralForward, naive_moe
+
+    w = random_weights(tiny_config, rng)
+    prompt = torch.randint(0, tiny_config.vocab_size, (5,), generator=rng)
+
+    kv1 = PagedKVCache(tiny_config, num_blocks=8, device="cpu", dtype=tiny_config.dtype)
+    ar = ar_greedy(MixtralForward(w, kv1, moe_fn=naive_moe), prompt.clone(), 24)
+
+    w_off = _offload_all(w)
+    pf = LayerPrefetcher(w_off.layers, depth=2, auto_bitmap=True)
+    kv2 = PagedKVCache(tiny_config, num_blocks=8, device="cpu", dtype=tiny_config.dtype)
+    target = MixtralForward(w_off, kv2, moe_fn=_repairing_moe_fn(pf), prefetcher=pf)
+    eng = SpecDecodeEngine(target, TinyDraft(tiny_config.vocab_size),
+                           tree_size=8, max_depth=3, expert_budget=3)
+    spec = eng.generate(prompt.clone(), max_new_tokens=24, eos_token_id=-1)
+
+    assert spec == ar
+    assert pf._hint is not None                     # the hint path really ran
+    assert (pf._hint.sum(-1) == 3).all()            # ...and was restrictive
+
+
 @pytest.mark.gpu
 def test_layer_prefetcher_gpu_forward_matches_resident(tiny_config, rng):
     """Real side-stream + event ordering: pinned-host offload forward must be

@@ -55,6 +55,9 @@ def main() -> None:
     ap.add_argument("--no-auto-bitmap", action="store_true",
                     help="offload only: disable the temporal predictor "
                          "(every pass copies all experts; isolates repair overhead)")
+    ap.add_argument("--no-router-hint", action="store_true",
+                    help="offload ablation: keep the temporal bitmap but disable "
+                         "the draft-guided router hint")
     ap.add_argument("--random-weights", action="store_true",
                     help="no checkpoint needed: random weights at real Mixtral "
                          "shapes. TPOT/hit_rate/streaming numbers are valid "
@@ -119,6 +122,7 @@ def main() -> None:
         if args.layout == "offload":
             pf = LayerPrefetcher(weights.layers, depth=args.prefetch_depth,
                                  auto_bitmap=not args.no_auto_bitmap)
+            pf.use_router_hint = not args.no_router_hint
             pf.routed_total = 0  # bench counter alongside pf.repair_misses
 
         def moe_fn(x, lw, layer_idx, _b=budget):

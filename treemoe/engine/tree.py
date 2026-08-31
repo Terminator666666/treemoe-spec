@@ -22,6 +22,8 @@ class DraftTree:
     attn_mask: torch.Tensor      # [N, N] bool: j visible to i iff j is ancestor-or-self
     children: list[list[int]]    # adjacency in final DFS numbering
     num_valid: int
+    features: torch.Tensor = None  # [num_valid, H] draft features, DFS order
+                                   # (op2 router hint input, spec §3.2)
 
     @property
     def size(self) -> int:
@@ -159,6 +161,7 @@ def build_eagle2_tree(
     return DraftTree(
         tokens=tokens, parent=parent, accept_prob=accept,
         attn_mask=mask, children=children, num_valid=len(dfs),
+        features=torch.stack([pool_feat[i] for i in dfs]),
     )
 
 
