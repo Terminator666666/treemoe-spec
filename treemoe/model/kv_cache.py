@@ -54,13 +54,20 @@ class PagedKVCache:
     # ---------------- prefill / AR append ----------------
 
     def append(self, layer: int, k: torch.Tensor, v: torch.Tensor, start_pos: int) -> None:
-        """Write [T, kv_heads, head_dim] at positions [start_pos, start_pos+T)."""
+        """Write [T, kv_heads, head_dim] at positions [start_pos, start_pos+T).
+
+        Single advanced-indexing scatter (block/offset indices computed on the
+        host from block_table — no D2H); the old per-position Python loop cost
+        T tiny strided writes x 32 layers per forward."""
         t = k.shape[0]
         self._ensure_capacity(start_pos + t)
-        for i in range(t):  # reference impl; kernelized later with a scatter
-            blk, off = self.slot_of(start_pos + i)
-            self.k[layer, blk, off] = k[i]
-            self.v[layer, blk, off] = v[i]
+        bs = self.block_size
+        blks = torch.tensor([self.block_table[(start_pos + i) // bs] for i in range(t)],
+                            device=k.device, dtype=torch.long)
+        offs = torch.tensor([(start_pos + i) % bs for i in range(t)],
+                            device=k.device, dtype=torch.long)
+        self.k[layer, blks, offs] = k
+        self.v[layer, blks, offs] = v
         self.seq_len = max(self.seq_len, start_pos + t)
 
     # ---------------- tree verification path ----------------
@@ -80,14 +87,16 @@ class PagedKVCache:
         pass a fixed-size buffer with -1 padding.
         """
         valid = accepted_slots[accepted_slots >= 0]
-        m = int(valid.numel())  # graph-safe variant uses masked scatter instead
+        m = int(valid.numel())  # reference path only; the GPU/graph path is
+        # op4's _kv_commit_kernel (fixed grid, num_accepted read on device)
         if m == 0:
             return
         self._ensure_capacity(self.seq_len + m)
-        for j in range(m):
-            blk, off = self.slot_of(self.seq_len + j)
-            self.k[:, blk, off] = self.k[:, self.tree_block, valid[j]]
-            self.v[:, blk, off] = self.v[:, self.tree_block, valid[j]]
+        dest = [self.slot_of(self.seq_len + j) for j in range(m)]
+        blks = torch.tensor([d[0] for d in dest], device=valid.device, dtype=torch.long)
+        offs = torch.tensor([d[1] for d in dest], device=valid.device, dtype=torch.long)
+        self.k[:, blks, offs] = self.k[:, self.tree_block, valid]
+        self.v[:, blks, offs] = self.v[:, self.tree_block, valid]
         self.seq_len += m
 
     # ---------------- gather for attention ----------------
