@@ -31,7 +31,16 @@ class EagleWeights:
 
 
 class EagleDraftModel:
-    """Feature-space autoregression producing (next_feature, token_logits)."""
+    """Feature-space autoregression producing (next_feature, token_logits).
+
+    Two-tier KV, mirroring the official EAGLE inference loop:
+      * committed KV — the accepted sequence (prompt + committed tokens),
+        extended via extend_committed() with TARGET features (accurate);
+        rejected branches never enter it.
+      * tree KV — scratch for the current draft tree, cleared by begin_tree();
+        step() rows attend committed KV + their tree ANCESTORS only (topology
+        mask), never siblings or other branches.
+    """
 
     def __init__(self, w: EagleWeights, config: MixtralConfig,
                  embed_tokens: torch.Tensor, lm_head: torch.Tensor):
@@ -40,22 +49,26 @@ class EagleDraftModel:
         self.embed_tokens = embed_tokens  # shared with target
         self.lm_head = lm_head            # shared with target
         self.rope_cos, self.rope_sin = build_rope_cache(config, embed_tokens.device.type)
-        # simple dense KV for the single draft layer (small; rebuilt per step-window)
-        self.k_cache: list[torch.Tensor] = []
-        self.v_cache: list[torch.Tensor] = []
+        self._ck: torch.Tensor | None = None  # committed K [S, kvh, hd]
+        self._cv: torch.Tensor | None = None
+        self._tree_k: list[torch.Tensor] = []  # per-level tree scratch
+        self._tree_v: list[torch.Tensor] = []
 
     def reset(self) -> None:
-        self.k_cache.clear()
-        self.v_cache.clear()
+        self._ck = self._cv = None
+        self._tree_k.clear()
+        self._tree_v.clear()
 
-    @torch.inference_mode()
-    def step(self, token_ids: torch.Tensor, features: torch.Tensor,
-             positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """token_ids/features/positions: [T] / [T, H] / [T] -> (feat' [T,H], logits [T,V])."""
+    def begin_tree(self) -> None:
+        """Start a fresh draft tree (drops the previous tree's scratch KV)."""
+        self._tree_k.clear()
+        self._tree_v.clear()
+
+    def _qkv(self, token_ids: torch.Tensor, features: torch.Tensor,
+             positions: torch.Tensor):
         cfg = self.cfg
         emb = F.embedding(token_ids, self.embed_tokens)
         x = F.linear(torch.cat([emb, features], dim=-1), self.w.fc)
-
         h = rms_norm(x, self.w.input_layernorm, cfg.rms_eps)
         t = h.shape[0]
         q = F.linear(h, self.w.attn["q_proj"]).view(t, cfg.num_heads, cfg.head_dim)
@@ -63,33 +76,75 @@ class EagleDraftModel:
         v = F.linear(h, self.w.attn["v_proj"]).view(t, cfg.num_kv_heads, cfg.head_dim)
         q = apply_rope(q, self.rope_cos, self.rope_sin, positions)
         k = apply_rope(k, self.rope_cos, self.rope_sin, positions)
-        self.k_cache.append(k)
-        self.v_cache.append(v)
-        fk = torch.cat(self.k_cache, dim=0)
-        fv = torch.cat(self.v_cache, dim=0)
+        return x, q, k, v
 
-        rep = cfg.num_heads // cfg.num_kv_heads
-        total = fk.shape[0]
-        mask = torch.zeros(t, total, dtype=torch.bool, device=x.device)
-        past = total - t
-        for i in range(t):
-            mask[i, : past + i + 1] = True
+    def _finish(self, x: torch.Tensor, q: torch.Tensor, fk: torch.Tensor,
+                fv: torch.Tensor, mask: torch.Tensor,
+                need_logits: bool = True):
+        cfg = self.cfg
+        t = q.shape[0]
         o = F.scaled_dot_product_attention(
-            q.transpose(0, 1),
-            fk.repeat_interleave(rep, dim=1).transpose(0, 1),
-            fv.repeat_interleave(rep, dim=1).transpose(0, 1),
-            attn_mask=mask.unsqueeze(0),
+            q.transpose(0, 1), fk.transpose(0, 1), fv.transpose(0, 1),
+            attn_mask=mask.unsqueeze(0), enable_gqa=True,
         )
         o = o.transpose(0, 1).reshape(t, cfg.num_heads * cfg.head_dim)
         x = x + F.linear(o, self.w.attn["o_proj"])
-
         h = rms_norm(x, self.w.post_attn_layernorm, cfg.rms_eps)
         feat = x + F.linear(
             F.silu(F.linear(h, self.w.mlp_gate)) * F.linear(h, self.w.mlp_up),
             self.w.mlp_down,
         )
-        logits = F.linear(feat, self.lm_head).float()
+        logits = F.linear(feat, self.lm_head).float() if need_logits else None
         return feat, logits
+
+    @torch.inference_mode()
+    def extend_committed(self, token_ids: torch.Tensor, features: torch.Tensor,
+                         positions: torch.Tensor) -> None:
+        """Append accepted tokens (prompt or verified path) to the committed KV.
+
+        Causal within the batch, full visibility of prior committed KV. No
+        logits (nothing is sampled here) — skips the vocab GEMM entirely.
+        """
+        x, q, k, v = self._qkv(token_ids, features, positions)
+        s = 0 if self._ck is None else self._ck.shape[0]
+        self._ck = k if self._ck is None else torch.cat([self._ck, k], dim=0)
+        self._cv = v if self._cv is None else torch.cat([self._cv, v], dim=0)
+        t = k.shape[0]
+        cols = torch.arange(s + t, device=x.device)
+        mask = cols[None, :] <= (s + torch.arange(t, device=x.device))[:, None]
+        self._finish(x, q, self._ck, self._cv, mask, need_logits=False)
+
+    @torch.inference_mode()
+    def step(self, token_ids: torch.Tensor, features: torch.Tensor,
+             positions: torch.Tensor, tree_mask: torch.Tensor | None = None
+             ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Draft one tree level: [T] / [T, H] / [T] -> (feat' [T,H], logits [T,V]).
+
+        tree_mask: bool [T, P+T] over (prior tree nodes, this batch) — ancestor
+        visibility built by build_eagle2_tree. All committed KV is always
+        visible (it is an ancestor of every tree node). Falls back to
+        batch-causal over the tree scratch when tree_mask is None.
+        """
+        x, q, k, v = self._qkv(token_ids, features, positions)
+        self._tree_k.append(k)
+        self._tree_v.append(v)
+        tk = torch.cat(self._tree_k, dim=0)
+        tv = torch.cat(self._tree_v, dim=0)
+        fk = tk if self._ck is None else torch.cat([self._ck, tk], dim=0)
+        fv = tv if self._cv is None else torch.cat([self._cv, tv], dim=0)
+
+        t = k.shape[0]
+        s = 0 if self._ck is None else self._ck.shape[0]
+        p = tk.shape[0] - t  # prior tree nodes
+        if tree_mask is None:
+            cols = torch.arange(p + t, device=x.device)
+            tree_mask = cols[None, :] <= (p + torch.arange(t, device=x.device))[:, None]
+        if s:
+            mask = torch.cat(
+                [torch.ones(t, s, dtype=torch.bool, device=x.device), tree_mask], dim=1)
+        else:
+            mask = tree_mask
+        return self._finish(x, q, fk, fv, mask)
 
 
 def load_eagle_weights(path: str, device: str = "cuda",

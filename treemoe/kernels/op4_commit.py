@@ -239,8 +239,13 @@ def fused_verify_commit(
         )
 
     if kv is not None:
+        # committed slots = [root] + accepted path. The root token (tree slot 0,
+        # RoPE position seq_len) is part of the output sequence — its KV lives
+        # only in the scratch block during verification and MUST land in the
+        # main cache, otherwise every future step attends a prefix with the
+        # root's KV missing and children shifted one slot (spec != AR).
         if use_kernel:
-            m_max = max_depth
+            m_max = max_depth + 1
             dest_pos = kv.seq_len + torch.arange(m_max, device=target_logits.device)
             kv._ensure_capacity(kv.seq_len + m_max)
             table = torch.tensor(kv.block_table, device=target_logits.device)
@@ -250,14 +255,18 @@ def fused_verify_commit(
             strides = (kv.k.stride(0), kv.k.stride(1), kv.k.stride(2))
             pack = int(kv.k.element_size() == 2 and kvh_hd % 4 == 0
                        and all(s % 4 == 0 for s in strides))
+            root_slot = torch.zeros(1, dtype=torch.int32, device=target_logits.device)
+            commit_slots = torch.cat([root_slot, res.accepted_slots.to(torch.int32)])
             _kv_commit_kernel[(kv.k.shape[0], m_max)](
-                kv.k, kv.v, res.accepted_slots.to(torch.int32), dest_block, dest_off,
-                res.num_accepted.to(torch.int32),
+                kv.k, kv.v, commit_slots, dest_block, dest_off,
+                (res.num_accepted + 1).to(torch.int32),
                 tree_block=kv.tree_block, BLOCK_SIZE=kv.block_size, KVH_HD=kvh_hd,
                 stride_layer=strides[0], stride_block=strides[1],
                 stride_slot=strides[2], PACK=pack,
             )
-            kv.seq_len += int(res.num_accepted)  # graph mode keeps this on-GPU
+            kv.seq_len += int(res.num_accepted) + 1  # graph mode keeps this on-GPU
         else:
-            kv.commit_tree(res.accepted_slots)
+            root_slot = torch.zeros(1, dtype=res.accepted_slots.dtype,
+                                    device=res.accepted_slots.device)
+            kv.commit_tree(torch.cat([root_slot, res.accepted_slots]))
     return res

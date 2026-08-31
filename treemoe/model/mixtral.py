@@ -123,11 +123,9 @@ class MixtralForward:
 
         if is_tree:
             self.kv.write_tree(layer_idx, k, v)
-            pk, pv = self.kv.gather(layer_idx)  # committed prefix
-            full_k = torch.cat([pk, k], dim=0)
-            full_v = torch.cat([pv, v], dim=0)
-            # mask: prefix fully visible + ancestor-only within tree
-            prefix_len = pk.shape[0]
+            # fused prefix-gather + tail append: one prefix copy, not two
+            full_k, full_v = self.kv.gather_with_tail(layer_idx, k, v)
+            prefix_len = full_k.shape[0] - t
             mask = torch.zeros(t, prefix_len + t, dtype=torch.bool, device=x.device)
             mask[:, :prefix_len] = True
             mask[:, prefix_len:] = tree_mask  # [N, N] bool, ancestors incl. self

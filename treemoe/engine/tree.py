@@ -8,6 +8,7 @@ path), keep the best `tree_size` nodes overall, then re-serialize in DFS order
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 
 import torch
@@ -46,13 +47,39 @@ def build_eagle2_tree(
     pool_feat = [root_feature]
 
     frontier = [0]
+    # topology-aware drafting: if the draft model accepts a tree_mask, pass
+    # per-level ancestor visibility so a node never attends siblings or other
+    # branches (matches official EAGLE-2; wrong context degrades draft quality
+    # and therefore mean accepted length). Duck-typed drafts without the param
+    # (tests) keep the legacy batch-causal behaviour.
+    try:
+        _wants_mask = "tree_mask" in inspect.signature(draft_step_fn).parameters
+    except (TypeError, ValueError):
+        _wants_mask = False
+    kv_index: dict[int, int] = {}  # pool id -> row in the draft's tree KV
+    kv_count = 0
     for depth in range(1, max_depth + 1):
         if not frontier:
             break
         toks = torch.tensor([pool_tokens[i] for i in frontier], device=device)
         feats = torch.stack([pool_feat[i] for i in frontier])
         poss = torch.tensor([root_pos + pool_depth[i] for i in frontier], device=device)
-        new_feats, logits = draft_step_fn(toks, feats, poss)
+        if _wants_mask:
+            t = len(frontier)
+            m = torch.zeros(t, kv_count + t, dtype=torch.bool)
+            for r, pool_i in enumerate(frontier):
+                m[r, kv_count + r] = True  # self
+                p = pool_parent[pool_i]
+                while p != -1:             # ancestors were processed in a prior level
+                    m[r, kv_index[p]] = True
+                    p = pool_parent[p]
+            new_feats, logits = draft_step_fn(toks, feats, poss,
+                                              tree_mask=m.to(device))
+            for r, pool_i in enumerate(frontier):
+                kv_index[pool_i] = kv_count + r
+            kv_count += t
+        else:
+            new_feats, logits = draft_step_fn(toks, feats, poss)
         logprobs = torch.log_softmax(logits.float(), dim=-1)
         topv, topi = logprobs.topk(branch_k, dim=-1)
         # ONE packed D2H per level. The old per-element int(topi[fi,k]) /
@@ -108,12 +135,15 @@ def build_eagle2_tree(
         par_new[new] = remap[pool_parent[old]] if pool_parent[old] in remap else -1
         logp_new[new] = pool_logp[old]
 
-    mask_rows = [[False] * n for _ in range(n)]
+    # ancestor-closure mask, one O(N) pass: DFS order guarantees parent < child,
+    # so row(i) = row(parent) | self. The old per-row while-parent walk cost
+    # O(N*depth) Python iterations (~0.2ms at N=64, growing with tree size).
+    mask_cpu = torch.zeros(n, n, dtype=torch.bool)
     for i in range(len(dfs)):
-        j = i
-        while j >= 0:
-            mask_rows[i][j] = True
-            j = par_new[j]
+        p = par_new[i]
+        if p >= 0:
+            mask_cpu[i] = mask_cpu[p]
+        mask_cpu[i, i] = True
 
     children: list[list[int]] = [[] for _ in range(n)]
     for i in range(1, len(dfs)):
@@ -124,7 +154,7 @@ def build_eagle2_tree(
     # fp32 exp matches the old torch.tensor(logp).exp() numerics bitwise;
     # padding slots get exp(-inf) = 0.0 like the old torch.zeros prefill
     accept = torch.tensor(logp_new, dtype=torch.float32).exp().to(device)
-    mask = torch.tensor(mask_rows, dtype=torch.bool, device=device)
+    mask = mask_cpu.to(device)
 
     return DraftTree(
         tokens=tokens, parent=parent, accept_prob=accept,

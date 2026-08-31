@@ -157,6 +157,9 @@ def test_op4_kv_commit_kernel_interpreted(tiny_config):
 
     res = fused_verify_commit(logits, torch.softmax(logits, -1), tokens, parent,
                               children, kv=kv_a, temperature=0.0, max_depth=6)
-    kv_b.commit_tree(res.accepted_slots)
+    # reference path mirrors the kernel's [root]+accepted commit (the root's KV
+    # lives in tree slot 0 and must land in the main cache too)
+    root = torch.zeros(1, dtype=res.accepted_slots.dtype)
+    kv_b.commit_tree(torch.cat([root, res.accepted_slots]))
     assert torch.equal(kv_a.k, kv_b.k) and torch.equal(kv_a.v, kv_b.v)
-    assert kv_a.seq_len == kv_b.seq_len
+    assert kv_a.seq_len == kv_b.seq_len == 10 + int(res.num_accepted) + 1

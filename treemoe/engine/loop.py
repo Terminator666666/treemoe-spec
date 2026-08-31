@@ -50,9 +50,16 @@ class SpecDecodeEngine:
 
     @torch.inference_mode()
     def prefill(self, token_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run target prefill; returns (last_logits [V], last_penultimate [H])."""
+        """Run target prefill; returns (last_logits [V], last_penultimate [H]).
+
+        Also conditions the draft on the prompt (official EAGLE: draft input at
+        position i pairs token_i with target feature_{i-1}) — without this the
+        first tree drafts from a single-token context.
+        """
         positions = torch.arange(token_ids.shape[0], device=token_ids.device)
         logits, hidden = self.target.forward(token_ids, positions, return_hidden=True)
+        if hasattr(self.draft, "extend_committed") and token_ids.shape[0] > 1:
+            self.draft.extend_committed(token_ids[1:], hidden[:-1], positions[1:])
         return logits[-1], hidden[-1]
 
     @torch.inference_mode()
@@ -61,6 +68,8 @@ class SpecDecodeEngine:
         kv = self.target.kv
         root_pos = kv.seq_len
 
+        if hasattr(self.draft, "begin_tree"):
+            self.draft.begin_tree()  # drop the previous tree's scratch KV
         tree = build_eagle2_tree(
             self.draft.step, last_token, root_feature, root_pos,
             tree_size=self.tree_size, max_depth=self.max_depth,
@@ -95,6 +104,20 @@ class SpecDecodeEngine:
         num = vals[0]
         new_tokens = vals[2:2 + num] + [vals[1]]
 
+        if hasattr(self.draft, "extend_committed"):
+            # commit [root, a_1..a_m] into the draft's committed KV with TARGET
+            # features (rejected branches stay out — they only ever lived in the
+            # tree scratch). Feature pairing: token at pos p pairs with target
+            # feature at p-1, i.e. its parent's hidden along the accepted path.
+            dev = last_token.device
+            slots = res.accepted_slots[:num]
+            toks = torch.cat([last_token.view(1), res.accepted_tokens[:num]])
+            prev_slots = torch.cat(
+                [torch.zeros(1, dtype=torch.long, device=dev), slots])[:num]
+            feats = torch.cat([root_feature.unsqueeze(0), hidden[prev_slots]])
+            poss = root_pos + torch.arange(num + 1, device=dev)
+            self.draft.extend_committed(toks, feats, poss)
+
         self.stats.steps += 1
         self.stats.tokens += len(new_tokens)
         return new_tokens, next_feature
@@ -102,10 +125,10 @@ class SpecDecodeEngine:
     @torch.inference_mode()
     def generate(self, prompt_ids: torch.Tensor, max_new_tokens: int = 128,
                  eos_token_id: int = 2) -> list[int]:
+        self.draft.reset()  # before prefill: prefill seeds the draft's committed KV
         logits, feature = self.prefill(prompt_ids)
         last = logits.argmax()
         out = [int(last)]
-        self.draft.reset()
         while len(out) < max_new_tokens:
             new_tokens, feature = self.step(last, feature)
             out.extend(new_tokens)

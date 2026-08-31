@@ -115,3 +115,25 @@ class PagedKVCache:
         k = self.k[layer, idx].reshape(nblk * self.block_size, kvh, hd)[:t]
         v = self.v[layer, idx].reshape(nblk * self.block_size, kvh, hd)[:t]
         return k, v
+
+    def gather_with_tail(self, layer: int, k_tail: torch.Tensor,
+                         v_tail: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """gather() + torch.cat([prefix, tail]) fused into one buffer.
+
+        index_select(out=) writes block rows straight into the output, so the
+        committed prefix is copied ONCE instead of twice (gather copy + cat
+        copy). The prefix grows with context length — at long contexts this
+        halves the dominant memory traffic of the tree-attention host path."""
+        s, t = self.seq_len, k_tail.shape[0]
+        bs = self.block_size
+        nblk = (s + bs - 1) // bs
+        idx = torch.tensor(self.block_table[:nblk], device=self.k.device, dtype=torch.long)
+        kvh, hd = self.config.num_kv_heads, self.config.head_dim
+        m = max(nblk * bs, s + t)
+        out_k = torch.empty(m, kvh, hd, device=self.k.device, dtype=self.k.dtype)
+        out_v = torch.empty_like(out_k)
+        torch.index_select(self.k[layer], 0, idx, out=out_k[:nblk * bs].view(nblk, bs, kvh, hd))
+        torch.index_select(self.v[layer], 0, idx, out=out_v[:nblk * bs].view(nblk, bs, kvh, hd))
+        out_k[s:s + t] = k_tail  # after index_select: overwrites block-tail garbage
+        out_v[s:s + t] = v_tail
+        return out_k[:s + t], out_v[:s + t]

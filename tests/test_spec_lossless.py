@@ -66,6 +66,98 @@ def test_spec_decode_lossless_vs_ar(engine_pair, rng):
     assert spec == ar  # lossless red line (plan Task 1.3)
 
 
+def test_spec_decode_lossless_vs_ar_long(engine_pair):
+    # 40 tokens x multiple prompts: catches KV position-bookkeeping bugs that a
+    # 12-token single-seed run misses (e.g. the root's KV never being committed
+    # only shows up once an uncommitted step's context matters — regression for
+    # the [root]+accepted commit fix). eos disabled so lengths always compare.
+    fresh, cfg = engine_pair
+    for seed in (1, 7, 42):
+        g = torch.Generator().manual_seed(seed)
+        prompt = torch.randint(0, cfg.vocab_size, (5,), generator=g)
+        ar = ar_greedy(fresh(), prompt.clone(), 40)
+        eng = SpecDecodeEngine(fresh(), TinyDraft(cfg.vocab_size),
+                               tree_size=8, max_depth=3, expert_budget=8)
+        spec = eng.generate(prompt.clone(), max_new_tokens=40, eos_token_id=-1)
+        assert spec == ar, f"seed {seed}"
+
+
+def random_eagle_weights(cfg, g):
+    from treemoe.model.eagle import EagleWeights
+
+    def r(*shape):
+        return torch.randn(*shape, generator=g, dtype=cfg.dtype) * 0.05
+
+    return EagleWeights(
+        fc=r(cfg.hidden_dim, 2 * cfg.hidden_dim),
+        attn={
+            "q_proj": r(cfg.num_heads * cfg.head_dim, cfg.hidden_dim),
+            "k_proj": r(cfg.num_kv_heads * cfg.head_dim, cfg.hidden_dim),
+            "v_proj": r(cfg.num_kv_heads * cfg.head_dim, cfg.hidden_dim),
+            "o_proj": r(cfg.hidden_dim, cfg.num_heads * cfg.head_dim),
+        },
+        input_layernorm=torch.ones(cfg.hidden_dim, dtype=cfg.dtype),
+        post_attn_layernorm=torch.ones(cfg.hidden_dim, dtype=cfg.dtype),
+        mlp_gate=r(cfg.intermediate_dim, cfg.hidden_dim),
+        mlp_up=r(cfg.intermediate_dim, cfg.hidden_dim),
+        mlp_down=r(cfg.hidden_dim, cfg.intermediate_dim),
+    )
+
+
+def test_spec_lossless_with_eagle_draft(engine_pair, rng):
+    # real EagleDraftModel end-to-end on CPU: exercises the committed-KV /
+    # begin_tree / tree_mask paths (prompt conditioning, ancestor-only
+    # attention, rejected-branch pruning). Red line: still bitwise == AR.
+    from treemoe.model.eagle import EagleDraftModel
+
+    fresh, cfg = engine_pair
+    w = random_weights(cfg, torch.Generator().manual_seed(5))
+    ew = random_eagle_weights(cfg, torch.Generator().manual_seed(6))
+    for seed in (3, 11):
+        g = torch.Generator().manual_seed(seed)
+        prompt = torch.randint(0, cfg.vocab_size, (6,), generator=g)
+        ar = ar_greedy(fresh(), prompt.clone(), 30)
+        target = fresh()
+        draft = EagleDraftModel(ew, cfg, w.embed_tokens, w.lm_head)
+        eng = SpecDecodeEngine(target, draft, tree_size=8, max_depth=3,
+                               expert_budget=8)
+        spec = eng.generate(prompt.clone(), max_new_tokens=30, eos_token_id=-1)
+        assert spec == ar, f"seed {seed}"
+        assert draft._ck is not None
+        # committed KV holds exactly the accepted sequence (prompt[1:] + outputs
+        # minus the trailing bonus/root not yet committed) — rejected branches
+        # never leak in: committed length == last root_pos - 1 + 1
+        assert draft._ck.shape[0] == target.kv.seq_len - 1
+
+
+def test_eagle_tree_mask_chain_equals_causal(tiny_config):
+    # a linear chain stepped one node per level with explicit ancestor masks
+    # must reproduce the same features/logits as one causal batch: the tree
+    # topology mask is exactly "ancestors + self".
+    from treemoe.model.eagle import EagleDraftModel
+
+    cfg = tiny_config
+    g = torch.Generator().manual_seed(9)
+    w = random_weights(cfg, g)
+    ew = random_eagle_weights(cfg, g)
+
+    toks = torch.randint(0, cfg.vocab_size, (3,), generator=g)
+    feats = torch.randn(3, cfg.hidden_dim, generator=g, dtype=cfg.dtype)
+    poss = torch.arange(4, 7)
+
+    a = EagleDraftModel(ew, cfg, w.embed_tokens, w.lm_head)
+    a.begin_tree()
+    fa, la = a.step(toks, feats, poss)  # tree_mask=None -> batch-causal chain
+
+    b = EagleDraftModel(ew, cfg, w.embed_tokens, w.lm_head)
+    b.begin_tree()
+    for i in range(3):
+        m = torch.ones(1, i + 1, dtype=torch.bool)  # ancestors 0..i-1 + self
+        fb, lb = b.step(toks[i:i + 1], feats[i:i + 1], poss[i:i + 1], tree_mask=m)
+        assert torch.allclose(fa[i], fb[0], atol=1e-5)
+        assert torch.allclose(la[i], lb[0], atol=1e-4)
+
+
 def test_accept_length_stat_updates(engine_pair, rng):
     fresh, cfg = engine_pair
     prompt = torch.randint(0, cfg.vocab_size, (5,), generator=rng)
