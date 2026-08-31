@@ -50,34 +50,63 @@ def main() -> None:
     ap.add_argument("--no-auto-bitmap", action="store_true",
                     help="offload only: disable the temporal predictor "
                          "(every pass copies all experts; isolates repair overhead)")
+    ap.add_argument("--random-weights", action="store_true",
+                    help="no checkpoint needed: random weights at real Mixtral "
+                         "shapes. TPOT/hit_rate/streaming numbers are valid "
+                         "(memory traffic ignores values); accept_len is NOT.")
     args = ap.parse_args()
-
-    from transformers import AutoTokenizer
 
     from treemoe.engine.loop import SpecDecodeEngine
     from treemoe.kernels.op1_tree_moe import route_experts, tree_moe_forward
     from treemoe.kernels.op2_prefetch import LayerPrefetcher
     from treemoe.model.config import MixtralConfig
-    from treemoe.model.eagle import EagleDraftModel, load_eagle_weights
+    from treemoe.model.eagle import EagleDraftModel, EagleWeights, load_eagle_weights
     from treemoe.model.kv_cache import PagedKVCache
     from treemoe.model.mixtral import MixtralForward
-    from treemoe.model.weights import load_mixtral_weights
+    from treemoe.model.weights import load_mixtral_weights, random_mixtral_weights
 
     cfg = MixtralConfig()
-    if args.layout == "offload":
-        weights = load_mixtral_weights(
-            args.model_dir, cfg, layout="offload",
-            offload_layers=set(range(cfg.num_layers)),
+    offload = set(range(cfg.num_layers)) if args.layout == "offload" else None
+    if args.random_weights:
+        weights = random_mixtral_weights(cfg, layout=args.layout,
+                                         offload_layers=offload)
+        g = torch.Generator().manual_seed(1)
+        hd = cfg.hidden_dim
+
+        def rw(*s):
+            return (torch.randn(*s, generator=g) * 0.02).to(cfg.dtype).cuda()
+
+        eagle_w = EagleWeights(
+            fc=rw(hd, 2 * hd),
+            attn={"q_proj": rw(cfg.num_heads * cfg.head_dim, hd),
+                  "k_proj": rw(cfg.num_kv_heads * cfg.head_dim, hd),
+                  "v_proj": rw(cfg.num_kv_heads * cfg.head_dim, hd),
+                  "o_proj": rw(hd, cfg.num_heads * cfg.head_dim)},
+            input_layernorm=torch.ones(hd, dtype=cfg.dtype, device="cuda"),
+            post_attn_layernorm=torch.ones(hd, dtype=cfg.dtype, device="cuda"),
+            mlp_gate=rw(cfg.intermediate_dim, hd),
+            mlp_up=rw(cfg.intermediate_dim, hd),
+            mlp_down=rw(hd, cfg.intermediate_dim),
         )
+        pg = torch.Generator().manual_seed(2)
+        prompts = [torch.randint(0, cfg.vocab_size, (32,), generator=pg).cuda()
+                   for _ in range(args.num_prompts)]
     else:
-        weights = load_mixtral_weights(args.model_dir, cfg)
-    eagle_w = load_eagle_weights(args.eagle_path)
-    tok = AutoTokenizer.from_pretrained(args.model_dir)
-    prompts = [
-        tok(f"Question {i}: explain topic {i} in detail.", return_tensors="pt")
-        .input_ids[0].cuda()
-        for i in range(args.num_prompts)
-    ]
+        from transformers import AutoTokenizer
+
+        if args.layout == "offload":
+            weights = load_mixtral_weights(
+                args.model_dir, cfg, layout="offload", offload_layers=offload,
+            )
+        else:
+            weights = load_mixtral_weights(args.model_dir, cfg)
+        eagle_w = load_eagle_weights(args.eagle_path)
+        tok = AutoTokenizer.from_pretrained(args.model_dir)
+        prompts = [
+            tok(f"Question {i}: explain topic {i} in detail.", return_tensors="pt")
+            .input_ids[0].cuda()
+            for i in range(args.num_prompts)
+        ]
 
     def factory(budget: int, tree_size: int):
         kv = PagedKVCache(cfg, num_blocks=256)

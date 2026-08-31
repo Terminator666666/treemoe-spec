@@ -131,3 +131,63 @@ def load_mixtral_weights(
     for h in open_handles.values():
         h.__exit__(None, None, None)
     return weights
+
+
+def random_mixtral_weights(
+    config: MixtralConfig | None = None,
+    device: str = "cuda",
+    layout: str = "full",
+    offload_layers: set[int] | None = None,
+    seed: int = 0,
+) -> MixtralWeights:
+    """Checkpoint-free weights at real Mixtral shapes, for plumbing/bandwidth
+    benchmarks (op2 hit-rate, offload streaming, launch overhead). Routing
+    varies per layer (distinct random routers); expert FFN weights are a
+    repeated block (values are irrelevant to memory traffic, and a full 90GB
+    randn would take minutes). accept_len / output quality are NOT meaningful
+    with these weights.
+    """
+    config = config or MixtralConfig()
+    g = torch.Generator().manual_seed(seed)
+    dt = config.dtype
+    h, inter, e = config.hidden_dim, config.intermediate_dim, config.num_experts
+
+    def r(*shape, scale=0.02):
+        return (torch.randn(*shape, generator=g) * scale).to(dt)
+
+    base = r(inter, h)  # one FFN block, repeated across experts/layers
+    base_t = base.t().contiguous()
+    offload_layers = offload_layers or set()
+    layers = []
+    for i in range(config.num_layers):
+        on_cpu = layout == "offload" and i in offload_layers
+        w1 = torch.empty(e, inter, h, dtype=dt).copy_(base.expand(e, inter, h))
+        w2 = torch.empty(e, h, inter, dtype=dt).copy_(base_t.expand(e, h, inter))
+        w3 = torch.empty(e, inter, h, dtype=dt).copy_(base.expand(e, inter, h))
+        if on_cpu:
+            try:
+                w1, w2, w3 = w1.pin_memory(), w2.pin_memory(), w3.pin_memory()
+            except RuntimeError:
+                pass
+        else:
+            w1, w2, w3 = w1.to(device), w2.to(device), w3.to(device)
+        layers.append(LayerWeights(
+            input_layernorm=torch.ones(h, dtype=dt, device=device),
+            post_attn_layernorm=torch.ones(h, dtype=dt, device=device),
+            attn={
+                "q_proj": r(config.num_heads * config.head_dim, h).to(device),
+                "k_proj": r(config.num_kv_heads * config.head_dim, h).to(device),
+                "v_proj": r(config.num_kv_heads * config.head_dim, h).to(device),
+                "o_proj": r(h, config.num_heads * config.head_dim).to(device),
+            },
+            router=r(e, h, scale=0.5).to(device),  # distinct per layer: routing varies
+            w1=w1, w2=w2, w3=w3,
+            experts_on_gpu=not on_cpu,
+        ))
+    return MixtralWeights(
+        config=config,
+        embed_tokens=r(config.vocab_size, h, scale=0.5).to(device),
+        final_norm=torch.ones(h, dtype=dt, device=device),
+        lm_head=r(config.vocab_size, h).to(device),
+        layers=layers,
+    )

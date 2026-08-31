@@ -32,11 +32,16 @@ echo "       -k 'regex:_moe_gemm' python benchmarks/bench_op1.py --tree-sizes 64
 echo "   check: occupancy ~38%/56%, LDG.E.64 weight loads, zero local-memory traffic"
 
 echo "== tier 2c: offload prefetch hit-rate + host-DRAM break-even probes =="
-python benchmarks/bench_e2e.py --layout offload --prefetch-depth 2
-python benchmarks/bench_e2e.py --layout offload --prefetch-depth 2 --no-auto-bitmap
-# hit_rate column: auto_bitmap temporal predictor vs full-copy baseline
 python benchmarks/bench_cpu_expert.py
 # AutoDL host DRAM BW vs PCIe 23.8GB/s decides the Fiddler-style CPU-expert path
+if [ -d checkpoints/mixtral-8x7b-instruct ]; then
+  E2E_W=""
+else
+  E2E_W="--random-weights"   # streaming/hit-rate numbers valid; accept_len is not
+fi
+python benchmarks/bench_e2e.py --layout offload --prefetch-depth 2 $E2E_W
+python benchmarks/bench_e2e.py --layout offload --prefetch-depth 2 --no-auto-bitmap $E2E_W
+# hit_rate column: auto_bitmap temporal predictor vs full-copy baseline
 
 if [ -d checkpoints/mixtral-8x7b-instruct ]; then
   echo "== tier 3: red-line tests (offloaded, slow: expect ~30-60 min) =="
