@@ -55,13 +55,19 @@ def build_eagle2_tree(
         new_feats, logits = draft_step_fn(toks, feats, poss)
         logprobs = torch.log_softmax(logits.float(), dim=-1)
         topv, topi = logprobs.topk(branch_k, dim=-1)
+        # ONE packed D2H per level. The old per-element int(topi[fi,k]) /
+        # float(topv[fi,k]) pulls cost 2*branch_k*|frontier| GPU syncs per
+        # level (~hundreds per step, ~5-10us each) -- rivaling a whole MoE
+        # layer. token ids (<32000) are exact in fp32.
+        packed = torch.cat([topi.float(), topv], dim=1).tolist()
         next_frontier = []
         for fi, pool_i in enumerate(frontier):
+            row = packed[fi]
             for k in range(branch_k):
-                pool_tokens.append(int(topi[fi, k]))
+                pool_tokens.append(int(row[k]))
                 pool_parent.append(pool_i)
                 pool_depth.append(depth)
-                pool_logp.append(pool_logp[pool_i] + float(topv[fi, k]))
+                pool_logp.append(pool_logp[pool_i] + row[branch_k + k])
                 pool_feat.append(new_feats[fi])
                 next_frontier.append(len(pool_tokens) - 1)
         # EAGLE-2 dynamic expansion: only the globally most promising nodes expand
@@ -89,26 +95,36 @@ def build_eagle2_tree(
     _walk(0)
     remap = {old: new for new, old in enumerate(dfs)}
 
+    # serialize entirely host-side, then upload once: the old per-element
+    # GPU-tensor writes and int(parent[j]) ancestor walks cost ~2N tiny H2D
+    # launches + O(N*depth) D2H syncs per step
     n = tree_size
-    tokens = torch.full((n,), -1, dtype=torch.long, device=device)
-    parent = torch.full((n,), -1, dtype=torch.long, device=device)
-    accept = torch.zeros(n, device=device)
+    tok_new = [-1] * n
+    par_new = [-1] * n
+    logp_new = [float("-inf")] * n
     for old in dfs:
         new = remap[old]
-        tokens[new] = pool_tokens[old]
-        parent[new] = remap[pool_parent[old]] if pool_parent[old] in remap else -1
-        accept[new] = float(torch.tensor(pool_logp[old]).exp())
+        tok_new[new] = pool_tokens[old]
+        par_new[new] = remap[pool_parent[old]] if pool_parent[old] in remap else -1
+        logp_new[new] = pool_logp[old]
 
-    mask = torch.zeros(n, n, dtype=torch.bool, device=device)
+    mask_rows = [[False] * n for _ in range(n)]
     for i in range(len(dfs)):
         j = i
         while j >= 0:
-            mask[i, j] = True
-            j = int(parent[j])
+            mask_rows[i][j] = True
+            j = par_new[j]
 
     children: list[list[int]] = [[] for _ in range(n)]
     for i in range(1, len(dfs)):
-        children[int(parent[i])].append(i)
+        children[par_new[i]].append(i)
+
+    tokens = torch.tensor(tok_new, dtype=torch.long, device=device)
+    parent = torch.tensor(par_new, dtype=torch.long, device=device)
+    # fp32 exp matches the old torch.tensor(logp).exp() numerics bitwise;
+    # padding slots get exp(-inf) = 0.0 like the old torch.zeros prefill
+    accept = torch.tensor(logp_new, dtype=torch.float32).exp().to(device)
+    mask = torch.tensor(mask_rows, dtype=torch.bool, device=device)
 
     return DraftTree(
         tokens=tokens, parent=parent, accept_prob=accept,
