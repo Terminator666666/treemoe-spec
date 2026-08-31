@@ -93,14 +93,16 @@ class PagedKVCache:
     # ---------------- gather for attention ----------------
 
     def gather(self, layer: int, upto: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
-        """Materialize contiguous [T, kv_heads, head_dim] (reference attention path)."""
+        """Materialize contiguous [T, kv_heads, head_dim] (reference attention path).
+
+        One advanced-indexing op over whole blocks (block_table maps logical
+        block i -> physical block), then trim the tail: single device copy per
+        call instead of the old per-position Python loop + T-way stack
+        (O(seq_len) host iterations x 32 layers x every step)."""
         t = self.seq_len if upto is None else upto
-        ks, vs = [], []
-        for pos in range(t):
-            blk, off = self.slot_of(pos)
-            ks.append(self.k[layer, blk, off])
-            vs.append(self.v[layer, blk, off])
-        if not ks:
-            empty = self.k.new_zeros((0, self.config.num_kv_heads, self.config.head_dim))
-            return empty, empty.clone()
-        return torch.stack(ks), torch.stack(vs)
+        nblk = (t + self.block_size - 1) // self.block_size
+        idx = torch.tensor(self.block_table[:nblk], device=self.k.device, dtype=torch.long)
+        kvh, hd = self.config.num_kv_heads, self.config.head_dim
+        k = self.k[layer, idx].reshape(nblk * self.block_size, kvh, hd)[:t]
+        v = self.v[layer, idx].reshape(nblk * self.block_size, kvh, hd)[:t]
+        return k, v

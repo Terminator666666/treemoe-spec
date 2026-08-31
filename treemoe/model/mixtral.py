@@ -111,6 +111,7 @@ class MixtralForward:
         positions: torch.Tensor,
         tree_mask: Optional[torch.Tensor],
         is_tree: bool,
+        start_pos: int,
     ) -> torch.Tensor:
         cfg = self.cfg
         t = x.shape[0]
@@ -131,18 +132,22 @@ class MixtralForward:
             mask[:, :prefix_len] = True
             mask[:, prefix_len:] = tree_mask  # [N, N] bool, ancestors incl. self
         else:
-            self.kv.append(layer_idx, k, v, start_pos=int(positions[0]))
+            self.kv.append(layer_idx, k, v, start_pos=start_pos)
             full_k, full_v = self.kv.gather(layer_idx)
             total = full_k.shape[0]
-            mask = torch.zeros(t, total, dtype=torch.bool, device=x.device)
-            for i in range(t):
-                mask[i, : int(positions[i]) + 1] = True
+            # causal mask without per-row int(positions[i]) D2H syncs
+            # (was 32 hidden syncs/step in the AR decode path)
+            mask = (torch.arange(total, device=x.device)[None, :]
+                    <= positions[:, None])
 
-        rep = cfg.num_heads // cfg.num_kv_heads
-        qh = q.transpose(0, 1)  # [heads, T, hd]
-        kh = full_k.repeat_interleave(rep, dim=1).transpose(0, 1)
-        vh = full_v.repeat_interleave(rep, dim=1).transpose(0, 1)
-        o = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=mask.unsqueeze(0))
+        qh = q.transpose(0, 1)          # [heads, T, hd]
+        kh = full_k.transpose(0, 1)     # [kv_heads, S, hd]
+        vh = full_v.transpose(0, 1)
+        # enable_gqa: SDPA maps q head h -> kv head h // (heads/kv_heads)
+        # internally, same grouping as the old repeat_interleave but without
+        # materializing a 4x copy of the whole K/V prefix per layer per step.
+        o = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=mask.unsqueeze(0),
+                                           enable_gqa=True)
         o = o.transpose(0, 1).reshape(t, cfg.num_heads * cfg.head_dim)
         return F.linear(o, lw.attn["o_proj"])
 
@@ -160,11 +165,14 @@ class MixtralForward:
         is_tree = tree_mask is not None
         x = F.embedding(token_ids, self.w.embed_tokens)
         penultimate = x
+        # one D2H for the whole step instead of int(positions[0]) per layer
+        start_pos = 0 if is_tree else int(positions[0])
         if self.prefetcher is not None:
             self.prefetcher.begin()
         for layer_idx, lw in enumerate(self.w.layers):
             h = rms_norm(x, lw.input_layernorm, cfg.rms_eps)
-            x = x + self._attention(lw, layer_idx, h, positions, tree_mask, is_tree)
+            x = x + self._attention(lw, layer_idx, h, positions, tree_mask,
+                                    is_tree, start_pos)
             h = rms_norm(x, lw.post_attn_layernorm, cfg.rms_eps)
             use_prefetch = self.prefetcher is not None and not lw.experts_on_gpu
             if lw.experts_on_gpu:
