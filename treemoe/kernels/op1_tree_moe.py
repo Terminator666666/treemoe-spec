@@ -521,9 +521,12 @@ def tree_moe_forward(
         pack_w = 0
 
     max_bpe = (2 * n + BM - 1) // BM
-    # fused Kernel A: single-CTA route+bucket (1 launch vs ~8 torch ops);
-    # register footprint of the O((2N)^2) rank limits it to N<=64, E<=16
-    use_fused_a = ((n & (n - 1)) == 0 and 16 <= n <= 64 and e <= 16
+    # fused Kernel A: single-CTA route+bucket (1 launch vs ~8 torch ops).
+    # N<=64: zero spill (nw=32, 64 regs). N=128: the O((2N)^2) rank matrix
+    # spills ~0.5KB/thread (AOT ptxas, sm_90a) -- accepted: single CTA, one
+    # launch per layer, vs the ~570us/layer launch-gap cost of the torch
+    # fallback measured on the 4090 (N=128 was 76% peak vs 89% at N<=64).
+    use_fused_a = ((n & (n - 1)) == 0 and 16 <= n <= 128 and e <= 16
                    and os.getenv("TREEMOE_FUSED_A") != "0")  # debug: force torch routing
     if use_fused_a:
         _route_bucket_fused_kernel[(1,)](

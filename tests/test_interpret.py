@@ -46,6 +46,16 @@ def test_op1_atomic_path_interpreted(rng):
     torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-5)
 
 
+def test_op1_pipeline_n128_interpreted(rng):
+    """N=128 now takes fused Kernel A (extended from N<=64): exercises the
+    O((2N)^2)=256^2 stable-rank and the RB-blocked inverse scatter at the
+    largest supported tree size."""
+    x, w1, w2, w3, router, accept = make_moe_inputs(128, E, H, I, rng)
+    out = tree_moe_forward(x, w1, w2, w3, router, accept, 8, deterministic=True)
+    ref = tree_moe_forward_ref(x, w1, w2, w3, router, accept, 8)
+    torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-5)
+
+
 def test_op1_packed_weight_path_interpreted(rng):
     """16-bit weights take the PACK_W=1 branch (u32-packed loads + bit-unpack);
     validates the little-endian unpack numerics end-to-end vs the reference.

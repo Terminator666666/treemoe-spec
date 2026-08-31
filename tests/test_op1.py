@@ -157,15 +157,18 @@ def test_triton_deterministic_bitwise():
 
 
 @pytest.mark.gpu
+@pytest.mark.parametrize("n", [64, 128])
 @pytest.mark.parametrize("budget", [2, 4, 8])
-def test_fused_route_bucket_triton_matches_torch(budget):
-    """Fused single-CTA Kernel A vs the torch composition, on device."""
+def test_fused_route_bucket_triton_matches_torch(n, budget):
+    """Fused single-CTA Kernel A vs the torch composition, on device.
+    n=128 covers the extended range (O((2N)^2)=256^2 rank, ~0.5KB/thread
+    spill accepted to kill the torch-fallback launch gap)."""
     from treemoe.kernels.op1_tree_moe import (
         BM, _route_bucket_fused_kernel, route_and_bucket,
     )
 
     g = torch.Generator().manual_seed(3)
-    n, e, h = 64, 8, 4096
+    e, h = 8, 4096
     x = torch.randn(n, h, generator=g, dtype=torch.bfloat16).cuda()
     router = (torch.randn(e, h, generator=g, dtype=torch.bfloat16) * 0.1).cuda()
     accept = torch.rand(n, generator=g).cuda()
