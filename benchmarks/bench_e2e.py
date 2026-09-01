@@ -46,6 +46,13 @@ def run_config(engine_factory, budget: int, tree_size: int, prompts: list[torch.
     }
     if pf is not None and pf.routed_total:
         r["hit_rate"] = 1.0 - pf.repair_misses / pf.routed_total
+    # the engine/prefetcher/kv sit in closure reference cycles (moe_fn attrs):
+    # without an explicit collect the previous config's staging ring survives
+    # into the next one and B-sweeps OOM on 24GB cards
+    del eng, pf
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
     return r
 
 
