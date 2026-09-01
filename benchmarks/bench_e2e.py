@@ -174,13 +174,15 @@ def main() -> None:
             "Draft a cover letter for a software engineering internship.",
             "Discuss the pros and cons of remote work.",
         ]
-        prompts = [
-            tok.apply_chat_template(
+        prompts = []
+        for i in range(args.num_prompts):
+            text = tok.apply_chat_template(
                 [{"role": "user", "content": instructions[i % len(instructions)]}],
-                return_tensors="pt", add_generation_prompt=True,
-            )[0].cuda()
-            for i in range(args.num_prompts)
-        ]
+                tokenize=False, add_generation_prompt=True,
+            )
+            # template already contains <s>; add_special_tokens would double it
+            ids = tok(text, return_tensors="pt", add_special_tokens=False).input_ids
+            prompts.append(ids[0].cuda())
 
     def factory(budget: int, tree_size: int):
         kv = PagedKVCache(cfg, num_blocks=256)
