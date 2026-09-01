@@ -19,6 +19,20 @@ from treemoe.model.config import MixtralConfig
 _ATTN_KEYS = ("q_proj", "k_proj", "v_proj", "o_proj")
 _EXPERT_KEYS = ("w1", "w2", "w3")
 
+# checkpoint locations, first existing wins (AutoDL data disk, then repo-local)
+_MODEL_DIRS = ("/root/autodl-tmp/Mixtral-8x7B-Instruct-v0.1",
+               "checkpoints/mixtral-8x7b-instruct")
+_EAGLE_PATHS = ("/root/autodl-tmp/checkpoints/eagle-mixtral/pytorch_model.bin",
+                "checkpoints/eagle-mixtral/model.safetensors")
+
+
+def default_model_dir() -> str:
+    return next((p for p in _MODEL_DIRS if Path(p).is_dir()), _MODEL_DIRS[-1])
+
+
+def default_eagle_path() -> str:
+    return next((p for p in _EAGLE_PATHS if Path(p).is_file()), _EAGLE_PATHS[-1])
+
 
 @dataclass
 class LayerWeights:

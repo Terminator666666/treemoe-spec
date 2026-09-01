@@ -34,7 +34,7 @@ echo "   check: occupancy ~38%/56%, LDG.E.64 weight loads, zero local-memory tra
 echo "== tier 2c: offload prefetch hit-rate + host-DRAM break-even probes =="
 python benchmarks/bench_cpu_expert.py
 # AutoDL host DRAM BW vs PCIe 23.8GB/s decides the Fiddler-style CPU-expert path
-if [ -d checkpoints/mixtral-8x7b-instruct ]; then
+if [ -d checkpoints/mixtral-8x7b-instruct ] || [ -d /root/autodl-tmp/Mixtral-8x7B-Instruct-v0.1 ]; then
   E2E_W=""
 else
   # random weights: streaming/hit-rate numbers valid, accept_len is not.
@@ -49,7 +49,7 @@ python benchmarks/bench_e2e.py --layout offload --prefetch-depth 2 $E2E_W
 python benchmarks/bench_e2e.py --layout offload --prefetch-depth 2 --no-auto-bitmap $E2E_W
 # hit_rate column: auto_bitmap temporal predictor vs full-copy baseline
 
-if [ -d checkpoints/mixtral-8x7b-instruct ]; then
+if [ -d checkpoints/mixtral-8x7b-instruct ] || [ -d /root/autodl-tmp/Mixtral-8x7B-Instruct-v0.1 ]; then
   echo "== tier 3: red-line tests (offloaded, slow: expect ~30-60 min) =="
   # NOTE: rerun test_ar_logits_match_hf even if it passed before -- the
   # attention path moved to SDPA enable_gqa + gather_with_tail (2026-08-31),

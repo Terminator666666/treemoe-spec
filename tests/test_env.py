@@ -1,16 +1,14 @@
 """Task 0.1 gate: environment + model availability (marked, skipped on dev boxes)."""
 
-import os
-
 import pytest
 import torch
 
 pytestmark = pytest.mark.model
 
-# prefer the local checkpoint (93GB -- never re-download into the HF cache)
-MODEL = ("checkpoints/mixtral-8x7b-instruct"
-         if os.path.isdir("checkpoints/mixtral-8x7b-instruct")
-         else "mistralai/Mixtral-8x7B-Instruct-v0.1")
+from treemoe.model.weights import default_model_dir  # noqa: E402
+
+# local checkpoint (93GB -- never re-download into the HF cache)
+MODEL = default_model_dir()
 
 
 @pytest.mark.gpu

@@ -44,8 +44,13 @@ def run_config(engine_factory, budget: int, tree_size: int, prompts: list[torch.
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model-dir", default="checkpoints/mixtral-8x7b-instruct")
-    ap.add_argument("--eagle-path", default="checkpoints/eagle-mixtral/model.safetensors")
+    ap.add_argument("--model-dir", default=None,
+                    help="Mixtral checkpoint dir (default: auto-detect "
+                         "/root/autodl-tmp/Mixtral-8x7B-Instruct-v0.1, then "
+                         "checkpoints/mixtral-8x7b-instruct)")
+    ap.add_argument("--eagle-path", default=None,
+                    help="EAGLE draft weights, .safetensors or .bin "
+                         "(default: auto-detect)")
     ap.add_argument("--budgets", type=int, nargs="+", default=[3, 4, 5, 6, 8])
     ap.add_argument("--tree-sizes", type=int, nargs="+", default=[64])
     ap.add_argument("--num-prompts", type=int, default=20)
@@ -79,7 +84,14 @@ def main() -> None:
     from treemoe.model.eagle import EagleDraftModel, EagleWeights, load_eagle_weights
     from treemoe.model.kv_cache import PagedKVCache
     from treemoe.model.mixtral import MixtralForward
-    from treemoe.model.weights import load_mixtral_weights, random_mixtral_weights
+    from treemoe.model.weights import (default_eagle_path, default_model_dir,
+                                       load_mixtral_weights,
+                                       random_mixtral_weights)
+
+    if args.model_dir is None:
+        args.model_dir = default_model_dir()
+    if args.eagle_path is None:
+        args.eagle_path = default_eagle_path()
 
     cfg = MixtralConfig()
     offload = set(range(cfg.num_layers)) if args.layout == "offload" else None

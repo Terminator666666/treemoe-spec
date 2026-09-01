@@ -121,9 +121,9 @@ def test_ar_logits_match_hf():
     import gc
 
     transformers = pytest.importorskip("transformers")
-    from treemoe.model.weights import load_mixtral_weights
+    from treemoe.model.weights import default_model_dir, load_mixtral_weights
 
-    model_dir = "checkpoints/mixtral-8x7b-instruct"
+    model_dir = default_model_dir()
     tok = transformers.AutoTokenizer.from_pretrained(model_dir)
     total_gb = torch.cuda.get_device_properties(0).total_memory / 2**30
     resident = total_gb >= 120
