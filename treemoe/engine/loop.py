@@ -58,6 +58,11 @@ class SpecDecodeEngine:
         first tree drafts from a single-token context.
         """
         positions = torch.arange(token_ids.shape[0], device=token_ids.device)
+        fn = getattr(self.target, "moe_fn", None)
+        if fn is not None and hasattr(fn, "current_accept_prob"):
+            # prompt tokens are all real: acceptance prob 1 (op3 spec §3.3)
+            fn.current_accept_prob = torch.ones(
+                token_ids.shape[0], device=token_ids.device)
         logits, hidden = self.target.forward(token_ids, positions, return_hidden=True)
         if hasattr(self.draft, "extend_committed") and token_ids.shape[0] > 1:
             self.draft.extend_committed(token_ids[1:], hidden[:-1], positions[1:])
@@ -83,6 +88,13 @@ class SpecDecodeEngine:
         pf = getattr(self.target, "prefetcher", None)
         if pf is not None and hasattr(pf, "router_hint"):
             pf.router_hint(tree.features, self.expert_budget)
+
+        # op3 acceptance-weighted budget routing (spec §3.3): expose the tree's
+        # global acceptance probabilities to the MoE routing hook so expert
+        # demand is weighted by p_accept and low-prob nodes degrade to top-1
+        fn = getattr(self.target, "moe_fn", None)
+        if fn is not None and hasattr(fn, "current_accept_prob"):
+            fn.current_accept_prob = tree.accept_prob
 
         # verification forward over the whole tree (root token occupies slot 0)
         positions = root_pos + _depths(tree.parent, self.max_depth)

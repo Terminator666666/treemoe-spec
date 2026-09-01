@@ -181,8 +181,12 @@ def main() -> None:
         host_layers = weights.layers  # pinned host copy for the CPU cold path
 
         def moe_fn(x, lw, layer_idx, _b=budget):
-            accept = moe_fn.current_accept_prob  # set by engine step; fallback ones
-            routing = route_experts(x, lw.router, accept[: x.shape[0]], _b,
+            # engine sets this per forward (prefill=ones, tree step=accept_prob);
+            # fallback for any other caller: real tokens, acceptance prob 1
+            accept = moe_fn.current_accept_prob
+            if accept.shape[0] != x.shape[0]:
+                accept = torch.ones(x.shape[0], device=x.device)
+            routing = route_experts(x, lw.router, accept, _b,
                                     inter=lw.w1.shape[1])
             cold_x = []
             if pf is not None:
@@ -209,7 +213,7 @@ def main() -> None:
                             cold_x.append((e, dev_toks, gates, x[dev_toks].cpu()))
                 pf.repair(layer_idx, ids)
             out = tree_moe_forward(x, lw.w1, lw.w2, lw.w3, lw.router,
-                                   accept[: x.shape[0]], _b, routing=routing)
+                                   accept, _b, routing=routing)
             for e, dev_toks, gates, xc in cold_x:
                 hw = host_layers[layer_idx]
                 y = (F.silu(xc @ hw.w1[e].t()) * (xc @ hw.w3[e].t())) @ hw.w2[e].t()
