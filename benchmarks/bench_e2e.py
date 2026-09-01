@@ -89,6 +89,10 @@ def main() -> None:
                     help="no checkpoint needed: random weights at real Mixtral "
                          "shapes. TPOT/hit_rate/streaming numbers are valid "
                          "(memory traffic ignores values); accept_len is NOT.")
+    ap.add_argument("--ar-baseline", action="store_true",
+                    help="run plain greedy AR through the same offload plumbing "
+                         "instead of the sweep (speedup denominator). Uses "
+                         "budget=8: AR must be exact, no expert truncation.")
     args = ap.parse_args()
 
     from treemoe.engine.loop import SpecDecodeEngine
@@ -243,6 +247,37 @@ def main() -> None:
 
     print(f"{'B':>3} {'N':>5} {'TPOT(ms)':>10} {'accept_len':>11} {'hit_rate':>9} {'cold':>6}",
           flush=True)
+    if args.ar_baseline:
+        # same kv/prefetcher/moe_fn plumbing as the spec arms, no draft/tree:
+        # prefill, then one token per forward. budget=8 => exact AR outputs.
+        eng, pf = factory(budget=8, tree_size=16)
+        target = eng.target
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        total = 0
+        for i, p in enumerate(prompts):
+            positions = torch.arange(p.shape[0], device=p.device)
+            logits = target.forward(p, positions)
+            last = logits[-1].argmax().view(1)
+            n_gen = 1
+            while n_gen < args.max_new_tokens:
+                pos = torch.tensor([target.kv.seq_len], device=p.device)
+                logits = target.forward(last, pos)
+                last = logits[-1].argmax().view(1)
+                n_gen += 1
+            total += n_gen
+            el = time.perf_counter() - t0
+            print(f"  AR prompt {i + 1}/{len(prompts)} ({el:.0f}s elapsed, "
+                  f"{el / total * 1e3:.0f}ms/tok)", file=sys.stderr, flush=True)
+        torch.cuda.synchronize()
+        wall = time.perf_counter() - t0
+        hit = float("nan")
+        if pf is not None and pf.routed_total:
+            hit = 1.0 - pf.repair_misses / pf.routed_total
+        print(f"{'AR':>3} {'-':>5} {wall / total * 1e3:>10.2f} {'-':>11} "
+              f"{hit:>9.3f} {'-':>6}", flush=True)
+        return
+
     for n in args.tree_sizes:
         for b in args.budgets:
             r = run_config(factory, b, n, prompts,
