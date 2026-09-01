@@ -162,7 +162,6 @@ class MixtralForward:
         cfg = self.cfg
         is_tree = tree_mask is not None
         x = F.embedding(token_ids, self.w.embed_tokens)
-        penultimate = x
         # one D2H for the whole step instead of int(positions[0]) per layer
         start_pos = 0 if is_tree else int(positions[0])
         if self.prefetcher is not None:
@@ -184,10 +183,11 @@ class MixtralForward:
             x = x + self.moe_fn(h, moe_lw, layer_idx)
             if use_prefetch:
                 self.prefetcher.release(layer_idx)
-            if layer_idx == cfg.num_layers - 2:
-                penultimate = x  # EAGLE-2 draft feature source (spec §3.2)
         x = rms_norm(x, self.w.final_norm, cfg.rms_eps)
         logits = F.linear(x, self.w.lm_head).float()
         if return_hidden:
-            return logits, penultimate
+            # EAGLE draft feature = the exact lm_head input (official ea_model:
+            # base_model.model(...)[0], i.e. AFTER all layers + final_norm).
+            # Feeding an earlier layer's pre-norm hidden collapses acceptance.
+            return logits, x
         return logits

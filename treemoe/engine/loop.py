@@ -50,8 +50,9 @@ class SpecDecodeEngine:
 
     @torch.inference_mode()
     def prefill(self, token_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run target prefill; returns (last_logits [V], last_penultimate [H]).
+        """Run target prefill; returns (last_logits [V], last_hidden [H]).
 
+        hidden = post-final-norm lm_head input, the official EAGLE feature.
         Also conditions the draft on the prompt (official EAGLE: draft input at
         position i pairs token_i with target feature_{i-1}) — without this the
         first tree drafts from a single-token context.
@@ -96,8 +97,9 @@ class SpecDecodeEngine:
             kv=kv, temperature=self.temperature, max_depth=self.max_depth,
         )
 
-        # next root feature = penultimate hidden at the last accepted node (spec
-        # §3.4 step 6) — pure tensor indexing, stays on GPU. num==0 falls back
+        # next root feature = target hidden (post-final-norm) at the last
+        # accepted node (spec §3.4 step 6) — pure tensor indexing, stays on GPU.
+        # num==0 falls back
         # to slot 0 (root): accepted_slots[0] is -1 then, clamp restores 0.
         last_idx = (res.num_accepted - 1).clamp(min=0)
         next_feature = hidden[res.accepted_slots[last_idx].clamp(min=0)]
