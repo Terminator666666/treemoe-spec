@@ -40,7 +40,10 @@ else
   # random weights: streaming/hit-rate numbers valid, accept_len is not.
   # Small workload: offload passes are PCIe-bound (~1s each) and a random
   # draft accepts ~nothing, so the full sweep would take hours.
-  E2E_W="--random-weights --num-prompts 3 --max-new-tokens 32 --budgets 4 8"
+  # --no-router-hint: measured best arm on random weights (degenerate
+  # routing maximally favours the temporal predictor; the hint's verdict
+  # belongs to tier 3 real weights).
+  E2E_W="--random-weights --num-prompts 3 --max-new-tokens 32 --budgets 4 8 --no-router-hint"
 fi
 python benchmarks/bench_e2e.py --layout offload --prefetch-depth 2 $E2E_W
 python benchmarks/bench_e2e.py --layout offload --prefetch-depth 2 --no-auto-bitmap $E2E_W
