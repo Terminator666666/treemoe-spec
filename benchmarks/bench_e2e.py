@@ -149,9 +149,36 @@ def main() -> None:
         eagle_w = load_eagle_weights(args.eagle_path)
         tok = AutoTokenizer.from_pretrained(args.model_dir)
         print("weights ready, starting benchmark", flush=True)
+        # EAGLE was trained on ShareGPT conversations and the official tau is
+        # measured on chat-templated MT-bench prompts; raw untemplated text
+        # systematically deflates acceptance. MT-bench-style instructions:
+        instructions = [
+            "Compose an engaging travel blog post about a recent trip to Hawaii.",
+            "Explain the difference between TCP and UDP to a beginner.",
+            "Write a short story about a robot learning to paint.",
+            "What are the main causes of the French Revolution?",
+            "Describe the process of photosynthesis step by step.",
+            "Draft an email to a professor asking for a recommendation letter.",
+            "Explain how a hash table works and when to use one.",
+            "Summarize the plot of Romeo and Juliet in three paragraphs.",
+            "Give practical tips for improving sleep quality.",
+            "Explain quantum entanglement in simple terms.",
+            "Write a product description for a smart water bottle.",
+            "Compare renewable and fossil fuel energy sources.",
+            "Describe how vaccines train the immune system.",
+            "Outline a beginner workout plan for building strength.",
+            "Explain the significance of the Turing test.",
+            "Write a recipe for a vegetarian pasta dinner.",
+            "Describe the water cycle and its main stages.",
+            "Explain why the sky is blue using physics.",
+            "Draft a cover letter for a software engineering internship.",
+            "Discuss the pros and cons of remote work.",
+        ]
         prompts = [
-            tok(f"Question {i}: explain topic {i} in detail.", return_tensors="pt")
-            .input_ids[0].cuda()
+            tok.apply_chat_template(
+                [{"role": "user", "content": instructions[i % len(instructions)]}],
+                return_tensors="pt", add_generation_prompt=True,
+            )[0].cuda()
             for i in range(args.num_prompts)
         ]
 
