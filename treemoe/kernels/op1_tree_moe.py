@@ -462,6 +462,7 @@ class _Workspace:
     def __init__(self, n: int, e: int, hidden: int, inter: int, device, dtype):
         max_blocks = e * ((2 * n + BM - 1) // BM)
         self.max_blocks = max_blocks
+        self.num_experts = e
         self.rows = max_blocks * BM
         self.h = torch.zeros(self.rows, inter, dtype=dtype, device=device)
         self.out_f32 = torch.zeros(n, hidden, dtype=torch.float32, device=device)
@@ -509,6 +510,42 @@ class Routing:
         (max_blocks int64s) -- the price of the exact-offload contract."""
         ids = self.block_expert_ids[: self.max_blocks].tolist()
         return sorted({int(i) for i in ids if i >= 0})
+
+    def exclude_experts(self, expert_ids) -> list[tuple[int, torch.Tensor, torch.Tensor]]:
+        """Hybrid CPU-expert dispatch (Fiddler, arXiv:2402.07033): drop these
+        experts from the GPU pass and return [(e, token_idx, gates)] host
+        tensors so the caller can run their FFN on CPU from the pinned host
+        copy -- below the ~8-token break-even (bench_cpu_expert) that beats
+        streaming a 352MB expert over PCIe.
+
+        GPU-side surgery, O(cold slots): zero their gates (atomic path),
+        mark their blocks unused so both GEMMs skip them, and zero their
+        partial rows so the fixed-order combine adds exact zeros. The GPU
+        output then equals a pass that never routed these experts."""
+        ws = self.ws
+        seg_rows = self.padded_slots.shape[0] // ws.num_experts
+        picked: list[tuple[int, torch.Tensor, torch.Tensor]] = []
+        all_slots = []
+        for e in expert_ids:
+            seg = self.padded_slots[e * seg_rows:(e + 1) * seg_rows]
+            slots = seg[seg >= 0]
+            if slots.numel() == 0:
+                continue
+            picked.append((int(e), (slots // 2).cpu(),
+                           self.gates_flat[slots].float().cpu()))
+            all_slots.append(slots)
+        if not picked:
+            return picked
+        slots = torch.cat(all_slots)
+        self.gates_flat[slots] = 0.0
+        partial = ws.get_partial(ws.out_f32.shape[1], self.padded_slots.device)
+        partial[:, self.slot_to_row[slots]] = 0.0
+        drop = torch.isin(
+            self.block_expert_ids,
+            torch.tensor([e for e, _, _ in picked],
+                         device=self.block_expert_ids.device))
+        self.block_expert_ids[drop] = -1
+        return picked
 
 
 def route_experts(

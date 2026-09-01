@@ -213,3 +213,59 @@ def test_two_phase_routing_matches_inline(budget):
     assert ids and all(0 <= eid < e for eid in ids) and len(ids) <= e
     two_phase = tree_moe_forward(x, w1, w2, w3, router, accept, budget, routing=routing)
     assert torch.equal(inline, two_phase)
+
+
+def test_routing_exclude_experts_cpu(rng, monkeypatch):
+    """Hybrid CPU-expert dispatch surgery (torch-fallback Routing): excluded
+    experts vanish from expert_ids(), exactly their gates are zeroed, and the
+    returned (token, gate) lists carry the pre-surgery routing so the host
+    FFN can reconstruct their contribution."""
+    monkeypatch.setenv("TREEMOE_FUSED_A", "0")  # torch routing runs on CPU
+    from treemoe.kernels.op1_tree_moe import route_experts
+
+    x, _, _, _, router, accept = make_moe_inputs(32, E, H, I, rng)
+    routing = route_experts(x, router, accept, 4, I)
+    ids = routing.expert_ids()
+    cold = ids[:2]
+    before = routing.gates_flat.sum().item()
+    info = routing.exclude_experts(cold)
+
+    assert [e for e, _, _ in info] == cold
+    assert not set(routing.expert_ids()) & set(cold)
+    moved = 0.0
+    for e, toks, gates in info:
+        assert toks.shape == gates.shape and toks.numel() > 0
+        assert (gates > 0).all() and (toks < 32).all()
+        moved += gates.sum().item()
+    assert routing.gates_flat.sum().item() == pytest.approx(before - moved, rel=1e-5)
+    # skipped blocks' partial rows are zeroed -> the fixed-order combine
+    # adds exact zeros for the excluded slots
+    assert routing.ws.partial is not None
+
+
+@pytest.mark.gpu
+def test_cold_expert_hybrid_matches_full_gpu():
+    """GPU mirror of the interpret hybrid test at Mixtral shapes: excluded
+    experts' host-computed FFN added back == full forward (rounding-level)."""
+    import torch.nn.functional as F
+
+    from treemoe.kernels.op1_tree_moe import route_experts, tree_moe_forward
+
+    g = torch.Generator().manual_seed(23)
+    e, h, i = 8, 4096, 14336
+    x, w1, w2, w3, router, accept = make_moe_inputs(64, e, h, i, g, dtype=torch.bfloat16)
+    xd, w1d, w2d, w3d = (t.cuda() for t in (x, w1, w2, w3))
+    routerd, acceptd = router.cuda(), accept.cuda()
+
+    full = tree_moe_forward(xd, w1d, w2d, w3d, routerd, acceptd, 4).clone()
+    routing = route_experts(xd, routerd, acceptd, 4, i)
+    cold = routing.expert_ids()[:2]
+    info = routing.exclude_experts(cold)
+    hybrid = tree_moe_forward(xd, w1d, w2d, w3d, routerd, acceptd, 4,
+                              routing=routing).clone()
+    for eid, toks, gates in info:  # host FFN from the (here: CPU) weight copy
+        xe = x[toks]
+        y = (F.silu(xe @ w1[eid].t()) * (xe @ w3[eid].t())) @ w2[eid].t()
+        hybrid.index_add_(0, toks.cuda(),
+                          (gates.unsqueeze(1) * y.float()).to(hybrid.dtype).cuda())
+    torch.testing.assert_close(hybrid, full, rtol=2e-2, atol=2e-2)

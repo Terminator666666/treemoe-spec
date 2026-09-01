@@ -11,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
+import torch.nn.functional as F
 
 
 def run_config(engine_factory, budget: int, tree_size: int, prompts: list[torch.Tensor],
@@ -34,6 +35,7 @@ def run_config(engine_factory, budget: int, tree_size: int, prompts: list[torch.
         "tpot_ms": wall / total_tokens * 1e3,
         "accept_len": eng.stats.mean_accept_len,
         "hit_rate": float("nan"),
+        "cold": getattr(pf, "cold_total", 0) if pf is not None else 0,
     }
     if pf is not None and pf.routed_total:
         r["hit_rate"] = 1.0 - pf.repair_misses / pf.routed_total
@@ -55,6 +57,12 @@ def main() -> None:
     ap.add_argument("--no-auto-bitmap", action="store_true",
                     help="offload only: disable the temporal predictor "
                          "(every pass copies all experts; isolates repair overhead)")
+    ap.add_argument("--cpu-expert-threshold", type=int, default=0,
+                    help="hybrid dispatch (Fiddler): missing experts routed "
+                         "fewer than N tokens are computed on host CPU from the "
+                         "pinned copy instead of repair-copied over PCIe (0 = "
+                         "off; ~8 = bench_cpu_expert break-even on the 4090). "
+                         "Exact arithmetic but different rounding vs all-GPU.")
     ap.add_argument("--no-router-hint", action="store_true",
                     help="offload ablation: keep the temporal bitmap but disable "
                          "the draft-guided router hint")
@@ -124,34 +132,59 @@ def main() -> None:
                                  auto_bitmap=not args.no_auto_bitmap)
             pf.use_router_hint = not args.no_router_hint
             pf.routed_total = 0  # bench counter alongside pf.repair_misses
+            pf.cold_total = 0    # experts computed on host CPU (hybrid arm)
+        host_layers = weights.layers  # pinned host copy for the CPU cold path
 
         def moe_fn(x, lw, layer_idx, _b=budget):
             accept = moe_fn.current_accept_prob  # set by engine step; fallback ones
             routing = route_experts(x, lw.router, accept[: x.shape[0]], _b,
                                     inter=lw.w1.shape[1])
+            cold_x = []
             if pf is not None:
                 # exact-offload contract: one small D2H, then on-demand copies
                 # for mispredicted experts BEFORE the GEMMs read lw.w1/w2/w3
                 # (lw.* aliases the prefetcher's staged ring buffer here)
                 ids = routing.expert_ids()
                 pf.routed_total += len(ids)
+                staged = pf._staged_rows.get(layer_idx)
+                if args.cpu_expert_threshold > 0 and staged is not None:
+                    counts = (routing.padded_slots.view(
+                        routing.ws.num_experts, -1) >= 0).sum(-1).tolist()
+                    cold = [e for e in ids if e not in staged
+                            and counts[e] < args.cpu_expert_threshold]
+                    if cold:
+                        # cold misses -> host CPU FFN (Fiddler-style) instead of
+                        # streaming 352MB/expert. Gather inputs now so the host
+                        # compute overlaps the GPU GEMMs below; kept out of
+                        # repair() so the temporal bitmap won't stage them either.
+                        pf.cold_total += len(cold)
+                        ids = [e for e in ids if e not in cold]
+                        for e, toks, gates in routing.exclude_experts(cold):
+                            dev_toks = toks.to(x.device)
+                            cold_x.append((e, dev_toks, gates, x[dev_toks].cpu()))
                 pf.repair(layer_idx, ids)
-            return tree_moe_forward(x, lw.w1, lw.w2, lw.w3, lw.router,
-                                    accept[: x.shape[0]], _b, routing=routing)
+            out = tree_moe_forward(x, lw.w1, lw.w2, lw.w3, lw.router,
+                                   accept[: x.shape[0]], _b, routing=routing)
+            for e, dev_toks, gates, xc in cold_x:
+                hw = host_layers[layer_idx]
+                y = (F.silu(xc @ hw.w1[e].t()) * (xc @ hw.w3[e].t())) @ hw.w2[e].t()
+                out.index_add_(0, dev_toks, (gates.unsqueeze(1) * y.float())
+                               .to(out.dtype).to(x.device))
+            return out
 
         moe_fn.current_accept_prob = torch.ones(tree_size, device="cuda")
         target = MixtralForward(weights, kv, moe_fn=moe_fn, prefetcher=pf)
         draft = EagleDraftModel(eagle_w, cfg, weights.embed_tokens, weights.lm_head)
         return SpecDecodeEngine(target, draft, tree_size=tree_size, expert_budget=budget), pf
 
-    print(f"{'B':>3} {'N':>5} {'TPOT(ms)':>10} {'accept_len':>11} {'hit_rate':>9}",
+    print(f"{'B':>3} {'N':>5} {'TPOT(ms)':>10} {'accept_len':>11} {'hit_rate':>9} {'cold':>6}",
           flush=True)
     for n in args.tree_sizes:
         for b in args.budgets:
             r = run_config(factory, b, n, prompts,
                            max_new_tokens=args.max_new_tokens)
             print(f"{r['budget']:>3} {r['tree_size']:>5} {r['tpot_ms']:>10.2f} "
-                  f"{r['accept_len']:>11.2f} {r['hit_rate']:>9.3f}", flush=True)
+                  f"{r['accept_len']:>11.2f} {r['hit_rate']:>9.3f} {r['cold']:>6}", flush=True)
 
 
 if __name__ == "__main__":

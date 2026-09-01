@@ -163,3 +163,31 @@ def test_op4_kv_commit_kernel_interpreted(tiny_config):
     kv_b.commit_tree(torch.cat([root, res.accepted_slots]))
     assert torch.equal(kv_a.k, kv_b.k) and torch.equal(kv_a.v, kv_b.v)
     assert kv_a.seq_len == kv_b.seq_len == 10 + int(res.num_accepted) + 1
+
+
+def test_op1_cold_expert_hybrid_interpreted(rng):
+    """Hybrid CPU-expert dispatch through the REAL kernels: excluding experts
+    from the GPU pass (blocks skipped, partial rows zeroed) and adding their
+    host-computed FFN back reproduces the full forward (bench_e2e
+    --cpu-expert-threshold path)."""
+    import torch.nn.functional as F
+
+    from treemoe.kernels.op1_tree_moe import route_experts
+
+    x, w1, w2, w3, router, accept = make_moe_inputs(N, E, H, I, rng)
+    full = tree_moe_forward(x, w1, w2, w3, router, accept, 4,
+                            deterministic=True).clone()
+
+    routing = route_experts(x, router, accept, 4, I)
+    cold = routing.expert_ids()[:2]
+    info = routing.exclude_experts(cold)
+    assert [e for e, _, _ in info] == cold
+    assert not set(routing.expert_ids()) & set(cold)
+
+    hybrid = tree_moe_forward(x, w1, w2, w3, router, accept, 4,
+                              deterministic=True, routing=routing).clone()
+    for e, toks, gates in info:
+        xe = x[toks]
+        y = (F.silu(xe @ w1[e].t()) * (xe @ w3[e].t())) @ w2[e].t()
+        hybrid.index_add_(0, toks, (gates.unsqueeze(1) * y.float()).to(hybrid.dtype))
+    torch.testing.assert_close(hybrid, full, rtol=1e-4, atol=1e-5)
