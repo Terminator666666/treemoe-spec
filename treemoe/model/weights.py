@@ -107,7 +107,17 @@ def load_mixtral_weights(
 
     offload_layers = offload_layers or set()
     layers = []
+    # 93GB stream + pinning takes tens of minutes: always show per-layer progress
+    try:
+        from tqdm import tqdm
+        bar = tqdm(total=config.num_layers, desc=f"mixtral load ({layout})",
+                   unit="layer")
+    except ImportError:
+        bar = None
     for i in range(config.num_layers):
+        if bar is None:
+            print(f"mixtral load ({layout}): layer {i + 1}/{config.num_layers}",
+                  flush=True)
         pfx = f"model.layers.{i}"
         expert_device = "cpu" if (layout == "offload" and i in offload_layers) else device
         w1 = _stack_experts(get, i, "w1", config.num_experts)
@@ -134,6 +144,10 @@ def load_mixtral_weights(
                 experts_on_gpu=(expert_device != "cpu"),
             )
         )
+        if bar is not None:
+            bar.update(1)
+    if bar is not None:
+        bar.close()
 
     weights = MixtralWeights(
         config=config,

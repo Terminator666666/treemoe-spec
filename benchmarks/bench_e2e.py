@@ -122,14 +122,19 @@ def main() -> None:
     else:
         from transformers import AutoTokenizer
 
+        print(f"loading mixtral from {args.model_dir} (layout={args.layout}, "
+              f"~93GB stream{', host pinning' if args.layout == 'offload' else ''}"
+              "; expect tens of minutes)", flush=True)
         if args.layout == "offload":
             weights = load_mixtral_weights(
                 args.model_dir, cfg, layout="offload", offload_layers=offload,
             )
         else:
             weights = load_mixtral_weights(args.model_dir, cfg)
+        print(f"loading eagle from {args.eagle_path}", flush=True)
         eagle_w = load_eagle_weights(args.eagle_path)
         tok = AutoTokenizer.from_pretrained(args.model_dir)
+        print("weights ready, starting benchmark", flush=True)
         prompts = [
             tok(f"Question {i}: explain topic {i} in detail.", return_tensors="pt")
             .input_ids[0].cuda()
