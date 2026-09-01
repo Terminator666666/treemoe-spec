@@ -11,6 +11,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# AutoDL images ship OMP_NUM_THREADS=0 (invalid -> libgomp warning + default)
+if ! [[ "${OMP_NUM_THREADS:-}" =~ ^[1-9][0-9]*$ ]]; then
+  export OMP_NUM_THREADS="$(nproc)"
+fi
+
 echo "== tier 1a: CPU logic suite (fast sanity, no GPU used) =="
 python -m pytest -q -m "not gpu and not model and not interpret"
 TRITON_INTERPRET=1 python -m pytest -q -m interpret

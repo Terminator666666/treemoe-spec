@@ -4,9 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
+
+# AutoDL images ship OMP_NUM_THREADS=0 (invalid): libgomp warns and the CPU
+# cold-expert arm gets a nondeterministic thread count. Sanitize before torch.
+if not os.environ.get("OMP_NUM_THREADS", "").isdigit() \
+        or int(os.environ["OMP_NUM_THREADS"]) <= 0:
+    os.environ["OMP_NUM_THREADS"] = str(os.cpu_count() or 1)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
