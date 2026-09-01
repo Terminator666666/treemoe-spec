@@ -130,6 +130,35 @@ def test_spec_lossless_with_eagle_draft(engine_pair, rng):
         assert draft._ck.shape[0] == target.kv.seq_len - 1
 
 
+def test_spec_lossless_with_official_shaped_eagle(engine_pair, rng):
+    """Official EAGLE-mixtral checkpoint facts (config.json): full-MHA draft
+    (kv heads == heads, unlike the target's GQA), NO layer-0 input_layernorm
+    (cnets.py skips index 0), fc bias slot, rms_eps/rope_theta differing from
+    the target. Red line must hold with head counts derived from weights."""
+    from dataclasses import replace as dc_replace
+
+    from treemoe.model.eagle import EagleDraftModel
+
+    fresh, cfg = engine_pair
+    w = random_weights(cfg, torch.Generator().manual_seed(5))
+    g = torch.Generator().manual_seed(7)
+    mha_cfg = dc_replace(cfg, num_kv_heads=cfg.num_heads)  # draft-side MHA
+    ew = random_eagle_weights(mha_cfg, g)
+    ew.input_layernorm = None
+    ew.fc_bias = torch.randn(cfg.hidden_dim, generator=g, dtype=cfg.dtype) * 0.05
+
+    prompt = torch.randint(0, cfg.vocab_size, (6,), generator=g)
+    ar = ar_greedy(fresh(), prompt.clone(), 24)
+    target = fresh()
+    draft = EagleDraftModel(ew, cfg, w.embed_tokens, w.lm_head,
+                            rms_eps=1e-6, rope_theta=1e4)
+    assert draft.num_kv_heads == cfg.num_heads  # derived from k_proj, not cfg
+    eng = SpecDecodeEngine(target, draft, tree_size=8, max_depth=3,
+                           expert_budget=8)
+    spec = eng.generate(prompt.clone(), max_new_tokens=24, eos_token_id=-1)
+    assert spec == ar
+
+
 def test_eagle_tree_mask_chain_equals_causal(tiny_config):    # a linear chain stepped one node per level with explicit ancestor masks
     # must reproduce the same features/logits as one causal batch: the tree
     # topology mask is exactly "ancestors + self".

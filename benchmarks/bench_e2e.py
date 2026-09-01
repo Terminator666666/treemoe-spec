@@ -174,7 +174,11 @@ def main() -> None:
 
         moe_fn.current_accept_prob = torch.ones(tree_size, device="cuda")
         target = MixtralForward(weights, kv, moe_fn=moe_fn, prefetcher=pf)
-        draft = EagleDraftModel(eagle_w, cfg, weights.embed_tokens, weights.lm_head)
+        # real EAGLE checkpoint facts (official config.json): rms_norm_eps=1e-6,
+        # no rope_theta field -> Llama-default 10000 (target uses 1e-5 / 1e6)
+        draft_kw = {} if args.random_weights else dict(rms_eps=1e-6, rope_theta=1e4)
+        draft = EagleDraftModel(eagle_w, cfg, weights.embed_tokens, weights.lm_head,
+                                **draft_kw)
         return SpecDecodeEngine(target, draft, tree_size=tree_size, expert_budget=budget), pf
 
     print(f"{'B':>3} {'N':>5} {'TPOT(ms)':>10} {'accept_len':>11} {'hit_rate':>9} {'cold':>6}",

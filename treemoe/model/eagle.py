@@ -10,7 +10,7 @@ target model's lm_head reused for draft token distributions.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import torch.nn.functional as F
@@ -22,12 +22,14 @@ from treemoe.model.mixtral import apply_rope, build_rope_cache, rms_norm
 @dataclass
 class EagleWeights:
     fc: torch.Tensor                # [H, 2H] fuse embed+feature
-    attn: dict[str, torch.Tensor]   # q/k/v/o proj, Mixtral-shaped single layer
-    input_layernorm: torch.Tensor
+    attn: dict[str, torch.Tensor]   # q/k/v/o proj; draft may be full MHA (32 kv
+                                    # heads per official config) unlike target GQA
+    input_layernorm: torch.Tensor | None  # None = official EAGLE layer-0 (skipped)
     post_attn_layernorm: torch.Tensor
     mlp_gate: torch.Tensor          # [I_d, H] dense (draft层是dense FFN,非MoE)
     mlp_up: torch.Tensor
     mlp_down: torch.Tensor
+    fc_bias: torch.Tensor | None = None  # config.json "bias": false for mixtral
 
 
 class EagleDraftModel:
@@ -43,12 +45,23 @@ class EagleDraftModel:
     """
 
     def __init__(self, w: EagleWeights, config: MixtralConfig,
-                 embed_tokens: torch.Tensor, lm_head: torch.Tensor):
+                 embed_tokens: torch.Tensor, lm_head: torch.Tensor,
+                 rms_eps: float | None = None,
+                 rope_theta: float | None = None):
         self.w = w
         self.cfg = config
         self.embed_tokens = embed_tokens  # shared with target
         self.lm_head = lm_head            # shared with target
-        self.rope_cos, self.rope_sin = build_rope_cache(config, embed_tokens.device.type)
+        # draft checkpoint facts may differ from the target (official EAGLE
+        # mixtral config.json: MHA kv=32, rms_norm_eps=1e-6, Llama-default
+        # rope theta=10000) -- head counts derived from the weights, the
+        # rest passed by the loader site; defaults keep target semantics
+        # for duck-typed tiny-config tests
+        self.num_heads = w.attn["q_proj"].shape[0] // config.head_dim
+        self.num_kv_heads = w.attn["k_proj"].shape[0] // config.head_dim
+        self.rms_eps = config.rms_eps if rms_eps is None else rms_eps
+        rope_cfg = config if rope_theta is None else replace(config, rope_theta=rope_theta)
+        self.rope_cos, self.rope_sin = build_rope_cache(rope_cfg, embed_tokens.device.type)
         self._ck: torch.Tensor | None = None  # committed K [S, kvh, hd]
         self._cv: torch.Tensor | None = None
         self._tree_k: list[torch.Tensor] = []  # per-level tree scratch
@@ -68,12 +81,15 @@ class EagleDraftModel:
              positions: torch.Tensor):
         cfg = self.cfg
         emb = F.embedding(token_ids, self.embed_tokens)
-        x = F.linear(torch.cat([emb, features], dim=-1), self.w.fc)
-        h = rms_norm(x, self.w.input_layernorm, cfg.rms_eps)
+        x = F.linear(torch.cat([emb, features], dim=-1), self.w.fc, self.w.fc_bias)
+        # official EAGLE skips input_layernorm on layer 0 (cnets.py: only
+        # index != 0 normalizes) -- the checkpoint has no such weight
+        h = x if self.w.input_layernorm is None else rms_norm(
+            x, self.w.input_layernorm, self.rms_eps)
         t = h.shape[0]
-        q = F.linear(h, self.w.attn["q_proj"]).view(t, cfg.num_heads, cfg.head_dim)
-        k = F.linear(h, self.w.attn["k_proj"]).view(t, cfg.num_kv_heads, cfg.head_dim)
-        v = F.linear(h, self.w.attn["v_proj"]).view(t, cfg.num_kv_heads, cfg.head_dim)
+        q = F.linear(h, self.w.attn["q_proj"]).view(t, self.num_heads, cfg.head_dim)
+        k = F.linear(h, self.w.attn["k_proj"]).view(t, self.num_kv_heads, cfg.head_dim)
+        v = F.linear(h, self.w.attn["v_proj"]).view(t, self.num_kv_heads, cfg.head_dim)
         q = apply_rope(q, self.rope_cos, self.rope_sin, positions)
         k = apply_rope(k, self.rope_cos, self.rope_sin, positions)
         return x, q, k, v
@@ -87,9 +103,9 @@ class EagleDraftModel:
             q.transpose(0, 1), fk.transpose(0, 1), fv.transpose(0, 1),
             attn_mask=mask.unsqueeze(0), enable_gqa=True,
         )
-        o = o.transpose(0, 1).reshape(t, cfg.num_heads * cfg.head_dim)
+        o = o.transpose(0, 1).reshape(t, self.num_heads * cfg.head_dim)
         x = x + F.linear(o, self.w.attn["o_proj"])
-        h = rms_norm(x, self.w.post_attn_layernorm, cfg.rms_eps)
+        h = rms_norm(x, self.w.post_attn_layernorm, self.rms_eps)
         feat = x + F.linear(
             F.silu(F.linear(h, self.w.mlp_gate)) * F.linear(h, self.w.mlp_up),
             self.w.mlp_down,
@@ -159,9 +175,12 @@ def load_eagle_weights(path: str, device: str = "cuda",
     return EagleWeights(
         fc=g("fc.weight"),
         attn={k: g(f"layers.0.self_attn.{k}.weight") for k in ("q_proj", "k_proj", "v_proj", "o_proj")},
-        input_layernorm=g("layers.0.input_layernorm.weight"),
+        # official EAGLE layer 0 has no input_layernorm (cnets.py index==0)
+        input_layernorm=g("layers.0.input_layernorm.weight")
+        if "layers.0.input_layernorm.weight" in sd else None,
         post_attn_layernorm=g("layers.0.post_attention_layernorm.weight"),
         mlp_gate=g("layers.0.mlp.gate_proj.weight"),
         mlp_up=g("layers.0.mlp.up_proj.weight"),
         mlp_down=g("layers.0.mlp.down_proj.weight"),
+        fc_bias=g("fc.bias") if "fc.bias" in sd else None,
     )
