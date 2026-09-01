@@ -153,31 +153,12 @@ def main() -> None:
         eagle_w = load_eagle_weights(args.eagle_path)
         tok = AutoTokenizer.from_pretrained(args.model_dir)
         print("weights ready, starting benchmark", flush=True)
-        # EAGLE was trained on ShareGPT conversations and the official tau is
-        # measured on chat-templated MT-bench prompts; raw untemplated text
-        # systematically deflates acceptance. MT-bench-style instructions:
-        instructions = [
-            "Compose an engaging travel blog post about a recent trip to Hawaii.",
-            "Explain the difference between TCP and UDP to a beginner.",
-            "Write a short story about a robot learning to paint.",
-            "What are the main causes of the French Revolution?",
-            "Describe the process of photosynthesis step by step.",
-            "Draft an email to a professor asking for a recommendation letter.",
-            "Explain how a hash table works and when to use one.",
-            "Summarize the plot of Romeo and Juliet in three paragraphs.",
-            "Give practical tips for improving sleep quality.",
-            "Explain quantum entanglement in simple terms.",
-            "Write a product description for a smart water bottle.",
-            "Compare renewable and fossil fuel energy sources.",
-            "Describe how vaccines train the immune system.",
-            "Outline a beginner workout plan for building strength.",
-            "Explain the significance of the Turing test.",
-            "Write a recipe for a vegetarian pasta dinner.",
-            "Describe the water cycle and its main stages.",
-            "Explain why the sky is blue using physics.",
-            "Draft a cover letter for a software engineering internship.",
-            "Discuss the pros and cons of remote work.",
-        ]
+        # real MT-bench questions (first turns), same eval set as the official
+        # EAGLE numbers — vendored from SafeAILab/EAGLE eagle/data/mt_bench
+        import json
+        mt_path = Path(__file__).resolve().parent / "data" / "mt_bench.jsonl"
+        with open(mt_path) as f:
+            instructions = [json.loads(line)["turns"][0] for line in f]
         prompts = []
         for i in range(args.num_prompts):
             text = tok.apply_chat_template(
