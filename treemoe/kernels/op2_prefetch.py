@@ -161,7 +161,8 @@ class LayerPrefetcher:
         self.depth = max(1, min(depth, max(1, len(self.offload_ids))))
         self.auto_bitmap = auto_bitmap
         self.use_router_hint = True         # gate for the draft-guided hint
-        self._hint: torch.Tensor | None = None
+        self._hint: torch.Tensor | None = None      # [L, E] fp32 router demand
+        self._hint_budget = 0
         self._routers: torch.Tensor | None = None  # [L, E, H] fp32 cache
         self._bufs: list[dict[str, torch.Tensor]] | None = None
         self._buf_of: dict[int, int] = {}   # layer idx -> buffer slot (this pass)
@@ -185,11 +186,11 @@ class LayerPrefetcher:
         """Draft-guided router pre-execution (spec §3.2 headline path).
 
         Runs every layer's own router over the draft tree's EAGLE features
-        (which approximate the target's hidden trajectory), keeps the
-        top-`budget` experts per layer by aggregated softmax demand. Same
-        idea as MoE-SpeQ'25's draft-predicted prefetch, but training-free:
-        the predictor IS the target's router. begin() ORs the hint with the
-        temporal bitmap; prediction only affects staging, repair() keeps
+        (which approximate the target's hidden trajectory) and stores the
+        aggregated softmax demand. Same idea as MoE-SpeQ'25's draft-predicted
+        prefetch, but training-free: the predictor IS the target's router.
+        begin() merges the demand ranking with the temporal set under a
+        per-layer row cap; prediction only affects staging, repair() keeps
         every pass exact. Gated behind auto_bitmap so the --no-auto-bitmap
         full-copy baseline stays prediction-free."""
         if not (self.auto_bitmap and self.use_router_hint and self.offload_ids):
@@ -197,11 +198,8 @@ class LayerPrefetcher:
         if self._routers is None:
             self._routers = torch.stack([lw.router for lw in self.layers]).float()
         logits = torch.einsum("nh,leh->nle", features.float(), self._routers)
-        demand = torch.softmax(logits, dim=-1).sum(0)                # [L, E]
-        keep = demand.topk(min(budget, demand.shape[-1]), dim=-1).indices
-        hint = torch.zeros(demand.shape, dtype=torch.bool)
-        hint.scatter_(1, keep.cpu(), True)
-        self._hint = hint
+        self._hint = torch.softmax(logits, dim=-1).sum(0).cpu()     # [L, E]
+        self._hint_budget = budget
 
     def _ensure_buffers(self, lw) -> None:
         dev = lw.router.device
@@ -225,16 +223,30 @@ class LayerPrefetcher:
             self._used_prev = self._used_cur
         self._used_cur = {}
         if self.auto_bitmap:
+            num_experts = self.layers[self.offload_ids[0]].w1.shape[0]
             if self._hint is not None:
-                # union of both zero-training predictors: the hint covers what
-                # the fresh tree's routing will likely need, the temporal set
-                # covers what the last pass actually used
-                bm = self._hint.clone()
-                for li, used in self._used_prev.items():
-                    bm[li, sorted(used)] = True
+                # capped merge of the two zero-training predictors. In the
+                # transfer-bound regime the cost is staged BYTES, not misses:
+                # a plain union stages unbounded extra rows and loses more on
+                # PCIe than the avoided misses cost (measured on 4090: 2.2x
+                # slower despite hit_rate 0.907 vs 0.846). So each layer
+                # stages at most max(budget, |observed|) rows -- op3 caps the
+                # routed set at `budget`, so this covers the worst case.
+                # Observed experts first (repeat routing is the common case),
+                # remaining slots to the highest-demand hint experts.
+                order = self._hint.argsort(dim=-1, descending=True)
+                bm = torch.zeros(len(self.layers), num_experts, dtype=torch.bool)
+                for li in self.offload_ids:
+                    used = self._used_prev.get(li, set())
+                    k = min(num_experts, max(self._hint_budget, len(used)))
+                    row = set(used)
+                    for e in order[li].tolist():
+                        if len(row) >= k:
+                            break
+                        row.add(e)
+                    bm[li, sorted(row)] = True
                 self.set_bitmap(bm)
             else:
-                num_experts = self.layers[self.offload_ids[0]].w1.shape[0]
                 self.set_bitmap(self.temporal_bitmap(num_experts))
         self._staged_rows.clear()
         self._buf_of.clear()

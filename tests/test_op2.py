@@ -287,7 +287,9 @@ def test_layer_prefetcher_auto_bitmap_temporal(tiny_config, rng):
 def test_layer_prefetcher_router_hint_stages_top_budget(rng):
     """router_hint stages exactly the top-budget experts per layer by the
     layer's own router demand over the draft features (first pass: no
-    temporal history to OR in). Disabled hint falls back to full copies."""
+    temporal history). With history, staging is capped at
+    max(budget, |observed|) rows: observed experts first, remaining slots
+    by demand. Disabled hint falls back to full copies."""
     from treemoe.model.weights import LayerWeights
 
     E_, I_, H_ = 4, 6, 8
@@ -307,10 +309,21 @@ def test_layer_prefetcher_router_hint_stages_top_budget(rng):
     pf = LayerPrefetcher(layers, depth=2, auto_bitmap=True)
     pf.router_hint(feats, budget=2)
     pf.begin()
+    demand_order = {}
     for li in (0, 1):
         logits = feats.float() @ layers[li].router.float().t()
-        want = set(torch.softmax(logits, -1).sum(0).topk(2).indices.tolist())
-        assert pf._staged_rows[li] == want
+        demand = torch.softmax(logits, -1).sum(0)
+        demand_order[li] = demand.argsort(descending=True).tolist()
+        assert pf._staged_rows[li] == set(demand_order[li][:2])
+
+    # second pass with observed usage: cap = max(budget=2, |used|), observed
+    # experts always staged, remaining slots by demand rank
+    pf.repair(0, {3})            # 1 observed  -> cap 2: {3} + top-1 demand
+    pf.repair(1, {0, 1, 2})      # 3 observed  -> cap 3: exactly the used set
+    pf.begin()
+    want0 = {3} | {next(e for e in demand_order[0] if e != 3)}
+    assert pf._staged_rows[0] == want0
+    assert pf._staged_rows[1] == {0, 1, 2}
 
     pf2 = LayerPrefetcher(layers, depth=2, auto_bitmap=True)
     pf2.use_router_hint = False
@@ -345,7 +358,7 @@ def test_spec_engine_offload_router_hint_lossless(tiny_config, rng):
 
     assert spec == ar
     assert pf._hint is not None                     # the hint path really ran
-    assert (pf._hint.sum(-1) == 3).all()            # ...and was restrictive
+    assert pf._bitmap is not None                   # ...and produced a bitmap
 
 
 @pytest.mark.gpu
