@@ -165,9 +165,12 @@ class EagleDraftModel:
 
 def load_eagle_weights(path: str, device: str = "cuda",
                        dtype: torch.dtype = torch.bfloat16) -> EagleWeights:
-    from safetensors.torch import load_file
+    if path.endswith(".bin") or path.endswith(".pt"):
+        sd = torch.load(path, map_location="cpu", weights_only=True)
+    else:
+        from safetensors.torch import load_file
 
-    sd = load_file(path)
+        sd = load_file(path)
 
     def g(key: str) -> torch.Tensor:
         return sd[key].to(device=device, dtype=dtype)
