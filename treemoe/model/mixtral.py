@@ -38,7 +38,10 @@ def build_rope_cache(config: MixtralConfig, device: str) -> tuple[torch.Tensor, 
     )
     t = torch.arange(config.max_seq_len, device=device).float()
     freqs = torch.outer(t, inv)
-    return freqs.cos(), freqs.sin()
+    # HF Llama/Mixtral duplicates the half-width frequencies and rotates the
+    # first/second halves of each head (not adjacent even/odd dimensions).
+    emb = torch.cat([freqs, freqs], dim=-1)
+    return emb.cos(), emb.sin()
 
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, positions: torch.Tensor):
@@ -46,12 +49,10 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, positions:
     # HF rotary embeddings cast cos/sin to the activation dtype before the
     # multiply; retaining FP32 here changes BF16 rounding at every layer.
     c = cos[positions].to(x.dtype).unsqueeze(1)
-    s = sin[positions].to(x.dtype).unsqueeze(1)  # [T,1,hd/2]
-    x1, x2 = x[..., 0::2], x[..., 1::2]
-    out = torch.empty_like(x)
-    out[..., 0::2] = x1 * c - x2 * s
-    out[..., 1::2] = x2 * c + x1 * s
-    return out
+    s = sin[positions].to(x.dtype).unsqueeze(1)  # [T,1,head_dim]
+    x1, x2 = x.chunk(2, dim=-1)
+    rotated = torch.cat([-x2, x1], dim=-1)
+    return x * c + rotated * s
 
 
 def naive_moe(x: torch.Tensor, lw: LayerWeights, _layer_idx: int) -> torch.Tensor:

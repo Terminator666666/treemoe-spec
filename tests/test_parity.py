@@ -11,7 +11,7 @@ import torch
 
 from treemoe.model.config import MixtralConfig
 from treemoe.model.kv_cache import PagedKVCache
-from treemoe.model.mixtral import MixtralForward, naive_moe
+from treemoe.model.mixtral import MixtralForward, apply_rope, naive_moe
 from treemoe.model.weights import LayerWeights, MixtralWeights
 
 
@@ -66,6 +66,15 @@ def test_ar_incremental_matches_full_recompute(tiny_model, tiny_config, rng):
         lg = m2.forward(ids[t : t + 1], pos[t : t + 1])
         step_logits.append(lg[0])
     torch.testing.assert_close(full_logits[-1], step_logits[-1], rtol=1e-3, atol=1e-4)
+
+
+def test_rope_uses_llama_half_split_layout():
+    """Mixtral rotates first/second head halves, not adjacent even/odd dims."""
+    x = torch.tensor([[[1.0, 2.0, 3.0, 4.0]]])
+    cos = torch.zeros(1, 4)
+    sin = torch.ones(1, 4)
+    out = apply_rope(x, cos, sin, torch.tensor([0]))
+    torch.testing.assert_close(out, torch.tensor([[[-3.0, -4.0, 1.0, 2.0]]]))
 
 
 def test_tree_forward_equals_path_forward(tiny_model, tiny_config, rng):
