@@ -1,18 +1,19 @@
-# TreeMoE-Spec 实施计划（2026-08-18）
+# TreeMoE-Spec 实施计划与最终状态（2026-08-18，2026-09-02 更新）
 
-> **Goal**: 从零构建独立的 Mixtral-8x7B + EAGLE-2 MoE 推测解码框架，实现 4 个树感知推理算子，
-> 产出可复现的论文实验数据。
+> 本文保留 2026-08-18 的任务拆分，并按 2026-09-02 的代码状态标注取舍。最终系统没有使用训练式
+> 路由预测器，也没有接入整步 CUDA Graph。论文只陈述已经进入 `bench_e2e.py` 端到端路径的功能。
 >
 > **Spec**: [docs/specs/treemoe-spec-design.md](../specs/treemoe-spec-design.md)
 >
-> **Architecture**: draft(Stream0) ∥ prefetch(Stream1) → tree-aware MoE 验证 → 融合提交，整步单 CUDA Graph。
+> **Current Architecture**: Python draft/tree loop → tree-aware MoE 验证；专家 H2D 在侧流预取；
+> greedy verify/KV commit 使用 Triton，随后由主机读回接受结果并维护序列状态。
 >
-> **Tech Stack**: Python 3.11 + PyTorch 2.5 + Triton 3.x（算子 1/3/4 v1）+ CUDA/CuTe（v2 可选）
-> + safetensors + pytest。硬件 H200-141G 或 2×H100-80G TP=2（A100 复验）。专家权重原生 BF16 不量化。
+> **Tech Stack**: Python 3.12 + PyTorch + Triton + transformers + safetensors + pytest。实际硬件为
+> RTX 4090 24GB，专家权重原生 BF16，经 host pinned memory offload。
 >
 > **Global Constraints**:
 > - 每个 kernel 必须先有 PyTorch 参考实现 + 数值对齐测试（BF16 rtol=1e-3），测试先行（TDD）；
-> - 所有 kernel 输出形状静态、不依赖 CPU 读回（CUDA Graph 红线）；
+> - kernel 使用静态输出缓冲；端到端允许 CPU 读回接受结果；
 > - 每完成一个任务 git commit 一次；每阶段末跑全量 pytest；
 > - 基线 kernel（vLLM fused_moe / DeepGEMM / HPC-Ops / MegaBlocks）只作为 pip 依赖引入 benchmark，
 >   不 vendored 进代码库。
@@ -25,10 +26,10 @@ treemoe-spec/
 ├── treemoe/
 │   ├── model/          # mixtral.py, eagle.py, kv_cache.py, weights.py
 │   ├── kernels/        # op1_tree_moe.py, op2_prefetch.py, op3_budget.py(内嵌op1), op4_commit.py
-│   ├── engine/         # loop.py（draft-verify-commit）, graph.py（CUDA Graph 捕获）, tree.py
+│   ├── engine/         # loop.py（生产路径）, tree.py；graph.py 为未接入原型
 │   └── ref/            # 每个算子的 PyTorch 纯参考实现（测试锚点）
 ├── measurements/       # Phase 0 观测脚本与图
-├── benchmarks/         # 与 4 个基线 kernel 的对比
+├── benchmarks/         # op1/op2 微基准与 4090 端到端实验
 └── tests/
 ```
 
@@ -60,7 +61,7 @@ treemoe-spec/
 
 ### Task 1.1 权重加载与显存布局
 - `treemoe/model/weights.py`：safetensors 流式读取，专家权重保持原生 BF16 不量化；
-  支持两种布局：全常驻（H200 / TP=2 按 I 维切分）与冷层专家 host pin 内存 offload（80G 配置 B）；
+  最终实验使用 4090 offload：专家权重常驻 host pinned memory，按层送入 GPU staging buffer；
 - 测试：单层 FFN 输出 vs HF 实现逐元素一致（同 dtype，零量化损失）。
 
 ### Task 1.2 极简 Mixtral 前向（AR 路径）
@@ -91,56 +92,56 @@ treemoe-spec/
 - 输出 `sorted_token_ids/expert_offsets` 全 GPU 侧；
 - 测试：与 ref 的 bucket 结果逐元素一致（排序稳定性用 (expert, dfs_order) 双键）。
 
-### Task 2.3 Kernel B（expert_stationary_fused_ffn, Triton）
-- BF16 权重直读（主线唯一精度，无量化 epilogue），grid=(E, SPLIT_K)，K-tile 内 w1/w3→SiLU⊙→w2 累加；
-- split-k partial 用 `_combine_kernel` 归约；
+### Task 2.3 expert-stationary GEMM1/GEMM2（Triton）
+- BF16 权重直读（主线唯一精度，无量化 epilogue）；GEMM1 融合 w1/w3、SiLU 和逐元素乘法，
+  中间激活写入预分配 workspace 后由 GEMM2 读取；
+- 性能路径用 atomic add；确定性路径把 split-k partial 写入 FP32 workspace，再由 `_combine_kernel` 固定顺序归约；
 - 测试：BF16 vs ref rtol=1e-3。
 
 ### Task 2.4 microbenchmark 与调优
-- `benchmarks/bench_op1.py`：N∈{32,64,128} vs vLLM fused_moe / DeepGEMM BF16 masked /
-  CUTLASS grouped GEMM / MegaBlocks（均 BF16 同精度，pip 版本锁定）；Nsight 抓 `dram__bytes_read`；
+- `benchmarks/bench_op1.py`：N∈{32,64,128} 的确定性/atomic 路径，vLLM 可用时追加同边界对照；
 - autotune 空间：BK∈{64,128}, SPLIT_K∈{4,8,16}, num_warps∈{4,8}；
-- **验收门**：N=64 时延 ≤ vLLM fused_moe 的 0.8x，或 HBM 读字节数下降 ≥ 30%（两者满足其一才进 Phase 3）。
+- 当前 4090 容器无 Nsight Compute 权限，使用权重流量估算有效带宽，并以 torch.profiler 做内核归因。
 
-### Task 2.5 接入端到端 + B 扫描
-- loop.py 换用算子 1；跑 B∈{3,4,5,6,8} 的 τ-TPOT Pareto（论文主图初版）；
+### Task 2.5 接入端到端 + B 扫描（已实现，最终实验待补）
+- loop.py 换用算子 1；跑 B∈{2,3,4,5,6,8} 的 τ-TPOT Pareto；
 - `test_spec_lossless.py` 在 B=8 下必须仍然通过。
 
 ---
 
-## Phase 3 — 算子 4 + CUDA Graph（2 人周）
+## Phase 3 — greedy 验证与提交（部分完成）
 
-### Task 3.1 融合提交核
-- `treemoe/kernels/op4_commit.py`：spec §3.4 六步单 kernel（Triton；vocab 归约先两 kernel、
-  后合并）；Philox 随机数；
-- 测试：固定种子下与 ref rejection sampling 的接受路径完全一致（1000 随机树）。
+### Task 3.1 greedy 验证与 KV 提交（已实现）
+- `treemoe/kernels/op4_commit.py`：temperature=0 使用 argmax、树验证和 KV commit 三个 Triton 阶段；
+- temperature>0 保留 PyTorch 参考路径，不计入性能实验；
+- CPU、Triton interpreter 和真机 kernel commit 均有回归测试。
 
-### Task 3.2 全步 CUDA Graph 捕获
-- `treemoe/engine/graph.py`：静态张量池 + `torch.cuda.graph` 捕获 draft→verify→commit；
-- 陷阱清单：树形状填充恒定、KV 页指针经 indirection buffer、B 值放 graph 外可写标量；
-- 验收：nsys 显示每步 CPU launch 间隙 < 20 μs；端到端 TPOT 相对 M1 的累计加速 ≥ 2x。
-
----
-
-## Phase 4 — 算子 2 预取（2 人周，独立可并行）
-
-### Task 4.1 跨层路由预测器
-- `measurements/train_predictor.py`：ShareGPT 5 万样本采集 (倒数第二层 hidden → 各层 top-2 label)，
-  训 Wp[4096,256]；验收 recall@4 ≥ 70%（不达标走 spec 风险表回退：上一步激活集启发式）。
-
-### Task 4.2 预取执行路径
-- `treemoe/kernels/op2_prefetch.py`：HBM 配置 L2-warm kernel；offload 配置（BF16 专家 + host pin 内存
-  + 环形缓冲 + cudaMemcpyAsync on Stream 1；单专家单层 352MB@PCIe Gen5≈5.5ms → 预取提前 ≥4 层流水）；
-- 验收：offload 配置下 TPOT 改善 ≥ 20%（这是算子 2 的主战场）；HBM 配置如实报告（哪怕 ~0）。
+### Task 3.2 全步 CUDA Graph 捕获（未实现，移入未来工作）
+- `treemoe/engine/graph.py` 只有原型，生产入口没有实例化 `StepGraph`；
+- 当前 Python 建树、动态 `children` 列表、KV 元数据和 `.tolist()` 不可直接捕获；
+- 论文不报告 graph launch 时延或 CUDA Graph 加速比。
 
 ---
 
-## Phase 5 — 论文实验与收尾（3 人周）
+## Phase 4 — 算子 2 零训练预取（已实现，消融待补）
 
-- 全量基线表（spec §4 的 4 基线 × 3 数据集 × 指标）；消融表；A100 复验；
-- 质量验证：B∈{4,5,6} 的 GSM8K/HumanEval/MT-Bench vs B=8；
-- （可选加分）算子 1 v2 持久化巨核（CUDA + PDL），只在时间富余时做；
-- 整理复现脚本 `benchmarks/reproduce_all.sh`。
+### Task 4.1 训练式跨层路由预测器（取消）
+- `RouterPredictor` 和 `measurements/train_predictor.py` 保留为实验原型；
+- 未采集 ShareGPT 训练集，未生成或加载 predictor checkpoint；
+- 最终方案使用上一轮真实专家集合，加上 EAGLE feature 直接运行目标 router 的 hint，全程无需训练。
+
+### Task 4.2 可修复预取执行路径（已实现）
+- offload 配置使用 host pinned BF16 权重、深度缓冲和侧流 H2D；
+- `repair()` 在真实路由后补齐漏预测专家，因此预测错误不影响输出正确性；
+- 正式消融比较 hint+temporal、temporal-only 和 full-copy。
+
+---
+
+## Phase 5 — 论文实验与收尾（进行中）
+
+- RTX 4090 上完成 AR、B∈{2,3,4,5,6,8} 主实验、tree-size 和预取消融；
+- 使用 MT-Bench 验证 B<8 质量，B=8 作为 lossless 对照；
+- 所有最终配置和结果维护在 `measurements/final_experiments.csv`。
 
 ---
 
@@ -151,6 +152,6 @@ treemoe-spec/
 | M0 | 观测三图 + 决策门 | 1 周 |
 | M1 | 正确的最小推测解码系统 | 3 周 |
 | M2 | 算子 1+3 落地，kernel 级验收门通过 | 7 周 |
-| M3 | 单 CUDA Graph 整步，端到端 ≥2x | 9 周 |
-| M4 | 预取消融完成 | 11 周 |
-| M5 | 论文实验齐全 | 14 周 |
+| M3 | greedy Triton verify/KV commit；CUDA Graph 取消 | 已完成（不含 Graph） |
+| M4 | 零训练预取接入，正式消融待测 | 进行中 |
+| M5 | 4090 论文实验齐全 | 进行中 |

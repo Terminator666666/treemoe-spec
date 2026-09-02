@@ -1,8 +1,20 @@
-# TreeMoE-Spec 设计规格（v2，细化版）
+# TreeMoE-Spec 当前实现规格（v3）
 
-> 一个不依赖 vLLM/SGLang 的独立 MoE 推测解码推理框架，目标模型 Mixtral-8x7B-Instruct + EAGLE-2 草稿模型，
-> 核心贡献是 4 个树感知（tree-aware）推理算子。
+> 一个不依赖 vLLM/SGLang 的 MoE 推测解码原型，目标模型为 Mixtral-8x7B-Instruct，草稿模型使用
+> EAGLE-2 动态树。当前论文贡献集中在三个已接入端到端路径的机制：树感知 MoE 核、接受概率加权
+> 的专家预算路由，以及带缺失修复的零训练专家预取。树验证与 KV 提交使用 Triton 内核加速。
 > 参考库：Tencent HPC-Ops、DeepSeek DeepGEMM、Databricks MegaBlocks、FlashInfer、vLLM fused_moe。
+
+### 实现边界
+
+| 模块 | 当前状态 | 论文口径 |
+|---|---|---|
+| 树感知 expert-stationary MoE | 已实现并接入 | 核心贡献 |
+| 接受概率加权预算路由 | 已内嵌路由核，B=8 可回到原始 top-2 | 核心贡献 |
+| temporal + EAGLE router hint 预取 | 已实现，miss repair 保证 staged 权重正确 | 核心贡献 |
+| greedy 树验证与 KV 提交 | 已实现 Triton 三核路径 | 系统实现优化 |
+| 训练式 `RouterPredictor` | 仅有实验类和训练脚本，未训练、未加载到运行时 | 不作为论文贡献或实验配置 |
+| 全步 CUDA Graph | `StepGraph` 仅为原型，未接入；当前循环仍有 Python 建树和主机读回 | 不纳入性能结论，列为未来工作 |
 
 ---
 
@@ -25,13 +37,9 @@
 **精度决策**：专家权重保持原生 BF16 **不量化**——规避量化误差与接受率 τ 的耦合干扰，
 且 BF16 下权重读字节数是 FP8 方案的 2 倍，"验证期权重读放大"矛盾更尖锐，树感知算子的收益上限更高。
 
-**显存预算（关键落地约束）**：BF16 全模型 ≈93 GB。
-- 主配置 A：**单卡 H200-141G**（93 GB 权重 + KV + 激活仍有富余）；
-  或 **2×H100-80G TP=2**——专家 FFN 按 I 维 Megatron 式切分（每卡 I/2=7168，w1/w3 切行、w2 切列），
-  每层一次 all-reduce，算子 1 的 kernel 结构不变、仅 I 减半；
-- 配置 B（offload，单卡 80G）：非专家权重 + 每层热专家常驻 GPU（~60 GB），
-  其余专家 BF16 常驻 host pin 内存按需 PCIe 拉取——算子 2 预取的主战场；
-- FP8/INT4 量化：**降级为附录消融项**，不在主线。
+**实际硬件与显存布局**：主实验平台为单张 RTX 4090 24GB。BF16 模型约 93GB，专家权重常驻
+host pinned memory；每层按预算预取到 GPU 环形缓冲，缺失专家在 GEMM 前同步修复。项目未实现 TP、
+H200 常驻权重路径或 FP8/INT4 量化，论文不报告这些配置的实测结果。
 
 ### 1.2 核心矛盾（论文第 3 章观测，需实测填数）
 
@@ -39,7 +47,8 @@
 EAGLE-2 树验证一次前向送入 N=64 个 token，**64 个 token 的 top-2 路由并集在每层几乎覆盖全部 8 个专家**
 （Cascade, arXiv:2506.20675 报告 2–3x 权重读放大）。此时：
 
-- 验证一步读权重 ≈ 90 GB（全专家、BF16），是 AR 单步的 ~4x，H200 上仅权重读就 ≈ 19 ms/步；
+- 验证一步最多搬运约 90 GB 专家权重（全专家、BF16）。在 4090 offload 配置中，瓶颈是 PCIe H2D，
+  因而预算 B 和预取命中率直接决定 TPOT；
 - 每专家平均只分到 64×2/8 = **16 个 token**，M 极小 → GEMM 是典型 flat/skinny 形状，
   现有 fused MoE kernel（vLLM Triton、CUTLASS grouped GEMM）按大 batch 吞吐设计，
   此形状下带宽利用率低（HPC-Ops 用 split-k 在同类 decode 形状上比 DeepGEMM 快 1.88x，证明有很大空间）；
@@ -56,40 +65,30 @@ EAGLE-2 树验证一次前向送入 N=64 个 token，**64 个 token 的 top-2 �
 |---|---|---|
 | Cascade (NVIDIA) | 发现 MoE 验证膨胀，动态调 K | 纯调度策略，无 kernel 创新 |
 | MoE-Spec | 验证期专家预算（drop 长尾） | 未与 kernel 融合；未用树结构概率 |
-| SP-MoE / MoE-SpeQ | 专家 offload 预取 | 需额外训练预测器；未用 EAGLE 特征白嫖 |
+| SP-MoE / MoE-SpeQ | 专家 offload 预取 | 本项目改用零训练 temporal history 与 EAGLE 特征直接跑目标 router |
 | HPC-Ops | split-k decode GroupGEMM、fused sampler、Route GEMM | 无推测解码/树感知；Megakernel 在 roadmap 未实现 |
-| DeepGEMM | masked grouped GEMM（CUDA Graph 友好） | 面向 EP 大 batch；无树重排、无 FFN 全融合 |
+| DeepGEMM | masked grouped GEMM（CUDA Graph 友好） | 面向通用 grouped GEMM；不负责本项目的树节点路由、预算与修复 |
 
 ---
 
 ## 2. 系统架构
 
-```
-┌────────────────────────── 1 个 CUDA Graph 捕获整步 ──────────────────────────┐
-│  Stream 0（主）                          Stream 1（预取）                     │
-│  ┌──────────────┐                       ┌──────────────────┐                │
-│  │ EAGLE-2 草稿  │──draft features──────▶│ 算子2: 路由预执行  │                │
-│  │ + GPU 树扩展  │                       │  + 专家预取       │                │
-│  └──────┬───────┘                       └────────┬─────────┘                │
-│         │ tree tokens[64], tree_mask             │ expert bitmap[32,8]      │
-│         ▼                                        ▼                          │
-│  ┌─────────────────────────────────────────────────────────┐               │
-│  │ 目标模型验证前向 ×32 层：                                   │               │
-│  │   attention（tree mask, paged KV）                        │               │
-│  │   算子1: 树感知专家驻留 MoE 核（内嵌 算子3: 预算路由）        │               │
-│  └──────────────────────────┬──────────────────────────────┘               │
-│                             │ logits[64, 32000]                            │
-│                             ▼                                              │
-│  ┌─────────────────────────────────────────────────────────┐               │
-│  │ 算子4: 融合 验证采样-KV压缩-提交 核（单 kernel）             │               │
-│  └──────────────────────────┬──────────────────────────────┘               │
-│                             │ accepted_len, next_root_feature（全留 GPU）    │
-│                             └──────────────▶ 回到草稿阶段，零 CPU 同步        │
-└─────────────────────────────────────────────────────────────────────────────┘
+```text
+Python 控制循环
+  EAGLE-2 分层扩展 + 动态树构建
+       ├── EAGLE features 直接运行各层 target router，形成预取 hint
+       └── tree tokens / mask / accept_prob
+                    ↓
+  目标模型 tree forward（主流） || 专家 H2D 预取（侧流）
+       attention + 树感知 MoE（内嵌预算路由与 miss repair）
+                    ↓
+  Triton argmax → greedy 树验证 → KV commit
+                    ↓
+  D2H 取回接受数、accepted tokens 和 bonus token，进入下一轮
 ```
 
-静态形状约定（CUDA Graph 前提）：树节点数 N=64（可编译 32/128 变体）、最大深度 D=6、
-top-k 子节点数按 EAGLE-2 动态树但**填充到固定 N**（无效节点 mask 掉）。
+树节点数 N 和最大深度 D 固定，便于 Triton kernel 专门化与缓冲复用。当前实现没有捕获整步 CUDA Graph：
+建树使用 Python 容器，`SpecDecodeEngine.step()` 还会把接受结果转成主机列表。
 
 ---
 
@@ -97,7 +96,7 @@ top-k 子节点数按 EAGLE-2 动态树但**填充到固定 N**（无效节点 m
 
 ### 3.1 算子 1：树感知专家驻留 MoE 核（核心贡献）
 
-**签名（v1 两 kernel 方案，Triton）**
+**签名（当前多阶段 Triton 方案）**
 
 ```python
 def tree_moe_forward(
@@ -112,7 +111,7 @@ def tree_moe_forward(
 ) -> None
 ```
 
-**Kernel A — route_and_bucket（一个 CTA 完成，~5 μs 级）**
+**阶段 A — route_and_bucket**
 1. router GEMM：x[64,4096] @ router_weight.T[4096,8] → logits[64,8]，**FP32 累加**
    （HPC-Ops 单列 Route GEMM 证明 router 对精度敏感，BF16 累加会翻转 top-2 边界样本）；
 2. softmax + top-2 → topk_ids[64,2], topk_gates[64,2]；
@@ -120,64 +119,48 @@ def tree_moe_forward(
 4. 片上 radix bucket（SMEM 内计数 + 前缀和）：产出
    - `sorted_token_ids[128]`：按 (expert, DFS序) 排序的 token 槽位
    - `expert_offsets[E+1]`：每专家 token 段的前缀和
-   - `num_tokens_per_expert[8]`：**由 GPU 写出，CPU 不读**（DeepGEMM masked layout 思路，
-     保证整步可被 CUDA Graph 捕获——这是与 vLLM fused_moe 需要 CPU 侧 moe_align 的本质区别）。
+   - `num_tokens_per_expert[8]`：由 GPU 写出，MoE 路由和分桶阶段不需要逐专家 CPU 读回。
 
-**Kernel B — expert_stationary_fused_ffn（主计算核）**
+**阶段 B/C — expert-stationary GEMM1/GEMM2（主计算核）**
 
-数学恒等式（中间激活不落 HBM 的关键）：
-
-$$\mathrm{FFN}(x) = \big(\mathrm{SiLU}(xW_1^\top) \odot xW_3^\top\big) W_2^\top = \sum_{k\text{-tile}} \big(\mathrm{SiLU}(xW_1[k]^\top) \odot xW_3[k]^\top\big) W_2[k]^\top$$
-
-对 intermediate 维 I=14336 分块（BK=128），每块算出 h_blk[M, BK] 后**立即**乘 W2[BK, 4096] 累加，
-14336 维中间激活永不物化到 HBM。
+当前实现分两阶段计算原生 Mixtral FFN：GEMM1 同时读取 w1/w3，融合 SiLU 与逐元素乘法后把 BF16
+中间激活写入预分配的 `h` workspace；GEMM2 紧接着读取 `h` 与 w2。代码通过 L2
+`evict_last` 提示促进该短生命周期 workspace 的复用，但不声称中间激活完全驻留片上。
 
 网格与调度（细节）：
 - grid = (E=8, SPLIT_K=14336/BK_SPLIT)。**split-k 是小 M 场景的占用率关键**：
-  M_e≈16 时若只按 M×N 切 tile，只有 8×2=16 个 CTA，H100 132 个 SM 大量闲置；
-  按 K 维再切 8 份 → 128 CTA 打满。partial 结果用第二个轻量 combine kernel 归约
-  （HPC-Ops "sm90 dynamic decode with split-k combine" 的同款结构）；
-- **专家驻留（weight-stationary）**：每个 CTA 绑定一个专家，w1/w3/w2 的 K-tile 经 TMA/cp.async
-  流过 SMEM 一次，对该专家名下所有 token（≤64）复用——权重读一遍服务多 token，
+  M_e≈16 时仅按 token 维切分会产生太少 CTA；当前 4090 配置采用 `SPLIT_K=2`，partial 结果用
+  轻量 combine kernel 归约；
+- **专家驻留（weight-stationary）**：每个 CTA 绑定一个专家，w1/w3/w2 以 BF16 packed load 流式读取，
+  对该专家名下所有 token（≤64）复用——权重读一遍服务多 token，
   而 token-stationary 布局（vLLM 默认）在小 M 下会重复读权重；
 - token 段按 DFS 序排列 → 同一专家内的树节点父子相邻，x 的加载有 L2 局部性；
 - 权重 BF16 直读，无反量化 epilogue（kernel 更简单、数值路径与 HF 完全对齐；
   FP8/INT4 变体仅作附录消融）；
 - 空专家（num_tokens_per_expert[e]==0）：CTA 读到 0 立即退出（masked 语义，形状恒定）。
 
-**v2（可选，论文加分项）**：持久化巨核，Kernel A/B 融为单 kernel，用 cooperative groups
-grid.sync() 或 PDL（programmatic dependent launch，HPC-Ops 教程中使用）消除 kernel 间隙。
-风险高，v1 已构成完整贡献，v2 作为附加优化章节。
+确定性路径把 split-K 和 top-2 槽位 partial 写入 FP32 workspace，再由 combine kernel 按固定顺序归约；
+性能路径使用 atomic add。论文分别报告两条路径，不把尚未实现的持久化巨核列为贡献。
 
-**验收基准**（对照组固定为 4 个，均 BF16 同精度对比）：
-vLLM `fused_moe` Triton、MegaBlocks dMoE、DeepGEMM BF16 grouped GEMM（masked layout）+独立激活核、
-CUTLASS grouped GEMM+独立激活核；HPC-Ops FP8 GroupGEMM 仅作低精度 skyline 参考、不进主对比表。
-指标：N∈{32,64,128} 下 kernel 时延、HBM 读字节数（Nsight `dram__bytes_read`）、SM 占用率。
+**验收基准**：`benchmarks/bench_op1.py` 测 N∈{32,64,128} 的确定性与 atomic 路径，报告时延、
+按权重字节估算的有效带宽和峰值利用率。安装 vLLM 时额外报告同一输入输出边界下的 `fused_moe`；
+当前环境没有完成 MegaBlocks、DeepGEMM 或 CUTLASS 的公平实测，不把它们列入最终结果表。
 
-### 3.2 算子 2：草稿引导的路由预执行与专家预取
+### 3.2 算子 2：零训练路由预测与可修复专家预取
 
-**问题的诚实表述**：第 l 层 router 的真实输入是第 l 层的 hidden state，草稿阶段拿不到。
-EAGLE-2 的 draft feature f ≈ 目标模型**倒数第二层** hidden state 的近似。
-因此需要一组轻量跨层预测器：
+当前系统没有训练额外预测网络。预取位图来自两个无需训练的信号：
 
-```
-P_l: f[4096] → expert_logits_l[8]     l = 0..31
-合并为一个 GEMM：f[64, 4096] @ Wp[4096, 256] → [64, 32, 8]   （Wp 仅 1M 参数）
-```
+1. **Temporal history**：复用上一轮 verification 中每层实际命中的专家集合；
+2. **EAGLE router hint**：将 EAGLE 树的 feature 直接输入目标模型各层已有的 router，按节点接受概率聚合
+   expert demand。该特征只是目标层 hidden state 的近似，因此 hint 只决定提前搬哪些权重，不参与最终路由。
 
-- 训练：ShareGPT 上跑 Mixtral 前向，采集 (倒数第二层 hidden, 各层 top-2 label)，
-  32 个 8 分类头，交叉熵，1 张卡半天可训完。**这是与 SP-MoE/MoE-SpeQ 的差异**：
-  它们为预取训练独立预测网络，我们复用 EAGLE-2 已有特征，预测器只有 1M 参数；
-- 输出聚合成每层专家位图 `prefetch_bitmap[32, 8]`（树内 64 节点做 OR + top-B 截断）；
-- 预取执行（Stream 1）：
-  - **权重全在 HBM**（80G 主配置）：预取退化为 L2 warm——对预测命中的专家权重段发
-    `cp.async.bulk.prefetch.L2`（或读 1 byte/128B 的 dummy load kernel），
-    收益预期温和（~5-10%），作为消融项；
-  - **offload 配置**（BF16 专家 + host pin 内存）：`cudaMemcpyAsync` H2D 拉取预测专家到 GPU 环形缓冲。
-    注意时延量级：单专家单层 352 MB @ PCIe Gen5 ≈5.5 ms，无法在层内隐藏 →
-    预取必须**提前 ≥4 层流水**（第 l 层验证时拉第 l+4 层的预测专家），且只 offload 冷层；
-    命中免 PCIe 等待——这是预取的主战场，论文报告 recall@B 与 TPOT 的关系曲线；
-- 评估指标：预测 recall@2 / recall@4（每层）、预取命中率、错误预取带宽浪费比。
+两种信号在每层最多保留 `max(B, |previous_set|)` 个专家，避免为提高表面命中率而搬运过多权重。
+host pinned 权重通过侧流复制到深度为 2 的 GPU 环形缓冲。目标层的真实路由完成后，`repair()` 检查
+缺失专家，并在 expert GEMM 前补拷贝。预测错误只损失性能，不会让 GEMM 读取陈旧权重。
+
+`RouterPredictor` 类和 `measurements/train_predictor.py` 是早期实验原型，没有模型 checkpoint，也没有在
+`bench_e2e.py` 中加载。论文评估使用 staged expert 数、真实路由命中率、repair miss 和 TPOT，不报告
+训练预测器的 recall@2/recall@4。
 
 ### 3.3 算子 3：预算约束的树验证路由（内嵌于算子 1 Kernel A）
 
@@ -190,67 +173,60 @@ P_l: f[4096] → expert_logits_l[8]     l = 0..31
 2. 保留 $\text{TopB}(s)$ 专家集合 $\mathcal{K}$；
 3. 重路由：token n 的 top-2 中被逐出的专家 → 替换为该 token 路由分布中 $\mathcal{K}$ 内得分最高者，
    gating 权重重新归一化（保证 $\sum g = 1$，避免输出幅值漂移）；
-4. 低概率分支降级：$p_{\text{accept}}(n) < \tau$（默认 0.05）的节点直接 top-1 路由。
+4. 可选近似：$p_{\text{accept}}(n) < \tau$ 的节点退化为 top-1。正式主实验默认 $\tau=0$；
+  $\tau=0.05$ 只作为消融，因为它会改变验证 logits，却不能减少已 staged 的 PCIe 字节。
 
-B 的选择：静态扫 B∈{3,4,5,6,8} 出接受率-时延 Pareto 曲线（论文主图）；
-进阶：按上一步实际接受长度反馈自适应 B（简单 PI 控制器，CPU 侧更新，graph 外参数）。
+B 的选择：静态扫描 B∈{2,3,4,5,6,8}，得到接受长度、质量和 TPOT 的 Pareto 曲线。
 
 **正确性红线**：预算路由改变了目标模型输出分布，严格的 speculative sampling 无损性不再成立。
 论文处理方式（与 MoE-Spec 相同）：报告下游任务分数（GSM8K/HumanEval/MT-Bench judge）证明无统计显著退化，
 并提供 B=8 无损模式作为对照。
 
-### 3.4 算子 4：融合 验证-采样-KV压缩-提交 核
+### 3.4 算子 4：greedy 树验证与 KV 提交
 
-现状痛点：HF/朴素实现里这一段是 ~10 个小 kernel + 多次 GPU→CPU 同步（读接受长度），
-每步浪费 50–200 μs 且阻断 CUDA Graph。HPC-Ops fused sampler（8.5x）证明融合采样类算子收益巨大，
-但它不处理树。本算子 = fused sampler 的树验证扩展：
+正式实验使用 temperature=0。GPU 路径由三个阶段组成：
 
-单 kernel（grid = 树路径数并行 + vocab 归约维），内部顺序：
-1. logits 后处理：temperature / repetition penalty（融合，HPC-Ops 同款）；
-2. online softmax（vocab=32000，两遍 max/sum 归约，SMEM 缓存热区）；
-3. 树 rejection sampling：从根 DFS，逐节点 accept/reject（Philox 计数器随机数，
-   种子固定可复现），拒绝时按残差分布 $\max(0, p-q)$ 采 bonus token；
-4. 选出最长接受路径，写 `accepted_len`（GPU 标量，不回读 CPU）；
-5. KV 压缩：接受路径的树槽位 KV → 按 `kv_remap_index` 写回主 KV cache 连续区
-   （paged KV，block 内 index remap，避免整块搬运）；
-6. 写 `next_root_feature[4096]`（接受路径末端 hidden，供下一步 EAGLE-2 起草）。
+1. 每个树节点对 logits 做 Triton argmax；greedy 模式不计算 softmax；
+2. 单 program 沿树执行串行 greedy 验证，输出接受槽位、bonus token 和接受数；
+3. KV commit kernel 将根节点和接受路径从 tree scratch block 写入 paged KV tail。
 
-全部输出留在 GPU，配合固定树形状 → **整个 draft-verify-commit 循环单 CUDA Graph 重放**，
-每步 CPU 开销 ≈ 一次 graph launch（~10 μs）。
+temperature>0 的 rejection sampling 仍走 PyTorch 参考实现，不属于当前性能实验。引擎随后用一次 `.tolist()`
+取回接受 token 和 bonus token，以便 Python 处理 EOS 和输出列表。因此本模块减少了逐节点同步，但没有做到
+零 CPU 同步，也没有形成单 kernel 或整步 CUDA Graph。
 
 ### 3.5 非贡献组件的选型（不重造轮子）
 
 | 组件 | 选型 | 理由 |
 |---|---|---|
-| tree attention | PyTorch SDPA + 显式 64×64 tree mask（prefill 用 flash-attn varlen） | N=64 的验证 attention 非瓶颈（<5% 时延），不值得自研 |
+| tree attention | PyTorch SDPA + 显式 64×64 tree mask | 沿用 PyTorch 后端分派；本项目不把自研 attention kernel 列为贡献 |
 | KV cache | 自实现极简 paged KV（block=64，正好一棵树） | 结构需配合算子 4 的 remap，第三方难嵌入 |
 | 权重加载 | safetensors 直读原生 BF16（无量化步骤） | 无框架依赖，数值与 HF 严格对齐 |
 | EAGLE-2 草稿权重 | `yuhuili/EAGLE-mixtral-instruct-8x7B`（官方已发布；EAGLE-2 是推理时动态树，复用 EAGLE-1 权重无需重训） | 省 2–4 周训练 |
-| 随机数 | Philox4x32（counter-based） | CUDA Graph 重放安全 |
+| 随机数 | PyTorch generator（仅 temperature>0 参考路径） | 正式实验使用 greedy，不进入采样核 |
 
 ---
 
 ## 4. 实验设计
 
-**硬件**：主实验 H200-141G ×1（备选 2×H100-80G TP=2，专家 I 维切分）；A100 复验（无 TMA 路径回退 cp.async）。
+**硬件**：主实验为 RTX 4090 24GB ×1，专家权重通过 PCIe Gen4 ×16 从 host pinned memory 按层加载。
 
 **基线**：
 1. HF transformers Mixtral AR（正确性锚点 + 最慢基线）；
 2. 本框架 AR（无推测，隔离框架本身开销）；
-3. 本框架 + EAGLE-2 + vLLM fused_moe kernel（隔离算子 1 的贡献）；
-4. vLLM 官方 EAGLE+Mixtral、SGLang EAGLE（端到端外部基线，注明版本）。
+3. 本框架 + EAGLE-2，关闭预取位图并全量搬运专家（隔离预取收益）。
 
-**指标**：TPOT、每步接受长度 τ、端到端加速比、`dram__bytes_read`（Nsight）、
-预取 recall/命中率、GSM8K/HumanEval/MT-Bench 分数（B<8 时的质量验证）。
+**指标**：TPOT、每步接受长度 τ、端到端加速比、预取命中率、repair miss，以及 B<8 时的
+MT-Bench 质量分数。当前 AutoDL 容器没有 Nsight Compute 计数器权限，不把 `dram__bytes_read` 作为必填实测项。
 
-**消融**（每算子独立开关）：+算子1 / +算子3(B扫描) / +算子4+CUDA Graph / +算子2(offload场景)；
-树大小 32/64/128；（附录）FP8/INT4 量化对 τ 与 TPOT 的影响。
+**消融**：B 扫描；树大小 16/32/64；默认 hint+temporal、temporal-only 与 full-copy 三种预取策略；
+top-1 阈值 0/0.05。项目不报告 CUDA Graph、训练预测器或量化消融。最终配置和待测结果统一维护在
+`measurements/final_experiments.csv`。
 
 **风险与回退**：
 
 | 风险 | 概率 | 回退 |
 |---|---|---|
 | Kernel B split-k 在 M=16 仍打不满带宽 | 中 | 双专家/CTA 绑定（E=8→4 CTA 组）+ 增大 BK |
-| 预测器 recall@4 < 70%，预取无收益 | 中 | 算子 2 降级为"上一验证步激活集"启发式（成本零，论文改为对比两种信号） |
+| 零训练 hint 命中率不足 | 中 | `repair()` 保持正确性，并与 temporal-only/full-copy 做消融 |
 | 预算路由伤接受率（τ 掉 >15%） | 低 | τ 阈值分支降级关闭，只保留 top-B |
-| BF16 全模型显存吃紧（H200 不可得 / TP=2 通信开销大） | 中 | 冷层专家 offload（配置 B）+ 算子 2 预取兜底；TP=2 时 all-reduce 与算子 4 重叠 |
+| BF16 全模型超出 4090 显存 | 已发生 | 全部专家权重放在 host pinned memory，按层预取和修复 |
