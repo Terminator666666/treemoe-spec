@@ -130,6 +130,7 @@ def test_ar_logits_match_hf():
     total_gb = torch.cuda.get_device_properties(0).total_memory / 2**30
     resident = total_gb >= 120
     steps = int(os.getenv("PARITY_STEPS", "32"))
+    layer_diag = os.getenv("PARITY_LAYER_DIAG") == "1"
 
     # ---- phase 1: HF reference tokens, then free everything ----
     print(f"[parity] phase 1/2: loading HF reference ({steps} greedy steps)", flush=True)
@@ -140,13 +141,21 @@ def test_ar_logits_match_hf():
                                           "cpu": "200GiB"},
     )
     ids = tok("The capital of France is", return_tensors="pt").input_ids[0].cuda()
-    hf_out = hf.generate(
-        ids.unsqueeze(0), do_sample=False, max_new_tokens=steps,
-        return_dict_in_generate=True, output_scores=True,
-    )
-    hf_tokens = hf_out.sequences[0, ids.shape[0]:].tolist()
-    hf_scores = [score[0].float().cpu() for score in hf_out.scores]
-    print(f"[parity] HF reference ready: {len(hf_tokens)} tokens", flush=True)
+    if layer_diag:
+        hf_forward = hf.model(
+            ids.unsqueeze(0), output_hidden_states=True, use_cache=False,
+        )
+        hf_layers = [state[0].float().cpu() for state in hf_forward.hidden_states]
+        hf_tokens, hf_scores = [], []
+        print(f"[parity] HF layer references ready: {len(hf_layers)} states", flush=True)
+    else:
+        hf_out = hf.generate(
+            ids.unsqueeze(0), do_sample=False, max_new_tokens=steps,
+            return_dict_in_generate=True, output_scores=True,
+        )
+        hf_tokens = hf_out.sequences[0, ids.shape[0]:].tolist()
+        hf_scores = [score[0].float().cpu() for score in hf_out.scores]
+        print(f"[parity] HF reference ready: {len(hf_tokens)} tokens", flush=True)
     del hf
     gc.collect()
     torch.cuda.empty_cache()
@@ -162,8 +171,22 @@ def test_ar_logits_match_hf():
     kv = PagedKVCache(cfg, num_blocks=64)
     ours = MixtralForward(w, kv)
 
+    if layer_diag:
+        def compare_layer(layer_idx, state):
+            # HF hidden_states[0] is embedding output; entry i+1 is decoder
+            # layer i output (except the final entry may include final norm).
+            ref = hf_layers[layer_idx + 1].to(state.device)
+            diff = (state.float() - ref).abs()
+            print(f"[parity-layer] {layer_idx:02d}: "
+                  f"max_abs={float(diff.max()):.6f} "
+                  f"mean_abs={float(diff.mean()):.6f}", flush=True)
+
+        ours.layer_observer = compare_layer
+
     pos = torch.arange(ids.shape[0], device="cuda")
     logits = ours.forward(ids, pos)
+    if layer_diag:
+        pytest.fail("layer diagnostics complete (inspect [parity-layer] output)")
     our_tokens = []
     mismatches = []
     for step in range(steps):

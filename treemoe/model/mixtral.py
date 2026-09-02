@@ -186,6 +186,9 @@ class MixtralForward:
             else:
                 moe_lw = self._stage_experts(lw)
             x = x + self.moe_fn(h, moe_lw, layer_idx)
+            observer = getattr(self, "layer_observer", None)
+            if observer is not None:
+                observer(layer_idx, x)
             if use_prefetch:
                 self.prefetcher.release(layer_idx)
         x = rms_norm(x, self.w.final_norm, cfg.rms_eps)
