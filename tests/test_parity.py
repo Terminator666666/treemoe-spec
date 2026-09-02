@@ -152,27 +152,28 @@ def test_ar_logits_match_hf():
         # numerical operation still runs as BF16 on this GPU.
         from transformers.models.mixtral import modeling_mixtral
 
-        hidden = hf.model.embed_tokens(ids_cpu.unsqueeze(0)).cuda()
-        position_ids = torch.arange(ids_cpu.shape[0], device="cuda").unsqueeze(0)
-        causal_mask = modeling_mixtral.create_causal_mask(
-            config=hf.config, inputs_embeds=hidden, attention_mask=None,
-            past_key_values=None, position_ids=position_ids,
-        )
-        hf.model.rotary_emb.to("cuda")
-        position_embeddings = hf.model.rotary_emb(hidden, position_ids)
-        hf.model.rotary_emb.to("cpu")
-        hf_layers = [hidden[0].float().cpu()]
-        for layer_idx, layer in enumerate(hf.model.layers):
-            layer.to("cuda")
-            hidden = layer(
-                hidden, position_embeddings=position_embeddings,
-                attention_mask=causal_mask, position_ids=position_ids,
-                past_key_values=None, use_cache=False,
+        with torch.inference_mode():
+            hidden = hf.model.embed_tokens(ids_cpu.unsqueeze(0)).cuda()
+            position_ids = torch.arange(ids_cpu.shape[0], device="cuda").unsqueeze(0)
+            causal_mask = modeling_mixtral.create_causal_mask(
+                config=hf.config, inputs_embeds=hidden, attention_mask=None,
+                past_key_values=None, position_ids=position_ids,
             )
-            hf_layers.append(hidden[0].float().cpu())
-            layer.to("cpu")
-            torch.cuda.empty_cache()
-            print(f"[parity] HF layer {layer_idx + 1}/32 ready", flush=True)
+            hf.model.rotary_emb.to("cuda")
+            position_embeddings = hf.model.rotary_emb(hidden, position_ids)
+            hf.model.rotary_emb.to("cpu")
+            hf_layers = [hidden[0].float().cpu()]
+            for layer_idx, layer in enumerate(hf.model.layers):
+                layer.to("cuda")
+                hidden = layer(
+                    hidden, position_embeddings=position_embeddings,
+                    attention_mask=causal_mask, position_ids=position_ids,
+                    past_key_values=None, use_cache=False,
+                )
+                hf_layers.append(hidden[0].float().cpu())
+                layer.to("cpu")
+                torch.cuda.empty_cache()
+                print(f"[parity] HF layer {layer_idx + 1}/32 ready", flush=True)
         hf_tokens, hf_scores = [], []
         print(f"[parity] HF layer references ready: {len(hf_layers)} states", flush=True)
     else:
