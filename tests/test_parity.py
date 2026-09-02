@@ -4,6 +4,8 @@ The tiny-config tests run everywhere and pin the *mechanism*; the marked tests
 pin real-model numerics on a GPU box with downloaded weights.
 """
 
+import os
+
 import pytest
 import torch
 
@@ -127,22 +129,30 @@ def test_ar_logits_match_hf():
     tok = transformers.AutoTokenizer.from_pretrained(model_dir)
     total_gb = torch.cuda.get_device_properties(0).total_memory / 2**30
     resident = total_gb >= 120
+    steps = int(os.getenv("PARITY_STEPS", "32"))
 
     # ---- phase 1: HF reference tokens, then free everything ----
+    print(f"[parity] phase 1/2: loading HF reference ({steps} greedy steps)", flush=True)
     hf = transformers.AutoModelForCausalLM.from_pretrained(
-        model_dir, torch_dtype=torch.bfloat16,
+        model_dir, dtype=torch.bfloat16,
         device_map="cuda" if resident else "auto",
         max_memory=None if resident else {0: f"{int(total_gb) - 6}GiB",
                                           "cpu": "200GiB"},
     )
     ids = tok("The capital of France is", return_tensors="pt").input_ids[0].cuda()
-    hf_out = hf.generate(ids.unsqueeze(0), do_sample=False, max_new_tokens=32)[0, ids.shape[0]:]
-    hf_tokens = hf_out.tolist()
+    hf_out = hf.generate(
+        ids.unsqueeze(0), do_sample=False, max_new_tokens=steps,
+        return_dict_in_generate=True, output_scores=True,
+    )
+    hf_tokens = hf_out.sequences[0, ids.shape[0]:].tolist()
+    hf_scores = [score[0].float().cpu() for score in hf_out.scores]
+    print(f"[parity] HF reference ready: {len(hf_tokens)} tokens", flush=True)
     del hf
     gc.collect()
     torch.cuda.empty_cache()
 
     # ---- phase 2: our forward on the same prompt ----
+    print("[parity] phase 2/2: loading TreeMoE offload weights", flush=True)
     cfg = MixtralConfig()
     w = load_mixtral_weights(
         model_dir, cfg,
@@ -155,10 +165,29 @@ def test_ar_logits_match_hf():
     pos = torch.arange(ids.shape[0], device="cuda")
     logits = ours.forward(ids, pos)
     our_tokens = []
-    cur = logits[-1].argmax()
-    for step in range(32):
-        our_tokens.append(int(cur))
+    first_mismatch = None
+    for step in range(steps):
+        our_score = logits[-1].float()
+        our_token = int(our_score.argmax())
+        our_tokens.append(our_token)
+        hf_token = hf_tokens[step]
+        if our_token != hf_token and first_mismatch is None:
+            hf_score = hf_scores[step].to(our_score.device)
+            hf_top2 = torch.topk(hf_score, 2)
+            first_mismatch = {
+                "step": step,
+                "ours": our_token,
+                "hf": hf_token,
+                "hf_margin": float(hf_top2.values[0] - hf_top2.values[1]),
+                "max_abs": float((our_score - hf_score).abs().max()),
+                "ours_at_hf": float(our_score[hf_token]),
+                "ours_at_ours": float(our_score[our_token]),
+            }
+        print(f"[parity] step {step + 1}/{steps}: "
+              f"ours={our_token} hf={hf_token}", flush=True)
+        # Teacher-force the HF token so one close argmax flip cannot poison all
+        # later positions; persistent errors then indicate a real forward bug.
         p = torch.tensor([kv.seq_len], device="cuda")
-        logits = ours.forward(cur.unsqueeze(0), p)
-        cur = logits[-1].argmax()
-    assert our_tokens == hf_tokens
+        token = torch.tensor([hf_token], device="cuda")
+        logits = ours.forward(token, p)
+    assert our_tokens == hf_tokens, f"first mismatch diagnostics: {first_mismatch}"
