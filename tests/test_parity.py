@@ -145,17 +145,34 @@ def test_ar_logits_match_hf():
     )
     ids_cpu = tok("The capital of France is", return_tensors="pt").input_ids[0]
     if layer_diag:
-        # transformers 5.x packs all eight experts into one ~2.8GB module.
-        # device_map="auto" keeps other layers resident and then OOMs when its
-        # hook stages that whole module on a 24GB card. Full cpu_offload keeps
-        # weights in host RAM and executes one module at a time on the same GPU.
-        from accelerate import cpu_offload
+        # transformers 5.x packs all eight experts into one ~2.8GB module, and
+        # both device_map="auto" and cpu_offload accumulate enough staged
+        # modules to OOM a 24GB card. Execute the unmodified HF decoder one
+        # layer at a time: weights live on CPU between calls, while every
+        # numerical operation still runs as BF16 on this GPU.
+        from transformers.models.mixtral import modeling_mixtral
 
-        hf = cpu_offload(hf, execution_device=torch.device("cuda"))
-        hf_forward = hf.model(
-            ids_cpu.unsqueeze(0).cuda(), output_hidden_states=True, use_cache=False,
+        hidden = hf.model.embed_tokens(ids_cpu.unsqueeze(0)).cuda()
+        position_ids = torch.arange(ids_cpu.shape[0], device="cuda").unsqueeze(0)
+        causal_mask = modeling_mixtral.create_causal_mask(
+            config=hf.config, inputs_embeds=hidden, attention_mask=None,
+            past_key_values=None, position_ids=position_ids,
         )
-        hf_layers = [state[0].float().cpu() for state in hf_forward.hidden_states]
+        hf.model.rotary_emb.to("cuda")
+        position_embeddings = hf.model.rotary_emb(hidden, position_ids)
+        hf.model.rotary_emb.to("cpu")
+        hf_layers = [hidden[0].float().cpu()]
+        for layer_idx, layer in enumerate(hf.model.layers):
+            layer.to("cuda")
+            hidden = layer(
+                hidden, position_embeddings=position_embeddings,
+                attention_mask=causal_mask, position_ids=position_ids,
+                past_key_values=None, use_cache=False,
+            )
+            hf_layers.append(hidden[0].float().cpu())
+            layer.to("cpu")
+            torch.cuda.empty_cache()
+            print(f"[parity] HF layer {layer_idx + 1}/32 ready", flush=True)
         hf_tokens, hf_scores = [], []
         print(f"[parity] HF layer references ready: {len(hf_layers)} states", flush=True)
     else:
