@@ -1,5 +1,7 @@
 """Task 0.1 gate: environment + model availability (marked, skipped on dev boxes)."""
 
+import os
+
 import pytest
 import torch
 
@@ -16,10 +18,14 @@ def test_mixtral_forward_one_token():
     transformers = pytest.importorskip("transformers")
     tok = transformers.AutoTokenizer.from_pretrained(MODEL)
     total_gb = torch.cuda.get_device_properties(0).total_memory / 2**30
+    # Keep extra headroom for allocator fragmentation and runtime activations
+    # on 24GB cards (4090). Override via TEST_ENV_GPU_CAP_GIB when needed.
+    gpu_cap = max(8, int(total_gb) - 8)
+    gpu_cap = int(os.getenv("TEST_ENV_GPU_CAP_GIB", str(gpu_cap)))
     model = transformers.AutoModelForCausalLM.from_pretrained(
-        MODEL, torch_dtype=torch.bfloat16, device_map="auto",
+        MODEL, dtype=torch.bfloat16, device_map="auto",
         # cap GPU usage so accelerate offloads to host RAM on small cards
-        max_memory={0: f"{int(total_gb) - 6}GiB", "cpu": "200GiB"},
+        max_memory={0: f"{gpu_cap}GiB", "cpu": "220GiB"},
     )
     ids = tok("hello", return_tensors="pt").input_ids.to(model.device)
     out = model(ids)
