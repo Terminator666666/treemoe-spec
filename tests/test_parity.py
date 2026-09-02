@@ -131,13 +131,14 @@ def test_ar_logits_match_hf():
     resident = total_gb >= 120
     steps = int(os.getenv("PARITY_STEPS", "32"))
     layer_diag = os.getenv("PARITY_LAYER_DIAG") == "1"
+    hf_gpu_cap = int(os.getenv("PARITY_HF_GPU_CAP_GIB", "14"))
 
     # ---- phase 1: HF reference tokens, then free everything ----
     print(f"[parity] phase 1/2: loading HF reference ({steps} greedy steps)", flush=True)
     hf = transformers.AutoModelForCausalLM.from_pretrained(
         model_dir, dtype=torch.bfloat16,
         device_map="cuda" if resident else "auto",
-        max_memory=None if resident else {0: f"{int(total_gb) - 6}GiB",
+        max_memory=None if resident else {0: f"{hf_gpu_cap}GiB",
                                           "cpu": "200GiB"},
     )
     ids = tok("The capital of France is", return_tensors="pt").input_ids[0].cuda()
