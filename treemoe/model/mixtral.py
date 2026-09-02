@@ -21,6 +21,8 @@ from treemoe.model.kv_cache import PagedKVCache
 from treemoe.model.weights import LayerWeights, MixtralWeights
 
 MoEFn = Callable[[torch.Tensor, LayerWeights, int], torch.Tensor]
+MoETraceFn = Callable[[str, torch.Tensor], None]
+LayerTraceFn = Callable[[int, str, torch.Tensor], None]
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -55,7 +57,12 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, positions:
     return x * c + rotated * s
 
 
-def naive_moe(x: torch.Tensor, lw: LayerWeights, _layer_idx: int) -> torch.Tensor:
+def naive_moe(
+    x: torch.Tensor,
+    lw: LayerWeights,
+    _layer_idx: int,
+    trace: Optional[MoETraceFn] = None,
+) -> torch.Tensor:
     """HF-equivalent per-expert loop. x: [T, H] -> [T, H]."""
     # HF MixtralTopKRouter runs the linear in the activation/weight dtype,
     # then promotes the rounded logits to FP32 for softmax.
@@ -63,15 +70,36 @@ def naive_moe(x: torch.Tensor, lw: LayerWeights, _layer_idx: int) -> torch.Tenso
     gates = torch.softmax(logits.float(), dim=-1)
     topg, topi = gates.topk(2, dim=-1)
     topg = topg / topg.sum(-1, keepdim=True)
+    if trace is not None:
+        trace("moe.router_logits", logits)
+        trace("moe.router_probs", gates)
+        trace("moe.topk_weights", topg)
+        trace("moe.topk_indices", topi)
     out = torch.zeros_like(x)
     for e in range(lw.w1.shape[0]):
         for k in range(2):
             sel = topi[:, k] == e
             if not sel.any():
                 continue
+            token_indices = sel.nonzero(as_tuple=False).flatten()
             xe = x[sel]
-            h = F.silu(xe @ lw.w1[e].t()) * (xe @ lw.w3[e].t())
-            out[sel] += (h @ lw.w2[e].t()) * topg[sel, k : k + 1].to(x.dtype)
+            gate = xe @ lw.w1[e].t()
+            up = xe @ lw.w3[e].t()
+            activated = F.silu(gate) * up
+            down = activated @ lw.w2[e].t()
+            weighted = down * topg[sel, k : k + 1].to(x.dtype)
+            out[sel] += weighted
+            if trace is not None:
+                prefix = f"moe.expert_{e}.slot_{k}"
+                trace(f"{prefix}.token_indices", token_indices)
+                trace(f"{prefix}.input", xe)
+                trace(f"{prefix}.gate", gate)
+                trace(f"{prefix}.up", up)
+                trace(f"{prefix}.activated", activated)
+                trace(f"{prefix}.down", down)
+                trace(f"{prefix}.weighted", weighted)
+    if trace is not None:
+        trace("moe.output", out)
     return out
 
 
@@ -85,10 +113,15 @@ class MixtralForward:
         # op2 LayerPrefetcher (spec §3.2): ahead-of-time side-stream staging of
         # offloaded layers; None falls back to synchronous _stage_experts
         self.prefetcher = prefetcher
+        self.trace_observer: Optional[LayerTraceFn] = None
         self.rope_cos, self.rope_sin = build_rope_cache(self.cfg, weights.embed_tokens.device.type)
         # reusable GPU staging buffers for layout="offload" layers (one layer's
         # experts = 2.82GB at Mixtral shapes) -- allocated on first use
         self._staging: Optional[dict[str, torch.Tensor]] = None
+
+    def _trace(self, layer_idx: int, name: str, tensor: torch.Tensor) -> None:
+        if self.trace_observer is not None:
+            self.trace_observer(layer_idx, name, tensor)
 
     def _stage_experts(self, lw: LayerWeights) -> LayerWeights:
         """Copy pinned-host expert weights into a reusable GPU staging buffer.
@@ -123,11 +156,20 @@ class MixtralForward:
     ) -> torch.Tensor:
         cfg = self.cfg
         t = x.shape[0]
-        q = F.linear(x, lw.attn["q_proj"]).view(t, cfg.num_heads, cfg.head_dim)
-        k = F.linear(x, lw.attn["k_proj"]).view(t, cfg.num_kv_heads, cfg.head_dim)
-        v = F.linear(x, lw.attn["v_proj"]).view(t, cfg.num_kv_heads, cfg.head_dim)
+        q_proj = F.linear(x, lw.attn["q_proj"])
+        k_proj = F.linear(x, lw.attn["k_proj"])
+        v_proj = F.linear(x, lw.attn["v_proj"])
+        self._trace(layer_idx, "attn.q_proj", q_proj)
+        self._trace(layer_idx, "attn.k_proj", k_proj)
+        self._trace(layer_idx, "attn.v_proj", v_proj)
+        q = q_proj.view(t, cfg.num_heads, cfg.head_dim)
+        k = k_proj.view(t, cfg.num_kv_heads, cfg.head_dim)
+        v = v_proj.view(t, cfg.num_kv_heads, cfg.head_dim)
         q = apply_rope(q, self.rope_cos, self.rope_sin, positions)
         k = apply_rope(k, self.rope_cos, self.rope_sin, positions)
+        self._trace(layer_idx, "attn.q_rope", q)
+        self._trace(layer_idx, "attn.k_rope", k)
+        self._trace(layer_idx, "attn.value_states", v)
 
         if is_tree:
             self.kv.write_tree(layer_idx, k, v)
@@ -145,6 +187,7 @@ class MixtralForward:
             # (was 32 hidden syncs/step in the AR decode path)
             mask = (torch.arange(total, device=x.device)[None, :]
                     <= positions[:, None])
+            self._trace(layer_idx, "attn.mask", mask)
 
         qh = q.transpose(0, 1)          # [heads, T, hd]
         kh = full_k.transpose(0, 1)     # [kv_heads, S, hd]
@@ -155,7 +198,10 @@ class MixtralForward:
         o = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=mask.unsqueeze(0),
                                            enable_gqa=True)
         o = o.transpose(0, 1).reshape(t, cfg.num_heads * cfg.head_dim)
-        return F.linear(o, lw.attn["o_proj"])
+        self._trace(layer_idx, "attn.context", o)
+        output = F.linear(o, lw.attn["o_proj"])
+        self._trace(layer_idx, "attn.output", output)
+        return output
 
     # ---------------- forward ----------------
 
@@ -170,15 +216,20 @@ class MixtralForward:
         cfg = self.cfg
         is_tree = tree_mask is not None
         x = F.embedding(token_ids, self.w.embed_tokens)
+        self._trace(-1, "embedding", x)
         # one D2H for the whole step instead of int(positions[0]) per layer
         start_pos = 0 if is_tree else int(positions[0])
         if self.prefetcher is not None:
             self.prefetcher.begin()
         for layer_idx, lw in enumerate(self.w.layers):
+            self._trace(layer_idx, "layer.input", x)
             h = rms_norm(x, lw.input_layernorm, cfg.rms_eps)
+            self._trace(layer_idx, "attn.norm", h)
             x = x + self._attention(lw, layer_idx, h, positions, tree_mask,
                                     is_tree, start_pos)
+            self._trace(layer_idx, "attn.residual", x)
             h = rms_norm(x, lw.post_attn_layernorm, cfg.rms_eps)
+            self._trace(layer_idx, "moe.norm", h)
             use_prefetch = self.prefetcher is not None and not lw.experts_on_gpu
             if lw.experts_on_gpu:
                 moe_lw = lw
@@ -188,14 +239,24 @@ class MixtralForward:
                                  experts_on_gpu=True)
             else:
                 moe_lw = self._stage_experts(lw)
-            x = x + self.moe_fn(h, moe_lw, layer_idx)
+            if self.trace_observer is not None and self.moe_fn is naive_moe:
+                moe_output = naive_moe(
+                    h, moe_lw, layer_idx,
+                    trace=lambda name, tensor: self._trace(layer_idx, name, tensor),
+                )
+            else:
+                moe_output = self.moe_fn(h, moe_lw, layer_idx)
+            x = x + moe_output
+            self._trace(layer_idx, "layer.output", x)
             observer = getattr(self, "layer_observer", None)
             if observer is not None:
                 observer(layer_idx, x)
             if use_prefetch:
                 self.prefetcher.release(layer_idx)
         x = rms_norm(x, self.w.final_norm, cfg.rms_eps)
+        self._trace(-1, "final.norm", x)
         logits = F.linear(x, self.w.lm_head).float()
+        self._trace(-1, "logits", logits)
         if return_hidden:
             # EAGLE draft feature = the exact lm_head input (official ea_model:
             # base_model.model(...)[0], i.e. AFTER all layers + final_norm).

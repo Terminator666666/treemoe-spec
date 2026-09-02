@@ -77,6 +77,31 @@ def test_rope_uses_llama_half_split_layout():
     torch.testing.assert_close(out, torch.tensor([[[-3.0, -4.0, 1.0, 2.0]]]))
 
 
+def test_trace_observer_captures_attention_and_expert_intermediates(
+        tiny_model, tiny_config, rng):
+    ids = torch.randint(0, tiny_config.vocab_size, (5,), generator=rng)
+    trace = {}
+
+    def observe(layer_idx, name, tensor):
+        trace[(layer_idx, name)] = tensor.detach().clone()
+
+    tiny_model.trace_observer = observe
+    output = tiny_model.forward(ids, torch.arange(ids.shape[0]))
+
+    assert torch.equal(trace[(-1, "logits")], output)
+    for name in (
+        "layer.input", "attn.norm", "attn.q_proj", "attn.q_rope",
+        "attn.mask", "attn.context", "attn.output", "attn.residual",
+        "moe.norm", "moe.router_logits", "moe.router_probs",
+        "moe.topk_weights", "moe.topk_indices", "moe.output", "layer.output",
+    ):
+        assert (0, name) in trace
+    assert any(name.endswith(".gate") for _, name in trace)
+    assert any(name.endswith(".weighted") for _, name in trace)
+    assert trace[(0, "attn.mask")].dtype == torch.bool
+    assert trace[(0, "moe.topk_indices")].dtype == torch.int64
+
+
 def test_tree_forward_equals_path_forward(tiny_model, tiny_config, rng):
     """A linear-chain 'tree' must produce the same logits as plain AR decode."""
     prompt = torch.randint(0, tiny_config.vocab_size, (4,), generator=rng)
