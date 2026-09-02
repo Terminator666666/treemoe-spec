@@ -157,7 +157,7 @@ def _simulate_fused_route_bucket(x, router, accept, budget, tau=0.05, ep=16):
     max_blocks = e * max_bpe
 
     logits = torch.full((n, ep), float("-inf"))
-    logits[:, :e] = x.float() @ router.t().float()
+    logits[:, :e] = (x @ router.t()).float()
     gates = torch.softmax(logits, dim=-1)                       # pad lanes -> 0
 
     scores = (accept[:, None] * gates).sum(0)

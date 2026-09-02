@@ -1,7 +1,7 @@
 """Op1: tree-aware expert-stationary MoE kernel (embeds op3 budget routing).
 
 v1 = two-kernel fallback declared in spec §3.1 risk table, structured as:
-  Kernel A  route_and_bucket : fp32 router GEMM (cuBLAS) + budget routing +
+    Kernel A  route_and_bucket : BF16 router GEMM + FP32 softmax/budget routing +
             stable (expert, DFS) bucketing — all GPU tensor ops, zero CPU
             readback, CUDA-Graph safe. v2 fuses this into one Triton CTA.
   Kernel B1 grouped w1/w3 + SiLU-mul  (expert-stationary tiles, Triton)
@@ -76,8 +76,8 @@ def route_and_bucket(
     """
     n, _ = x.shape
     e = router_weight.shape[0]
-    logits = F.linear(x.float(), router_weight.float())
-    gates = torch.softmax(logits, dim=-1)
+    logits = F.linear(x, router_weight)
+    gates = torch.softmax(logits.float(), dim=-1)
     topk_ids, topk_gates = budget_route_ref(gates, node_accept_prob, expert_budget,
                                             top1_threshold=top1_threshold)
 
@@ -142,15 +142,18 @@ if HAS_TRITON:
         offs_e = tl.arange(0, EP)
         e_valid = offs_e < E
 
-        # ---- 1. router GEMM, fp32 accumulate (HPC-Ops finding) ----
+        # ---- 1. router GEMM: BF16 output, matching HF MixtralTopKRouter ----
         acc = tl.zeros((N, EP), dtype=tl.float32)
         for k0 in range(0, H, BK):
             ks = k0 + tl.arange(0, BK)
-            x_t = tl.load(x_ptr + offs_n[:, None] * H + ks[None, :]).to(tl.float32)
+            x_t = tl.load(x_ptr + offs_n[:, None] * H + ks[None, :])
             w_t = tl.load(router_ptr + offs_e[:, None] * H + ks[None, :],
-                          mask=e_valid[:, None], other=0.0).to(tl.float32)
+                          mask=e_valid[:, None], other=0.0)
             acc += tl.dot(x_t, tl.trans(w_t))
-        logits = tl.where(e_valid[None, :], acc, -float("inf"))
+        # torch F.linear(BF16, BF16) rounds its output to BF16 before HF
+        # promotes router logits to FP32 for softmax.
+        logits = acc.to(tl.bfloat16).to(tl.float32)
+        logits = tl.where(e_valid[None, :], logits, -float("inf"))
 
         # ---- 2. row softmax ----
         rmax = tl.max(logits, axis=1)

@@ -58,8 +58,8 @@ def route_and_bucket_ref(
     encoded as token*2+k. expert_offsets: [E+1] prefix sums. All GPU tensors,
     nothing read back to CPU (CUDA Graph red line).
     """
-    logits = F.linear(x.float(), router_weight.float())               # fp32 accumulate
-    gates = torch.softmax(logits, dim=-1)
+    logits = F.linear(x, router_weight)
+    gates = torch.softmax(logits.float(), dim=-1)
     topk_ids, topk_gates = budget_route_ref(gates, node_accept_prob, expert_budget)
 
     n = x.shape[0]

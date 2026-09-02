@@ -56,8 +56,10 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, positions:
 
 def naive_moe(x: torch.Tensor, lw: LayerWeights, _layer_idx: int) -> torch.Tensor:
     """HF-equivalent per-expert loop. x: [T, H] -> [T, H]."""
-    logits = F.linear(x.float(), lw.router.float())  # fp32 router (spec §3.1)
-    gates = torch.softmax(logits, dim=-1)
+    # HF MixtralTopKRouter runs the linear in the activation/weight dtype,
+    # then promotes the rounded logits to FP32 for softmax.
+    logits = F.linear(x, lw.router)
+    gates = torch.softmax(logits.float(), dim=-1)
     topg, topi = gates.topk(2, dim=-1)
     topg = topg / topg.sum(-1, keepdim=True)
     out = torch.zeros_like(x)

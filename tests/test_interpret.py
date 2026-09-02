@@ -21,7 +21,7 @@ if os.getenv("TRITON_INTERPRET", "0") != "1":
                 allow_module_level=True)
 
 from tests.conftest import make_moe_inputs
-from treemoe.kernels.op1_tree_moe import tree_moe_forward
+from treemoe.kernels.op1_tree_moe import route_and_bucket, route_experts, tree_moe_forward
 from treemoe.kernels.op4_commit import fused_verify_commit
 from treemoe.ref.tree_moe_ref import tree_moe_forward_ref
 from treemoe.ref.verify_ref import tree_verify_ref
@@ -36,15 +36,21 @@ def test_full_op1_pipeline_interpreted(rng, budget):
     x, w1, w2, w3, router, accept = make_moe_inputs(N, E, H, I, rng)
     out = tree_moe_forward(x, w1, w2, w3, router, accept, budget, deterministic=True)
     ref = tree_moe_forward_ref(x, w1, w2, w3, router, accept, budget)
-    torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(out, ref, rtol=1e-4, atol=5e-5)
+
+
+def test_fused_router_ids_match_bf16_reference(rng):
+    """BF16 router rounding must not change selected experts in Kernel A."""
+    x, _, _, _, router, accept = make_moe_inputs(N, E, H, I, rng)
+    routing = route_experts(x, router, accept, 4, I)
+    topk_ref, _, _, _, _, _ = route_and_bucket(x, router, accept, 4)
+    assert torch.equal(routing.ws.topk_flat, topk_ref.reshape(-1))
 
 
 def test_op1_two_phase_routing_interpreted(rng):
     """route_experts + tree_moe_forward(routing=...) on the interpreter:
     bitwise-equal to the single-call path; expert_ids() exposes the routed
     set for the op2 prefetch-repair contract."""
-    from treemoe.kernels.op1_tree_moe import route_experts
-
     x, w1, w2, w3, router, accept = make_moe_inputs(N, E, H, I, rng)
     inline = tree_moe_forward(x, w1, w2, w3, router, accept, 4, deterministic=True).clone()
     routing = route_experts(x, router, accept, 4, I)
@@ -59,7 +65,7 @@ def test_op1_atomic_path_interpreted(rng):
     x, w1, w2, w3, router, accept = make_moe_inputs(N, E, H, I, rng)
     out = tree_moe_forward(x, w1, w2, w3, router, accept, 8, deterministic=False)
     ref = tree_moe_forward_ref(x, w1, w2, w3, router, accept, 8)
-    torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(out, ref, rtol=1e-4, atol=5e-5)
 
 
 def test_op1_pipeline_n128_interpreted(rng):
@@ -69,7 +75,7 @@ def test_op1_pipeline_n128_interpreted(rng):
     x, w1, w2, w3, router, accept = make_moe_inputs(128, E, H, I, rng)
     out = tree_moe_forward(x, w1, w2, w3, router, accept, 8, deterministic=True)
     ref = tree_moe_forward_ref(x, w1, w2, w3, router, accept, 8)
-    torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(out, ref, rtol=1e-4, atol=5e-5)
 
 
 def test_op1_packed_weight_path_interpreted(rng):
