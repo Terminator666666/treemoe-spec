@@ -9,6 +9,8 @@ pilot_order2_b4_n64,pilot_budget_repeat,MT-Bench,offload,spec,4,64,2,32,0,2,true
 pilot_order2_b8_n64,pilot_budget_repeat,MT-Bench,offload,spec,8,64,2,32,0,2,true,true,0,1,complete,1084.96,0.9217,1.4241,,3.65,1.000,,,,,,,logs/pilot_budget_order_b4_b8_b5_b6_n64.log,,2026-09-02,Reverse-order repeat; TPOT differs 1.03% from first B=8 pilot
 pilot_budget_b5_n64,pilot_budget,MT-Bench,offload,spec,5,64,2,32,0,2,true,true,0,1,complete,1113.74,0.8979,1.3873,,3.05,0.744,,,,,,,logs/pilot_budget_order_b4_b8_b5_b6_n64.log,,2026-09-02,Pilot point is dominated by B=8 on both TPOT and accept length
 pilot_budget_b6_n64,pilot_budget,MT-Bench,offload,spec,6,64,2,32,0,2,true,true,0,1,complete,1141.81,0.8758,1.3532,,3.45,0.825,,,,,,,logs/pilot_budget_order_b4_b8_b5_b6_n64.log,,2026-09-02,Pilot point is dominated by B=8 on both TPOT and accept length
+pilot_budget_b2_n64,pilot_budget,MT-Bench,offload,spec,2,64,2,32,0,2,true,true,0,1,complete,719.76,1.3894,2.1466,,2.44,0.434,,,,,,,,,,2026-09-02,Reported console result; fastest pilot but approximate quality is not yet evaluated
+pilot_budget_b3_n64,pilot_budget,MT-Bench,offload,spec,3,64,2,32,0,2,true,true,0,1,complete,979.09,1.0214,1.5781,,2.25,0.552,,,,,,,,,,2026-09-02,Reported console result; dominated by B=2 in this two-prompt pilot and accept length is non-monotonic
 budget_b2_n64,main_budget,MT-Bench,offload,spec,2,64,20,128,0,2,true,true,0,3,pending,,,,,,,,,,,,,,,,,
 budget_b3_n64,main_budget,MT-Bench,offload,spec,3,64,20,128,0,2,true,true,0,3,pending,,,,,,,,,,,,,,,,,
 budget_b4_n64,main_budget,MT-Bench,offload,spec,4,64,20,128,0,2,true,true,0,3,pending,,,,,,,,,,,,,,,,,
