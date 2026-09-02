@@ -1,6 +1,6 @@
 experiment_id,category,dataset,layout,mode,budget,tree_size,num_prompts,max_new_tokens,top1_threshold,prefetch_depth,auto_bitmap,router_hint,cpu_expert_threshold,repeats,status,tpot_ms,tokens_per_second,speedup_vs_ar,generated_tokens,mean_accept_len,prefetch_hit_rate,repair_misses,cold_experts,quality_metric,quality_score,all_match,first_mismatch,artifact_path,log_path,git_commit,run_date,notes
 correctness_b8_n64,correctness,MT-Bench,offload,lossless,8,64,2,32,0,2,true,true,0,1,complete,,,,64,3.6471,,,,,,true,,artifacts/e2e_lossless.json,,46e6f0f,2026-09-02,Two prompts and 64 generated tokens matched AR; weighted speculative accept length is 62/17
-ar_mtbench_20x128,baseline,MT-Bench,offload,ar,,,20,128,0,2,true,true,0,3,pending,,,,,,,,,,,,,,,,,
+ar_mtbench_20x128,baseline,MT-Bench,offload,ar,,,20,128,0,2,true,true,0,1,complete,1545.07,0.6472,1.0,,,0.359,,,,,,,,,,2026-09-02,Reported console result; AR bypasses EAGLE router_hint so hit_rate is temporal-only; exact generated-token count and runner commit were not captured
 budget_b2_n64,main_budget,MT-Bench,offload,spec,2,64,20,128,0,2,true,true,0,3,pending,,,,,,,,,,,,,,,,,
 budget_b3_n64,main_budget,MT-Bench,offload,spec,3,64,20,128,0,2,true,true,0,3,pending,,,,,,,,,,,,,,,,,
 budget_b4_n64,main_budget,MT-Bench,offload,spec,4,64,20,128,0,2,true,true,0,3,pending,,,,,,,,,,,,,,,,,
