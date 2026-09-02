@@ -135,21 +135,31 @@ def test_ar_logits_match_hf():
 
     # ---- phase 1: HF reference tokens, then free everything ----
     print(f"[parity] phase 1/2: loading HF reference ({steps} greedy steps)", flush=True)
+    hf_device_map = "cpu" if layer_diag else ("cuda" if resident else "auto")
     hf = transformers.AutoModelForCausalLM.from_pretrained(
         model_dir, dtype=torch.bfloat16,
-        device_map="cuda" if resident else "auto",
-        max_memory=None if resident else {0: f"{hf_gpu_cap}GiB",
-                                          "cpu": "200GiB"},
+        device_map=hf_device_map,
+        max_memory=None if (resident or layer_diag) else {
+            0: f"{hf_gpu_cap}GiB", "cpu": "200GiB",
+        },
     )
-    ids = tok("The capital of France is", return_tensors="pt").input_ids[0].cuda()
+    ids_cpu = tok("The capital of France is", return_tensors="pt").input_ids[0]
     if layer_diag:
+        # transformers 5.x packs all eight experts into one ~2.8GB module.
+        # device_map="auto" keeps other layers resident and then OOMs when its
+        # hook stages that whole module on a 24GB card. Full cpu_offload keeps
+        # weights in host RAM and executes one module at a time on the same GPU.
+        from accelerate import cpu_offload
+
+        hf = cpu_offload(hf, execution_device=torch.device("cuda"))
         hf_forward = hf.model(
-            ids.unsqueeze(0), output_hidden_states=True, use_cache=False,
+            ids_cpu.unsqueeze(0).cuda(), output_hidden_states=True, use_cache=False,
         )
         hf_layers = [state[0].float().cpu() for state in hf_forward.hidden_states]
         hf_tokens, hf_scores = [], []
         print(f"[parity] HF layer references ready: {len(hf_layers)} states", flush=True)
     else:
+        ids = ids_cpu.cuda()
         hf_out = hf.generate(
             ids.unsqueeze(0), do_sample=False, max_new_tokens=steps,
             return_dict_in_generate=True, output_scores=True,
@@ -184,6 +194,7 @@ def test_ar_logits_match_hf():
 
         ours.layer_observer = compare_layer
 
+    ids = ids_cpu.cuda()
     pos = torch.arange(ids.shape[0], device="cuda")
     logits = ours.forward(ids, pos)
     if layer_diag:
