@@ -1,0 +1,25 @@
+experiment_id,category,dataset,layout,mode,budget,tree_size,num_prompts,max_new_tokens,top1_threshold,prefetch_depth,auto_bitmap,router_hint,cpu_expert_threshold,repeats,status,tpot_ms,tokens_per_second,speedup_vs_ar,generated_tokens,mean_accept_len,prefetch_hit_rate,repair_misses,cold_experts,quality_metric,quality_score,all_match,first_mismatch,artifact_path,log_path,git_commit,run_date,notes
+correctness_b8_n64,correctness,MT-Bench,offload,lossless,8,64,2,32,0,2,true,true,0,1,complete,,,,64,3.6471,,,,,,true,,artifacts/e2e_lossless.json,,46e6f0f,2026-09-02,Two prompts and 64 generated tokens matched AR; weighted speculative accept length is 62/17
+ar_mtbench_20x128,baseline,MT-Bench,offload,ar,,,20,128,0,2,true,true,0,3,pending,,,,,,,,,,,,,,,,,
+budget_b2_n64,main_budget,MT-Bench,offload,spec,2,64,20,128,0,2,true,true,0,3,pending,,,,,,,,,,,,,,,,,
+budget_b3_n64,main_budget,MT-Bench,offload,spec,3,64,20,128,0,2,true,true,0,3,pending,,,,,,,,,,,,,,,,,
+budget_b4_n64,main_budget,MT-Bench,offload,spec,4,64,20,128,0,2,true,true,0,3,pending,,,,,,,,,,,,,,,,,
+budget_b5_n64,main_budget,MT-Bench,offload,spec,5,64,20,128,0,2,true,true,0,3,pending,,,,,,,,,,,,,,,,,
+budget_b6_n64,main_budget,MT-Bench,offload,spec,6,64,20,128,0,2,true,true,0,3,pending,,,,,,,,,,,,,,,,,
+budget_b8_n64,main_budget,MT-Bench,offload,spec,8,64,20,128,0,2,true,true,0,3,pending,,,,,,,,,,,,,,,,,
+tree_b2_n16,tree_size,MT-Bench,offload,spec,2,16,20,128,0,2,true,true,0,3,pending,,,,,,,,,,,,,,,,,
+tree_b2_n32,tree_size,MT-Bench,offload,spec,2,32,20,128,0,2,true,true,0,3,pending,,,,,,,,,,,,,,,,,
+tree_b4_n16,tree_size,MT-Bench,offload,spec,4,16,20,128,0,2,true,true,0,3,pending,,,,,,,,,,,,,,,,,
+tree_b4_n32,tree_size,MT-Bench,offload,spec,4,32,20,128,0,2,true,true,0,3,pending,,,,,,,,,,,,,,,,,
+tree_b8_n16,tree_size,MT-Bench,offload,spec,8,16,20,128,0,2,true,true,0,3,pending,,,,,,,,,,,,,,,,,
+tree_b8_n32,tree_size,MT-Bench,offload,spec,8,32,20,128,0,2,true,true,0,3,pending,,,,,,,,,,,,,,,,,
+prefetch_temporal_b4,prefetch_ablation,MT-Bench,offload,spec,4,64,20,128,0,2,true,false,0,3,pending,,,,,,,,,,,,,,,,,Compare against budget_b4_n64 as the default arm
+prefetch_full_copy_b4,prefetch_ablation,MT-Bench,offload,spec,4,64,20,128,0,2,false,false,0,3,pending,,,,,,,,,,,,,,,,,Compare against budget_b4_n64 as the default arm
+top1_t005_b4,top1_ablation,MT-Bench,offload,spec,4,64,20,128,0.05,2,true,true,0,3,pending,,,,,,,,,,,,,,,,,
+quality_b2,quality,MT-Bench,offload,spec,2,64,80,128,0,2,true,true,0,1,pending,,,,,,,,,MT-Bench judge,,,,,,,,
+quality_b4,quality,MT-Bench,offload,spec,4,64,80,128,0,2,true,true,0,1,pending,,,,,,,,,MT-Bench judge,,,,,,,,
+quality_b8,quality,MT-Bench,offload,spec,8,64,80,128,0,2,true,true,0,1,pending,,,,,,,,,MT-Bench judge,,,,,,,,
+op1_n32,microbenchmark,synthetic,resident,op1,8,32,,,0,,,,,5,pending,,,,,,,,,,,,,,,,,
+op1_n64,microbenchmark,synthetic,resident,op1,8,64,,,0,,,,,5,pending,,,,,,,,,,,,,,,,,
+op1_n128,microbenchmark,synthetic,resident,op1,8,128,,,0,,,,,5,pending,,,,,,,,,,,,,,,,,
+op2_transfer_overlap,microbenchmark,synthetic,offload,op2,,,,,0,2,,,,5,pending,,,,,,,,,,,,,,,,,Record pinned and pageable H2D bandwidth plus op1 slowdown under active prefetch
