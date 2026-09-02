@@ -65,8 +65,13 @@ else
 fi
 
 # tier 3+ (needs the EAGLE draft checkpoint, yuhuili/EAGLE-mixtral-instruct-8x7B):
-#   real-model MAT measurement -- the draft-side fixes (tree topology mask,
-#   committed-KV pruning, prompt conditioning) should raise mean accept length;
-#   compare engine.stats.mean_accept_len against the pre-fix baseline.
+#   First run the lossless red line on official MT-bench prompts. This saves
+#   both token sequences and the first mismatch (if any) before any B<8 sweep:
+#   python benchmarks/bench_e2e.py --layout offload --check-lossless \
+#       --tree-sizes 64 --num-prompts 2 --max-new-tokens 32 \
+#       --output-json artifacts/e2e_lossless.json
+#   Then measure MAT -- the draft-side fixes (tree topology mask, committed-KV
+#   pruning, prompt conditioning) should raise mean accept length; compare
+#   mean_accept_len against the pre-fix baseline.
 
 echo "all tiers done"

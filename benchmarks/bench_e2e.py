@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -19,6 +20,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 import torch.nn.functional as F
+
+
+@torch.inference_mode()
+def ar_generate(target, prompt: torch.Tensor, max_new_tokens: int,
+                eos_token_id: int = 2) -> list[int]:
+    target.kv.reset()
+    positions = torch.arange(prompt.shape[0], device=prompt.device)
+    logits = target.forward(prompt, positions)
+    last = logits[-1].argmax().view(1)
+    output = [int(last)]
+    while len(output) < max_new_tokens and output[-1] != eos_token_id:
+        position = torch.tensor([target.kv.seq_len], device=prompt.device)
+        logits = target.forward(last, position)
+        last = logits[-1].argmax().view(1)
+        output.append(int(last))
+    return output
 
 
 def run_config(engine_factory, budget: int, tree_size: int, prompts: list[torch.Tensor],
@@ -56,6 +73,72 @@ def run_config(engine_factory, budget: int, tree_size: int, prompts: list[torch.
     return r
 
 
+def run_lossless_check(engine_factory, tree_size: int,
+                       prompts: list[torch.Tensor], max_new_tokens: int,
+                       output_path: Path) -> None:
+    ar_engine, ar_prefetcher = engine_factory(budget=8, tree_size=tree_size)
+    ar_outputs = []
+    for index, prompt in enumerate(prompts):
+        ar_outputs.append(ar_generate(ar_engine.target, prompt, max_new_tokens))
+        print(f"  lossless AR prompt {index + 1}/{len(prompts)} ready",
+              file=sys.stderr, flush=True)
+    del ar_engine, ar_prefetcher
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    spec_engine, spec_prefetcher = engine_factory(budget=8, tree_size=tree_size)
+    rows = []
+    all_match = True
+    for index, (prompt, ar_output) in enumerate(zip(prompts, ar_outputs, strict=True)):
+        steps_before = spec_engine.stats.steps
+        tokens_before = spec_engine.stats.tokens
+        spec_output = spec_engine.generate(prompt, max_new_tokens=max_new_tokens)
+        steps = spec_engine.stats.steps - steps_before
+        accepted_tokens = spec_engine.stats.tokens - tokens_before
+        first_mismatch = next(
+            (offset for offset, pair in enumerate(zip(ar_output, spec_output, strict=False))
+             if pair[0] != pair[1]),
+            None,
+        )
+        if first_mismatch is None and len(ar_output) != len(spec_output):
+            first_mismatch = min(len(ar_output), len(spec_output))
+        matched = first_mismatch is None
+        all_match &= matched
+        accept_len = accepted_tokens / max(steps, 1)
+        rows.append({
+            "prompt_index": index,
+            "input_ids": prompt.cpu().tolist(),
+            "ar_tokens": ar_output,
+            "spec_tokens": spec_output,
+            "match": matched,
+            "first_mismatch": first_mismatch,
+            "target_steps": steps,
+            "mean_accept_len": accept_len,
+        })
+        verdict = "PASS" if matched else f"FAIL@{first_mismatch}"
+        print(f"  lossless prompt {index + 1}/{len(prompts)}: {verdict} "
+              f"tokens={len(spec_output)} accept_len={accept_len:.2f}", flush=True)
+
+    artifact = {
+        "mode": "lossless",
+        "expert_budget": 8,
+        "top1_threshold": 0.0,
+        "tree_size": tree_size,
+        "max_new_tokens": max_new_tokens,
+        "all_match": all_match,
+        "prompts": rows,
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(artifact, indent=2) + "\n")
+    print(f"lossless artifact: {output_path}", flush=True)
+    del spec_engine, spec_prefetcher
+    gc.collect()
+    torch.cuda.empty_cache()
+    if not all_match:
+        raise RuntimeError("B=8 speculative output diverged from AR; see artifact")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir", default=None,
@@ -89,17 +172,25 @@ def main() -> None:
                     help="no checkpoint needed: random weights at real Mixtral "
                          "shapes. TPOT/hit_rate/streaming numbers are valid "
                          "(memory traffic ignores values); accept_len is NOT.")
-    ap.add_argument("--top1-threshold", type=float, default=0.05,
+    ap.add_argument("--top1-threshold", type=float, default=0.0,
                     help="op3: tree nodes with global acceptance prob below "
-                         "this degrade to top-1 routing (spec §3.3 step 4). "
-                         "0 disables. In the offload regime this saves GEMM "
-                         "flops only (staged bytes unchanged) but perturbs "
-                         "verification logits for most deep nodes.")
+                        "this degrade to top-1 routing (spec §3.3 step 4). "
+                        "Disabled by default because it is approximate. In "
+                        "the offload regime this saves GEMM flops only "
+                        "(staged bytes unchanged) but perturbs verification "
+                        "logits for most deep nodes.")
     ap.add_argument("--ar-baseline", action="store_true",
                     help="run plain greedy AR through the same offload plumbing "
                          "instead of the sweep (speedup denominator). Uses "
                          "budget=8: AR must be exact, no expert truncation.")
+    ap.add_argument("--check-lossless", action="store_true",
+                    help="compare B=8 speculative tokens against AR on every "
+                         "prompt and save a detailed JSON artifact")
+    ap.add_argument("--output-json", type=Path,
+                    default=Path("artifacts/e2e_lossless.json"))
     args = ap.parse_args()
+    if args.check_lossless and args.top1_threshold != 0:
+        ap.error("--check-lossless requires --top1-threshold 0")
 
     from treemoe.engine.loop import SpecDecodeEngine
     from treemoe.kernels.op1_tree_moe import route_experts, tree_moe_forward
@@ -161,7 +252,6 @@ def main() -> None:
         print("weights ready, starting benchmark", flush=True)
         # real MT-bench questions (first turns), same eval set as the official
         # EAGLE numbers — vendored from SafeAILab/EAGLE eagle/data/mt_bench
-        import json
         mt_path = Path(__file__).resolve().parent / "data" / "mt_bench.jsonl"
         with open(mt_path) as f:
             instructions = [json.loads(line)["turns"][0] for line in f]
@@ -239,6 +329,12 @@ def main() -> None:
 
     print(f"{'B':>3} {'N':>5} {'TPOT(ms)':>10} {'accept_len':>11} {'hit_rate':>9} {'cold':>6}",
           flush=True)
+    if args.check_lossless:
+        run_lossless_check(
+            factory, args.tree_sizes[0], prompts, args.max_new_tokens,
+            args.output_json,
+        )
+        return
     if args.ar_baseline:
         # same kv/prefetcher/moe_fn plumbing as the spec arms, no draft/tree:
         # prefill, then one token per forward. budget=8 => exact AR outputs.
@@ -248,16 +344,8 @@ def main() -> None:
         t0 = time.perf_counter()
         total = 0
         for i, p in enumerate(prompts):
-            positions = torch.arange(p.shape[0], device=p.device)
-            logits = target.forward(p, positions)
-            last = logits[-1].argmax().view(1)
-            n_gen = 1
-            while n_gen < args.max_new_tokens:
-                pos = torch.tensor([target.kv.seq_len], device=p.device)
-                logits = target.forward(last, pos)
-                last = logits[-1].argmax().view(1)
-                n_gen += 1
-            total += n_gen
+            output = ar_generate(target, p, args.max_new_tokens)
+            total += len(output)
             el = time.perf_counter() - t0
             print(f"  AR prompt {i + 1}/{len(prompts)} ({el:.0f}s elapsed, "
                   f"{el / total * 1e3:.0f}ms/tok)", file=sys.stderr, flush=True)

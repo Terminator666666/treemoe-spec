@@ -1,6 +1,8 @@
 """Task 1.3 gate: speculative decoding output == AR greedy (lossless, B=8);
 plus measurement-pipeline sanity (Task 0.2/0.3) on synthetic traces."""
 
+import json
+
 import pytest
 import torch
 
@@ -80,6 +82,51 @@ def test_spec_decode_lossless_vs_ar_long(engine_pair):
                                tree_size=8, max_depth=3, expert_budget=8)
         spec = eng.generate(prompt.clone(), max_new_tokens=40, eos_token_id=-1)
         assert spec == ar, f"seed {seed}"
+
+
+def test_reused_engine_resets_target_kv_between_prompts(engine_pair):
+    fresh, cfg = engine_pair
+    generator = torch.Generator().manual_seed(19)
+    first_prompt = torch.randint(0, cfg.vocab_size, (9,), generator=generator)
+    second_prompt = torch.randint(0, cfg.vocab_size, (4,), generator=generator)
+
+    reused = SpecDecodeEngine(fresh(), TinyDraft(cfg.vocab_size),
+                              tree_size=8, max_depth=3, expert_budget=8)
+    reused.generate(first_prompt, max_new_tokens=18, eos_token_id=-1)
+    reused_output = reused.generate(second_prompt, max_new_tokens=18, eos_token_id=-1)
+
+    clean = SpecDecodeEngine(fresh(), TinyDraft(cfg.vocab_size),
+                             tree_size=8, max_depth=3, expert_budget=8)
+    clean_output = clean.generate(second_prompt, max_new_tokens=18, eos_token_id=-1)
+    assert reused_output == clean_output
+
+
+def test_e2e_lossless_check_writes_matching_artifact(engine_pair, tmp_path):
+    from benchmarks.bench_e2e import run_lossless_check
+
+    fresh, cfg = engine_pair
+
+    def factory(budget, tree_size):
+        assert budget == 8
+        return SpecDecodeEngine(
+            fresh(), TinyDraft(cfg.vocab_size), tree_size=tree_size,
+            max_depth=3, expert_budget=budget,
+        ), None
+
+    generator = torch.Generator().manual_seed(23)
+    prompts = [
+        torch.randint(0, cfg.vocab_size, (length,), generator=generator)
+        for length in (4, 7)
+    ]
+    output_path = tmp_path / "lossless.json"
+    run_lossless_check(factory, tree_size=8, prompts=prompts,
+                       max_new_tokens=16, output_path=output_path)
+
+    artifact = json.loads(output_path.read_text())
+    assert artifact["all_match"] is True
+    assert len(artifact["prompts"]) == 2
+    assert all(row["match"] and row["first_mismatch"] is None
+               for row in artifact["prompts"])
 
 
 def random_eagle_weights(cfg, g):

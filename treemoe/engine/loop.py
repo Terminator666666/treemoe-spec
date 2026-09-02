@@ -146,17 +146,19 @@ class SpecDecodeEngine:
     @torch.inference_mode()
     def generate(self, prompt_ids: torch.Tensor, max_new_tokens: int = 128,
                  eos_token_id: int = 2) -> list[int]:
+        self.target.kv.reset()
         self.draft.reset()  # before prefill: prefill seeds the draft's committed KV
         logits, feature = self.prefill(prompt_ids)
         last = logits.argmax()
         out = [int(last)]
-        while len(out) < max_new_tokens:
+        while len(out) < max_new_tokens and out[-1] != eos_token_id:
             new_tokens, feature = self.step(last, feature)
             out.extend(new_tokens)
             # new_tokens[-1] is always the bonus token, which step() kept on
             # GPU — no host->device re-upload per step
             last = self._last_token_gpu
             if eos_token_id in new_tokens:
+                out = out[:out.index(eos_token_id) + 1]
                 break
         return out[:max_new_tokens]
 

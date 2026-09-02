@@ -42,6 +42,12 @@ class PagedKVCache:
 
     # ---------------- allocation ----------------
 
+    def reset(self) -> None:
+        """Start a new sequence without clearing the backing KV tensors."""
+        self._free.extend(reversed(self.block_table))
+        self.block_table.clear()
+        self.seq_len = 0
+
     def _ensure_capacity(self, new_len: int) -> None:
         while len(self.block_table) * self.block_size < new_len:
             if not self._free:
