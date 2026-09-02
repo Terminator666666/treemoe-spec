@@ -73,8 +73,14 @@ def bench_vllm(x, w1, w2, w3, router):
     except ImportError:
         return None
     w13 = torch.cat([w1, w3], dim=1).contiguous()  # vLLM packs gate+up
-    gating = x.float() @ router.t().float()
-    return timed(lambda: fused_moe(x, w13, w2, gating, topk=2, renormalize=True))
+
+    def run():
+        # Match op1's input/output boundary: both timings start from hidden
+        # states and include router-logit computation plus exact top-2 MoE.
+        gating = x.float() @ router.t().float()
+        return fused_moe(x, w13, w2, gating, topk=2, renormalize=True)
+
+    return timed(run)
 
 
 def bench_megablocks_note() -> str:
@@ -94,6 +100,12 @@ def main() -> None:
     peak = args.peak_gbs or detect_peak_gbs()
     print(f"device: {torch.cuda.get_device_name(0)}"
           + (f"  (peak {peak:.0f} GB/s)" if peak else "  (peak unknown: pass --peak-gbs)"))
+    try:
+        import vllm
+        print(f"vllm: {vllm.__version__}")
+    except ImportError:
+        print("vllm: not installed (baseline column will be skipped)")
+    print("scope: hidden states -> router logits -> exact top-2 MoE; BF16 weights/activations")
 
     g = torch.Generator(device="cuda").manual_seed(0)
     w1 = torch.randn(E, I, H, device="cuda", dtype=torch.bfloat16, generator=g) * 0.02
@@ -104,7 +116,9 @@ def main() -> None:
     print(f"{'N':>5} {'det(us)':>10} {'atomic(us)':>11} {'GB/s':>8} {'util':>6} {'vllm(us)':>10} {'ratio':>7}")
     for n in args.tree_sizes:
         x = torch.randn(n, H, device="cuda", dtype=torch.bfloat16, generator=g)
-        accept = torch.rand(n, device="cuda", generator=g)
+        # All ones disable low-probability top-1 degradation. With B=E=8,
+        # ours and vLLM therefore execute the same lossless top-2 semantics.
+        accept = torch.ones(n, device="cuda")
         # deterministic=True is the red-line path (fp32 partial round-trip +
         # combine launch); deterministic=False (atomic) is the production
         # perf path -- GB/s, util and the vLLM gate are measured on it
