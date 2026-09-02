@@ -102,6 +102,17 @@ def test_trace_observer_captures_attention_and_expert_intermediates(
     assert trace[(0, "moe.topk_indices")].dtype == torch.int64
 
 
+def test_hf_none_attention_mask_is_normalized_to_causal_visibility():
+    from benchmarks.diag_layer_parity import allowed_attention_mask
+
+    expected = torch.tril(torch.ones(4, 4, dtype=torch.bool))
+    assert torch.equal(allowed_attention_mask(None, 4), expected)
+
+    additive = torch.zeros(1, 1, 4, 4)
+    additive.masked_fill_(~expected.view(1, 1, 4, 4), torch.finfo(torch.float32).min)
+    assert torch.equal(allowed_attention_mask(additive, 4), expected)
+
+
 def test_tree_forward_equals_path_forward(tiny_model, tiny_config, rng):
     """A linear-chain 'tree' must produce the same logits as plain AR decode."""
     prompt = torch.randint(0, tiny_config.vocab_size, (4,), generator=rng)

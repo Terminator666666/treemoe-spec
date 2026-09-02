@@ -32,6 +32,15 @@ def snapshot(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.detach().cpu().clone()
 
 
+def allowed_attention_mask(causal_mask: torch.Tensor | None,
+                           sequence_length: int) -> torch.Tensor:
+    if causal_mask is None:
+        return torch.ones(
+            sequence_length, sequence_length, dtype=torch.bool,
+        ).tril()
+    return causal_mask[0, 0] == 0
+
+
 def add_derived_checkpoints(trace: dict[str, torch.Tensor], num_heads: int,
                             num_kv_heads: int, head_dim: int) -> None:
     for prefix, input_name in (
@@ -211,7 +220,9 @@ def run_hf(model_dir: str, output: Path) -> None:
                     input_ids.shape[0], model.config.num_key_value_heads, -1,
                 )
             )
-            trace["attn.mask"] = snapshot(causal_mask[0, 0] == 0)
+            trace["attn.mask"] = snapshot(
+                allowed_attention_mask(causal_mask, input_ids.shape[0]),
+            )
             trace["attn.residual"] = snapshot(
                 trace["layer.input"] + trace["attn.output"],
             )
