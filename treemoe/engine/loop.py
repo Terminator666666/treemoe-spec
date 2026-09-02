@@ -87,7 +87,7 @@ class SpecDecodeEngine:
         # router predicts which experts the verification pass will stage.
         pf = getattr(self.target, "prefetcher", None)
         if pf is not None and hasattr(pf, "router_hint"):
-            pf.router_hint(tree.features, self.expert_budget)
+            pf.router_hint(tree.features, self.expert_budget, tree.accept_prob)
 
         # op3 acceptance-weighted budget routing (spec §3.3): expose the tree's
         # global acceptance probabilities to the MoE routing hook so expert

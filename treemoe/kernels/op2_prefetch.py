@@ -182,7 +182,8 @@ class LayerPrefetcher:
         CPU here (one sync), so per-layer scheduling stays sync-free."""
         self._bitmap = None if bitmap is None else bitmap.detach().to("cpu", torch.bool)
 
-    def router_hint(self, features: torch.Tensor, budget: int) -> None:
+    def router_hint(self, features: torch.Tensor, budget: int,
+                    accept_prob: torch.Tensor | None = None) -> None:
         """Draft-guided router pre-execution (spec §3.2 headline path).
 
         Runs every layer's own router over the draft tree's EAGLE features
@@ -198,7 +199,12 @@ class LayerPrefetcher:
         if self._routers is None:
             self._routers = torch.stack([lw.router for lw in self.layers]).float()
         logits = torch.einsum("nh,leh->nle", features.float(), self._routers)
-        self._hint = torch.softmax(logits, dim=-1).sum(0).cpu()     # [L, E]
+        probs = torch.softmax(logits, dim=-1)                        # [N, L, E]
+        if accept_prob is not None:
+            # match op3's demand score s_e = sum_n p_accept(n) * g_{n,e} so the
+            # predictor ranks experts the way verification will actually route
+            probs = probs * accept_prob.float().view(-1, 1, 1)
+        self._hint = probs.sum(0).cpu()                              # [L, E]
         self._hint_budget = budget
 
     def _ensure_buffers(self, lw) -> None:

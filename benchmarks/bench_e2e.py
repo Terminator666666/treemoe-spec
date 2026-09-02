@@ -89,6 +89,12 @@ def main() -> None:
                     help="no checkpoint needed: random weights at real Mixtral "
                          "shapes. TPOT/hit_rate/streaming numbers are valid "
                          "(memory traffic ignores values); accept_len is NOT.")
+    ap.add_argument("--top1-threshold", type=float, default=0.05,
+                    help="op3: tree nodes with global acceptance prob below "
+                         "this degrade to top-1 routing (spec §3.3 step 4). "
+                         "0 disables. In the offload regime this saves GEMM "
+                         "flops only (staged bytes unchanged) but perturbs "
+                         "verification logits for most deep nodes.")
     ap.add_argument("--ar-baseline", action="store_true",
                     help="run plain greedy AR through the same offload plumbing "
                          "instead of the sweep (speedup denominator). Uses "
@@ -187,7 +193,8 @@ def main() -> None:
             if accept.shape[0] != x.shape[0]:
                 accept = torch.ones(x.shape[0], device=x.device)
             routing = route_experts(x, lw.router, accept, _b,
-                                    inter=lw.w1.shape[1])
+                                    inter=lw.w1.shape[1],
+                                    top1_threshold=args.top1_threshold)
             cold_x = []
             if pf is not None:
                 # exact-offload contract: one small D2H, then on-demand copies

@@ -66,6 +66,7 @@ def route_and_bucket(
     node_accept_prob: torch.Tensor,
     expert_budget: int,
     block_m: int = BM,
+    top1_threshold: float = 0.05,
 ):
     """Returns (topk_ids, topk_gates, padded_slots, block_expert_ids, num_blocks_max).
 
@@ -77,7 +78,8 @@ def route_and_bucket(
     e = router_weight.shape[0]
     logits = F.linear(x.float(), router_weight.float())
     gates = torch.softmax(logits, dim=-1)
-    topk_ids, topk_gates = budget_route_ref(gates, node_accept_prob, expert_budget)
+    topk_ids, topk_gates = budget_route_ref(gates, node_accept_prob, expert_budget,
+                                            top1_threshold=top1_threshold)
 
     flat_expert = topk_ids.reshape(-1)                       # [2N]
     order = torch.argsort(flat_expert, stable=True)          # DFS-stable in-expert
@@ -554,6 +556,7 @@ def route_experts(
     node_accept_prob: torch.Tensor,
     expert_budget: int,
     inter: int,
+    top1_threshold: float = 0.05,
 ) -> Routing:
     """Phase 1 of tree_moe_forward: op3 budget routing + bucketing (fused
     Kernel A or the torch fallback). Needs only the resident router weights;
@@ -580,7 +583,7 @@ def route_experts(
             x, router_weight, node_accept_prob,
             ws.topk_flat, ws.gates_flat, ws.padded_slots,
             ws.block_expert_ids, ws.slot_to_row,
-            expert_budget, 0.05,
+            expert_budget, top1_threshold,
             N=n, E=e, EP=16, H=hidden, BK=bk1,
             MAX_BPE=max_bpe, BLOCK_M=BM, MAX_BLOCKS=ws.max_blocks,
             # 32 warps: ptxas shows the O((2N)^2) rank matrix spills 7.6KB/thread
@@ -591,7 +594,8 @@ def route_experts(
         return Routing(ws, ws.gates_flat, ws.padded_slots,
                        ws.block_expert_ids, ws.slot_to_row, ws.max_blocks)
     _topk_ids, topk_gates, padded_slots, block_expert_ids, slot_to_row, max_blocks = route_and_bucket(
-        x, router_weight, node_accept_prob, expert_budget
+        x, router_weight, node_accept_prob, expert_budget,
+        top1_threshold=top1_threshold,
     )
     gates_flat = topk_gates.reshape(-1).float().contiguous()   # index by slot id
     return Routing(ws, gates_flat, padded_slots, block_expert_ids,
