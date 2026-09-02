@@ -46,6 +46,7 @@ class LayerWeights:
     w2: torch.Tensor
     w3: torch.Tensor
     experts_on_gpu: bool = True
+    gate_up: torch.Tensor | None = None  # optional HF-layout [E, 2I, H]
 
 
 @dataclass

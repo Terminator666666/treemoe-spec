@@ -76,28 +76,34 @@ def naive_moe(
         trace("moe.topk_weights", topg)
         trace("moe.topk_indices", topi)
     out = torch.zeros_like(x)
+    expert_mask = F.one_hot(topi, num_classes=lw.w1.shape[0]).permute(2, 1, 0)
     for e in range(lw.w1.shape[0]):
-        for k in range(2):
-            sel = topi[:, k] == e
-            if not sel.any():
-                continue
-            token_indices = sel.nonzero(as_tuple=False).flatten()
-            xe = x[sel]
+        top_k_pos, token_indices = torch.where(expert_mask[e])
+        if token_indices.numel() == 0:
+            continue
+        xe = x[token_indices]
+        if lw.gate_up is not None:
+            gate, up = F.linear(xe, lw.gate_up[e]).chunk(2, dim=-1)
+        else:
             gate = xe @ lw.w1[e].t()
             up = xe @ lw.w3[e].t()
-            activated = F.silu(gate) * up
-            down = activated @ lw.w2[e].t()
-            weighted = down * topg[sel, k : k + 1].to(x.dtype)
-            out[sel] += weighted
-            if trace is not None:
+        activated = F.silu(gate) * up
+        down = activated @ lw.w2[e].t()
+        weighted = down * topg[token_indices, top_k_pos, None]
+        out.index_add_(0, token_indices, weighted.to(out.dtype))
+        if trace is not None:
+            for k in range(2):
+                selected = top_k_pos == k
+                if not selected.any():
+                    continue
                 prefix = f"moe.expert_{e}.slot_{k}"
-                trace(f"{prefix}.token_indices", token_indices)
-                trace(f"{prefix}.input", xe)
-                trace(f"{prefix}.gate", gate)
-                trace(f"{prefix}.up", up)
-                trace(f"{prefix}.activated", activated)
-                trace(f"{prefix}.down", down)
-                trace(f"{prefix}.weighted", weighted)
+                trace(f"{prefix}.token_indices", token_indices[selected])
+                trace(f"{prefix}.input", xe[selected])
+                trace(f"{prefix}.gate", gate[selected])
+                trace(f"{prefix}.up", up[selected])
+                trace(f"{prefix}.activated", activated[selected])
+                trace(f"{prefix}.down", down[selected])
+                trace(f"{prefix}.weighted", weighted[selected])
     if trace is not None:
         trace("moe.output", out)
     return out
@@ -131,11 +137,32 @@ class MixtralForward:
         The performance path is op2's ring-buffer prefetcher (config B)."""
         dev = lw.router.device
         if self._staging is None:
-            self._staging = {
-                "w1": torch.empty_like(lw.w1, device=dev),
-                "w2": torch.empty_like(lw.w2, device=dev),
-                "w3": torch.empty_like(lw.w3, device=dev),
-            }
+            if self.moe_fn is naive_moe:
+                self._staging = {
+                    "gate_up": torch.empty(
+                        lw.w1.shape[0], lw.w1.shape[1] + lw.w3.shape[1],
+                        lw.w1.shape[2], dtype=lw.w1.dtype, device=dev,
+                    ),
+                    "w2": torch.empty_like(lw.w2, device=dev),
+                }
+            else:
+                self._staging = {
+                    "w1": torch.empty_like(lw.w1, device=dev),
+                    "w2": torch.empty_like(lw.w2, device=dev),
+                    "w3": torch.empty_like(lw.w3, device=dev),
+                }
+        if self.moe_fn is naive_moe:
+            intermediate_dim = lw.w1.shape[1]
+            gate_up = self._staging["gate_up"]
+            staged_w1 = gate_up[:, :intermediate_dim]
+            staged_w3 = gate_up[:, intermediate_dim:]
+            staged_w1.copy_(lw.w1, non_blocking=True)
+            self._staging["w2"].copy_(lw.w2, non_blocking=True)
+            staged_w3.copy_(lw.w3, non_blocking=True)
+            return replace(
+                lw, w1=staged_w1, w2=self._staging["w2"], w3=staged_w3,
+                gate_up=gate_up, experts_on_gpu=True,
+            )
         self._staging["w1"].copy_(lw.w1, non_blocking=True)
         self._staging["w2"].copy_(lw.w2, non_blocking=True)
         self._staging["w3"].copy_(lw.w3, non_blocking=True)
@@ -187,17 +214,34 @@ class MixtralForward:
             # (was 32 hidden syncs/step in the AR decode path)
             mask = (torch.arange(total, device=x.device)[None, :]
                     <= positions[:, None])
-            self._trace(layer_idx, "attn.mask", mask)
+        self._trace(layer_idx, "attn.mask", mask)
 
-        qh = q.transpose(0, 1)          # [heads, T, hd]
-        kh = full_k.transpose(0, 1)     # [kv_heads, S, hd]
-        vh = full_v.transpose(0, 1)
+        qh = q.transpose(0, 1).unsqueeze(0)       # [1, heads, T, hd]
+        kh = full_k.transpose(0, 1).unsqueeze(0)  # [1, kv_heads, S, hd]
+        vh = full_v.transpose(0, 1).unsqueeze(0)
+        if not is_tree and start_pos == 0 and full_k.shape[0] == t:
+            # Match HF's unpadded prefill: no materialized mask, and causal
+            # dispatch only when q_length > 1.
+            attention_mask = None
+            is_causal = t > 1
+        elif not is_tree and t == 1 and full_k.shape[0] == start_pos + 1:
+            # HF decode sets is_causal=False for q_length=1; the lone query
+            # can see the entire committed prefix.
+            attention_mask = None
+            is_causal = False
+        else:
+            attention_mask = mask.unsqueeze(0).unsqueeze(0)
+            is_causal = False
         # enable_gqa: SDPA maps q head h -> kv head h // (heads/kv_heads)
         # internally, same grouping as the old repeat_interleave but without
         # materializing a 4x copy of the whole K/V prefix per layer per step.
-        o = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=mask.unsqueeze(0),
-                                           enable_gqa=True)
-        o = o.transpose(0, 1).reshape(t, cfg.num_heads * cfg.head_dim)
+        o = F.scaled_dot_product_attention(
+            qh, kh, vh, attn_mask=attention_mask, dropout_p=0.0,
+            is_causal=is_causal, scale=cfg.head_dim**-0.5, enable_gqa=True,
+        )
+        o = o.transpose(1, 2).contiguous().reshape(
+            1, t, cfg.num_heads * cfg.head_dim,
+        )[0]
         self._trace(layer_idx, "attn.context", o)
         output = F.linear(o, lw.attn["o_proj"])
         self._trace(layer_idx, "attn.output", output)

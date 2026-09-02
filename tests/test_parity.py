@@ -8,6 +8,7 @@ import os
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from treemoe.model.config import MixtralConfig
 from treemoe.model.kv_cache import PagedKVCache
@@ -100,6 +101,35 @@ def test_trace_observer_captures_attention_and_expert_intermediates(
     assert any(name.endswith(".weighted") for _, name in trace)
     assert trace[(0, "attn.mask")].dtype == torch.bool
     assert trace[(0, "moe.topk_indices")].dtype == torch.int64
+
+
+def test_sdpa_dispatch_matches_hf_prefill_and_decode(
+        tiny_model, tiny_config, rng, monkeypatch):
+    calls = []
+    original_sdpa = F.scaled_dot_product_attention
+
+    def observe_sdpa(query, key, value, **kwargs):
+        calls.append((query.ndim, key.ndim, kwargs["attn_mask"], kwargs["is_causal"]))
+        return original_sdpa(query, key, value, **kwargs)
+
+    monkeypatch.setattr(F, "scaled_dot_product_attention", observe_sdpa)
+    prompt = torch.randint(0, tiny_config.vocab_size, (4,), generator=rng)
+    tiny_model.forward(prompt, torch.arange(4))
+    prefill_calls = calls[:tiny_config.num_layers]
+    assert all(qdim == kdim == 4 and mask is None and is_causal
+               for qdim, kdim, mask, is_causal in prefill_calls)
+
+    tiny_model.forward(prompt[:1], torch.tensor([4]))
+    decode_calls = calls[tiny_config.num_layers:2 * tiny_config.num_layers]
+    assert all(qdim == kdim == 4 and mask is None and not is_causal
+               for qdim, kdim, mask, is_causal in decode_calls)
+
+    tree_mask = torch.tril(torch.ones(2, 2, dtype=torch.bool))
+    tiny_model.forward(prompt[:2], torch.tensor([5, 6]), tree_mask=tree_mask)
+    tree_calls = calls[2 * tiny_config.num_layers:]
+    assert all(qdim == kdim == 4 and mask is not None and mask.dtype == torch.bool
+               and mask.ndim == 4 and not is_causal
+               for qdim, kdim, mask, is_causal in tree_calls)
 
 
 def test_hf_none_attention_mask_is_normalized_to_causal_visibility():
