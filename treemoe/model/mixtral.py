@@ -26,7 +26,9 @@ MoEFn = Callable[[torch.Tensor, LayerWeights, int], torch.Tensor]
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     x32 = x.float()
     x32 = x32 * torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + eps)
-    return (x32 * weight.float()).to(x.dtype)
+    # Match HF MixtralRMSNorm exactly: normalize in FP32, cast the normalized
+    # activations back to the input dtype, then multiply by the native weight.
+    return weight * x32.to(x.dtype)
 
 
 def build_rope_cache(config: MixtralConfig, device: str) -> tuple[torch.Tensor, torch.Tensor]:
@@ -41,7 +43,10 @@ def build_rope_cache(config: MixtralConfig, device: str) -> tuple[torch.Tensor, 
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, positions: torch.Tensor):
     # x: [T, heads, head_dim]; positions: [T]
-    c, s = cos[positions].unsqueeze(1), sin[positions].unsqueeze(1)  # [T,1,hd/2]
+    # HF rotary embeddings cast cos/sin to the activation dtype before the
+    # multiply; retaining FP32 here changes BF16 rounding at every layer.
+    c = cos[positions].to(x.dtype).unsqueeze(1)
+    s = sin[positions].to(x.dtype).unsqueeze(1)  # [T,1,hd/2]
     x1, x2 = x[..., 0::2], x[..., 1::2]
     out = torch.empty_like(x)
     out[..., 0::2] = x1 * c - x2 * s

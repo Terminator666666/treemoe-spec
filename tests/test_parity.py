@@ -165,29 +165,34 @@ def test_ar_logits_match_hf():
     pos = torch.arange(ids.shape[0], device="cuda")
     logits = ours.forward(ids, pos)
     our_tokens = []
-    first_mismatch = None
+    mismatches = []
     for step in range(steps):
         our_score = logits[-1].float()
         our_token = int(our_score.argmax())
         our_tokens.append(our_token)
         hf_token = hf_tokens[step]
-        if our_token != hf_token and first_mismatch is None:
-            hf_score = hf_scores[step].to(our_score.device)
-            hf_top2 = torch.topk(hf_score, 2)
-            first_mismatch = {
+        hf_score = hf_scores[step].to(our_score.device)
+        hf_top2 = torch.topk(hf_score, 2)
+        max_abs = float((our_score - hf_score).abs().max())
+        hf_margin = float(hf_top2.values[0] - hf_top2.values[1])
+        if our_token != hf_token:
+            mismatches.append({
                 "step": step,
                 "ours": our_token,
                 "hf": hf_token,
-                "hf_margin": float(hf_top2.values[0] - hf_top2.values[1]),
-                "max_abs": float((our_score - hf_score).abs().max()),
+                "hf_margin": hf_margin,
+                "max_abs": max_abs,
                 "ours_at_hf": float(our_score[hf_token]),
                 "ours_at_ours": float(our_score[our_token]),
-            }
+                "hf_rank_of_ours": int((hf_score > hf_score[our_token]).sum()) + 1,
+                "ours_rank_of_hf": int((our_score > our_score[hf_token]).sum()) + 1,
+            })
         print(f"[parity] step {step + 1}/{steps}: "
-              f"ours={our_token} hf={hf_token}", flush=True)
+              f"ours={our_token} hf={hf_token} "
+              f"max_abs={max_abs:.4f} hf_margin={hf_margin:.4f}", flush=True)
         # Teacher-force the HF token so one close argmax flip cannot poison all
         # later positions; persistent errors then indicate a real forward bug.
         p = torch.tensor([kv.seq_len], device="cuda")
         token = torch.tensor([hf_token], device="cuda")
         logits = ours.forward(token, p)
-    assert our_tokens == hf_tokens, f"first mismatch diagnostics: {first_mismatch}"
+    assert our_tokens == hf_tokens, f"mismatch diagnostics: {mismatches}"
