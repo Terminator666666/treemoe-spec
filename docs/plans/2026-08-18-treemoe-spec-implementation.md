@@ -7,6 +7,8 @@
 >
 > **Current Architecture**: Python draft/tree loop → tree-aware MoE 验证；专家 H2D 在侧流预取；
 > greedy verify/KV commit 使用 Triton，随后由主机读回接受结果并维护序列状态。
+> 论文将接受概率感知的树级专家预算，以及 EAGLE feature 引导的零训练预取与 offload 协同列为
+> 两项核心贡献；MoE Triton kernel 和 GPU verify/KV commit 作为系统实现优化。
 >
 > **Tech Stack**: Python 3.12 + PyTorch + Triton + transformers + safetensors + pytest。实际硬件为
 > RTX 4090 24GB，专家权重原生 BF16，经 host pinned memory offload。
@@ -79,7 +81,7 @@ treemoe-spec/
 
 ---
 
-## Phase 2 — 算子 1 + 算子 3（核心，4 人周）
+## Phase 2 — 核心贡献：树级专家预算与支撑 MoE kernel（4 人周）
 
 ### Task 2.1 参考实现与测试先行
 - `treemoe/ref/tree_moe_ref.py`：spec §3.1 签名的纯 PyTorch 实现（含预算路由逻辑）；
@@ -123,7 +125,7 @@ treemoe-spec/
 
 ---
 
-## Phase 4 — 算子 2 零训练预取（已实现，消融待补）
+## Phase 4 — 核心贡献：零训练预取与 offload 协同（已实现，消融待补）
 
 ### Task 4.1 训练式跨层路由预测器（取消）
 - `RouterPredictor` 和 `measurements/train_predictor.py` 保留为实验原型；
@@ -151,7 +153,7 @@ treemoe-spec/
 |---|---|---|
 | M0 | 观测三图 + 决策门 | 1 周 |
 | M1 | 正确的最小推测解码系统 | 3 周 |
-| M2 | 算子 1+3 落地，kernel 级验收门通过 | 7 周 |
+| M2 | 树级专家预算与支撑 MoE kernel 落地 | 7 周 |
 | M3 | greedy Triton verify/KV commit；CUDA Graph 取消 | 已完成（不含 Graph） |
 | M4 | 零训练预取接入，正式消融待测 | 进行中 |
 | M5 | 4090 论文实验齐全 | 进行中 |

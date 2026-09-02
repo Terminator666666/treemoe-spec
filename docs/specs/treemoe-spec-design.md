@@ -1,17 +1,18 @@
 # TreeMoE-Spec 当前实现规格（v3）
 
 > 一个不依赖 vLLM/SGLang 的 MoE 推测解码原型，目标模型为 Mixtral-8x7B-Instruct，草稿模型使用
-> EAGLE-2 动态树。当前论文贡献集中在三个已接入端到端路径的机制：树感知 MoE 核、接受概率加权
-> 的专家预算路由，以及带缺失修复的零训练专家预取。树验证与 KV 提交使用 Triton 内核加速。
+> EAGLE-2 动态树。当前论文贡献收敛为两个已接入端到端路径的机制：接受概率感知的树级专家预算，
+> 以及 EAGLE feature 引导的零训练专家预取与 offload 协同。树感知 MoE 核、greedy 树验证和 KV
+> 提交是承载上述机制的系统实现优化，不作为独立算法创新。
 > 参考库：Tencent HPC-Ops、DeepSeek DeepGEMM、Databricks MegaBlocks、FlashInfer、vLLM fused_moe。
 
 ### 实现边界
 
 | 模块 | 当前状态 | 论文口径 |
 |---|---|---|
-| 树感知 expert-stationary MoE | 已实现并接入 | 核心贡献 |
-| 接受概率加权预算路由 | 已内嵌路由核，B=8 可回到原始 top-2 | 核心贡献 |
-| temporal + EAGLE router hint 预取 | 已实现，miss repair 保证 staged 权重正确 | 核心贡献 |
+| 接受概率感知的树级专家预算 | 已内嵌路由核，B=8 可回到原始 top-2 | 核心贡献 |
+| EAGLE feature 引导的零训练预取与 offload 协同 | 已实现 temporal/history 合并，miss repair 保证 staged 权重正确 | 核心贡献 |
+| 树感知 expert-stationary MoE | 已实现并接入，承载预算后的专家分桶和计算 | 系统实现优化，不单列创新 |
 | greedy 树验证与 KV 提交 | 已实现 Triton 三核路径 | 系统实现优化 |
 | 训练式 `RouterPredictor` | 仅有实验类和训练脚本，未训练、未加载到运行时 | 不作为论文贡献或实验配置 |
 | 全步 CUDA Graph | `StepGraph` 仅为原型，未接入；当前循环仍有 Python 建树和主机读回 | 不纳入性能结论，列为未来工作 |
@@ -94,7 +95,7 @@ Python 控制循环
 
 ## 3. 算子详细设计
 
-### 3.1 算子 1：树感知专家驻留 MoE 核（核心贡献）
+### 3.1 算子 1：树感知专家驻留 MoE 核（系统实现）
 
 **签名（当前多阶段 Triton 方案）**
 
@@ -146,7 +147,7 @@ def tree_moe_forward(
 按权重字节估算的有效带宽和峰值利用率。安装 vLLM 时额外报告同一输入输出边界下的 `fused_moe`；
 当前环境没有完成 MegaBlocks、DeepGEMM 或 CUTLASS 的公平实测，不把它们列入最终结果表。
 
-### 3.2 算子 2：零训练路由预测与可修复专家预取
+### 3.2 核心贡献：EAGLE feature 引导的零训练专家预取与 offload 协同
 
 当前系统没有训练额外预测网络。预取位图来自两个无需训练的信号：
 
@@ -162,7 +163,7 @@ host pinned 权重通过侧流复制到深度为 2 的 GPU 环形缓冲。目标
 `bench_e2e.py` 中加载。论文评估使用 staged expert 数、真实路由命中率、repair miss 和 TPOT，不报告
 训练预测器的 recall@2/recall@4。
 
-### 3.3 算子 3：预算约束的树验证路由（内嵌于算子 1 Kernel A）
+### 3.3 核心贡献：接受概率感知的树级专家预算（内嵌于算子 1 Kernel A）
 
 逐层执行，输入本层真实 router 输出（非预测）：
 
