@@ -1,9 +1,9 @@
 """Op1: tree-aware expert-stationary MoE kernel (embeds op3 budget routing).
 
 v1 = two-kernel fallback declared in spec §3.1 risk table, structured as:
-    Kernel A  route_and_bucket : BF16 router GEMM + FP32 softmax/budget routing +
-            stable (expert, DFS) bucketing — all GPU tensor ops, zero CPU
-            readback, CUDA-Graph safe. v2 fuses this into one Triton CTA.
+    Router      F.linear(BF16) + FP32 softmax, exactly matching HF numerics.
+    Kernel A    acceptance-weighted budget routing + stable (expert, DFS)
+                            bucketing in one Triton CTA, with zero CPU readback.
   Kernel B1 grouped w1/w3 + SiLU-mul  (expert-stationary tiles, Triton)
   Kernel B2 grouped w2 + gate-scaled scatter-add, split-k over I (Triton)
 
@@ -57,7 +57,7 @@ GEMM2_WARPS, GEMM2_STAGES = 8, 3   # 4090 sweep top-1 (ties within noise)
 
 
 # --------------------------------------------------------------------------
-# Kernel A — route_and_bucket (graph-safe torch composition, v2: fuse in Triton)
+# Kernel A — exact-HF router followed by fused budget/demand/bucket
 # --------------------------------------------------------------------------
 
 def route_and_bucket(
@@ -68,6 +68,7 @@ def route_and_bucket(
     block_m: int = BM,
     top1_threshold: float = 0.05,
     return_demand: bool = False,
+    router_gates: torch.Tensor | None = None,
 ):
     """Returns (topk_ids, topk_gates, padded_slots, block_expert_ids, num_blocks_max).
 
@@ -77,8 +78,11 @@ def route_and_bucket(
     """
     n, _ = x.shape
     e = router_weight.shape[0]
-    logits = F.linear(x, router_weight)
-    gates = torch.softmax(logits.float(), dim=-1)
+    if router_gates is None:
+        logits = F.linear(x, router_weight)
+        gates = torch.softmax(logits.float(), dim=-1)
+    else:
+        gates = router_gates
     topk_ids, topk_gates = budget_route_ref(gates, node_accept_prob, expert_budget,
                                             top1_threshold=top1_threshold)
 
@@ -125,21 +129,21 @@ def route_and_bucket(
 if HAS_TRITON:
 
     @triton.jit
-    def _route_bucket_fused_kernel(
-        x_ptr, router_ptr, accept_ptr,
+    def _budget_bucket_fused_kernel(
+        gates_ptr, accept_ptr,
         topk_ids_ptr, gates_flat_ptr, padded_slots_ptr,
         block_expert_ids_ptr, slot_to_row_ptr, demand_ptr,
         expert_budget, tau,
         N: tl.constexpr, E: tl.constexpr, EP: tl.constexpr,   # EP = 16 (pow2 pad)
-        H: tl.constexpr, BK: tl.constexpr,
         MAX_BPE: tl.constexpr, BLOCK_M: tl.constexpr, MAX_BLOCKS: tl.constexpr,
     ):
-        """Kernel A v2: the whole route+bucket pipeline in ONE program.
+        """Fuse acceptance-weighted budgeting and bucketing in one program.
 
         Production precedent: vLLM fuses topk_softmax and moe_align_block_size
         into single CUDA kernels (csrc/moe/) instead of chains of torch ops —
-        at decode batch sizes launch overhead rivals the math. This replaces
-        ~8 kernel launches per layer with 1.
+        at decode batch sizes launch overhead rivals the math. Router gates are
+        computed by PyTorch first so BF16 GEMM and FP32 softmax exactly follow
+        the HF path across Triton/cuBLAS versions.
 
         Serial-friendly sizes: N<=128 nodes, E=8 experts; the O((2N)^2) stable
         rank is a 128x128 vectorized comparison, trivial for one CTA.
@@ -148,25 +152,13 @@ if HAS_TRITON:
         offs_e = tl.arange(0, EP)
         e_valid = offs_e < E
 
-        # ---- 1. router GEMM: BF16 output, matching HF MixtralTopKRouter ----
-        acc = tl.zeros((N, EP), dtype=tl.float32)
-        for k0 in range(0, H, BK):
-            ks = k0 + tl.arange(0, BK)
-            x_t = tl.load(x_ptr + offs_n[:, None] * H + ks[None, :])
-            w_t = tl.load(router_ptr + offs_e[:, None] * H + ks[None, :],
-                          mask=e_valid[:, None], other=0.0)
-            acc += tl.dot(x_t, tl.trans(w_t))
-        # torch F.linear(BF16, BF16) rounds its output to BF16 before HF
-        # promotes router logits to FP32 for softmax.
-        logits = acc.to(tl.bfloat16).to(tl.float32)
-        logits = tl.where(e_valid[None, :], logits, -float("inf"))
+        # ---- 1. exact-HF router probabilities, padded to EP lanes ----
+        gates = tl.load(
+            gates_ptr + offs_n[:, None] * E + offs_e[None, :],
+            mask=e_valid[None, :], other=0.0,
+        ).to(tl.float32)
 
-        # ---- 2. row softmax ----
-        rmax = tl.max(logits, axis=1)
-        expl = tl.exp(logits - rmax[:, None])
-        gates = expl / tl.sum(expl, axis=1)[:, None]          # [N, EP]
-
-        # ---- 3. op3 budget routing: acceptance-weighted expert demand ----
+        # ---- 2. op3 budget routing: acceptance-weighted expert demand ----
         accept = tl.load(accept_ptr + offs_n).to(tl.float32)  # [N]
         scores = tl.sum(accept[:, None] * gates, axis=0)      # [EP]
         scores = tl.where(e_valid, scores, -float("inf"))
@@ -177,7 +169,7 @@ if HAS_TRITON:
             am = tl.argmax(cand, axis=0)
             keep = keep | ((offs_e == am) & (i < expert_budget))
 
-        # ---- 4. in-budget top-2 + p/(p1+p2) renorm + tau degradation ----
+        # ---- 3. in-budget top-2 + p/(p1+p2) renorm + tau degradation ----
         mg = tl.where(keep[None, :], gates, 0.0)
         i1 = tl.argmax(mg, axis=1)                            # [N]
         g1 = tl.max(mg, axis=1)
@@ -197,7 +189,7 @@ if HAS_TRITON:
         tl.store(gates_flat_ptr + offs_n * 2, tg1)
         tl.store(gates_flat_ptr + offs_n * 2 + 1, tg2)
 
-        # ---- 5. stable (expert, DFS) bucketing via O((2N)^2) rank ----
+        # ---- 4. stable (expert, DFS) bucketing via O((2N)^2) rank ----
         # fe stays in registers (tl.interleave): same-CTA global store->load
         # reread is an L1-coherence hazard production kernels avoid
         slots = tl.arange(0, 2 * N)
@@ -220,7 +212,7 @@ if HAS_TRITON:
             val = tl.sum(tl.where(hit, slots[None, :] + 1, 0), axis=1) - 1
             tl.store(padded_slots_ptr + pos, val.to(tl.int64))
 
-        # ---- 6. per-block expert ids (blocks past ceil(count/BM) masked -1) ----
+        # ---- 5. per-block expert ids (blocks past ceil(count/BM) masked -1) ----
         counts = tl.sum((fe[None, :] == offs_e[:, None]).to(tl.int32), axis=1)  # [EP]
         blocks_needed = (counts + BLOCK_M - 1) // BLOCK_M
         blk = tl.arange(0, MAX_BLOCKS)
@@ -581,22 +573,23 @@ def route_experts(
     if ws is None:
         ws = _ws_cache[key] = _Workspace(n, e, hidden, inter, x.device, x.dtype)
 
-    bk1 = BK1 if hidden % BK1 == 0 else hidden
     max_bpe = (2 * n + BM - 1) // BM
-    # fused Kernel A: single-CTA route+bucket (1 launch vs ~8 torch ops).
+    # Exact-HF router math followed by a single-CTA budget+bucket kernel.
     # N<=64: zero spill (nw=32, 64 regs). N=128: the O((2N)^2) rank matrix
     # spills ~0.5KB/thread (AOT ptxas, sm_90a) -- accepted: single CTA, one
     # launch per layer, vs the ~570us/layer launch-gap cost of the torch
     # fallback measured on the 4090 (N=128 was 76% peak vs 89% at N<=64).
     use_fused_a = ((n & (n - 1)) == 0 and 16 <= n <= 128 and e <= 16
                    and os.getenv("TREEMOE_FUSED_A") != "0")  # debug: force torch routing
+    logits = F.linear(x, router_weight)
+    gates = torch.softmax(logits.float(), dim=-1).contiguous()
     if use_fused_a:
-        _route_bucket_fused_kernel[(1,)](
-            x, router_weight, node_accept_prob,
+        _budget_bucket_fused_kernel[(1,)](
+            gates, node_accept_prob,
             ws.topk_flat, ws.gates_flat, ws.padded_slots,
             ws.block_expert_ids, ws.slot_to_row, ws.demand,
             expert_budget, top1_threshold,
-            N=n, E=e, EP=16, H=hidden, BK=bk1,
+            N=n, E=e, EP=16,
             MAX_BPE=max_bpe, BLOCK_M=BM, MAX_BLOCKS=ws.max_blocks,
             # 32 warps: ptxas shows the O((2N)^2) rank matrix spills 7.6KB/thread
             # at 4 warps; spreading it over 1024 threads -> regs 255->64,
@@ -611,6 +604,7 @@ def route_experts(
         x, router_weight, node_accept_prob, expert_budget,
         top1_threshold=top1_threshold,
         return_demand=True,
+        router_gates=gates,
     )
     gates_flat = topk_gates.reshape(-1).float().contiguous()   # index by slot id
     return Routing(ws, gates_flat, padded_slots, block_expert_ids,

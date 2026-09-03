@@ -150,7 +150,7 @@ def test_greedy_all_negative_logits():
 # ---------------- fused Kernel A: register-level algorithm simulation ----------------
 
 def _simulate_fused_route_bucket(x, router, accept, budget, tau=0.05, ep=16):
-    """Line-by-line torch port of _route_bucket_fused_kernel (op1_tree_moe.py)."""
+    """Line-by-line torch port of _budget_bucket_fused_kernel (op1_tree_moe.py)."""
     n = x.shape[0]
     e = router.shape[0]
     max_bpe = (2 * n + BM - 1) // BM

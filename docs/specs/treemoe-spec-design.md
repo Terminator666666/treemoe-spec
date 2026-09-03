@@ -114,12 +114,11 @@ def tree_moe_forward(
 ) -> None
 ```
 
-**阶段 A — route_and_bucket**
-1. router GEMM：x[64,4096] @ router_weight.T[4096,8] → logits[64,8]，**FP32 累加**
-   （HPC-Ops 单列 Route GEMM 证明 router 对精度敏感，BF16 累加会翻转 top-2 边界样本）；
-2. softmax + top-2 → topk_ids[64,2], topk_gates[64,2]；
-3. **算子 3 内嵌于此**：预算路由（见 3.3），产出修正后的 topk_ids/gates；
-4. 片上 radix bucket（SMEM 内计数 + 前缀和）：产出
+**阶段 A — exact router + fused budget/demand/bucket**
+1. router 使用与 HF 相同的 BF16 `F.linear`，其 BF16 logits 转 FP32 后 softmax。不能在单 CTA 内另算
+  router GEMM：Triton tensor-core 与 cuBLAS 的合法 reduction 顺序不同，在边界样本上会翻转 top-k；
+2. `_budget_bucket_fused_kernel` 读取 FP32 gates，在单 CTA 内聚合完整 demand 并执行算子 3 的预算路由；
+3. 同一 CTA 完成稳定 bucket，产出
    - `sorted_token_ids[128]`：按 (expert, DFS序) 排序的 token 槽位
    - `expert_offsets[E+1]`：每专家 token 段的前缀和
    - `num_tokens_per_expert[8]`：由 GPU 写出，MoE 路由和分桶阶段不需要逐专家 CPU 读回。

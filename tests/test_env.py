@@ -1,6 +1,7 @@
 """Task 0.1 gate: environment + model availability (marked, skipped on dev boxes)."""
 
 import os
+import gc
 
 import pytest
 import torch
@@ -22,18 +23,24 @@ def test_mixtral_forward_one_token():
     # on 24GB cards (4090). Override via TEST_ENV_GPU_CAP_GIB when needed.
     gpu_cap = max(8, int(total_gb) - 8)
     gpu_cap = int(os.getenv("TEST_ENV_GPU_CAP_GIB", str(gpu_cap)))
-    model = transformers.AutoModelForCausalLM.from_pretrained(
-        MODEL, dtype=torch.bfloat16, device_map="auto",
-        # cap GPU usage so accelerate offloads to host RAM on small cards
-        max_memory={0: f"{gpu_cap}GiB", "cpu": "220GiB"},
-    )
-    ids = tok("hello", return_tensors="pt").input_ids.to(model.device)
+    model = None
+    out = None
     try:
+        model = transformers.AutoModelForCausalLM.from_pretrained(
+            MODEL, dtype=torch.bfloat16, device_map="auto",
+            # cap GPU usage so accelerate offloads to host RAM on small cards
+            max_memory={0: f"{gpu_cap}GiB", "cpu": "220GiB"},
+        )
+        ids = tok("hello", return_tensors="pt").input_ids.to(model.device)
         out = model(ids)
+        assert out.logits.shape[-1] == 32000
     except torch.OutOfMemoryError:
         pytest.skip(
             "HF env smoke hit CUDA OOM during expert dispatch on this GPU. "
             "Retry with TEST_ENV_GPU_CAP_GIB=12 and "
             "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
         )
-    assert out.logits.shape[-1] == 32000
+    finally:
+        del out, model
+        gc.collect()
+        torch.cuda.empty_cache()

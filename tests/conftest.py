@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import gc
+
 import pytest
 import torch
 
@@ -24,6 +26,15 @@ def tiny_config() -> MixtralConfig:
 def rng():
     g = torch.Generator().manual_seed(1234)
     return g
+
+
+@pytest.fixture(autouse=True)
+def cleanup_cuda_after_gpu_test(request):
+    """Prevent model/offload hooks from starving later kernel tests."""
+    yield
+    if request.node.get_closest_marker("gpu") is not None and torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 def make_moe_inputs(n: int, e: int, h: int, i: int, g: torch.Generator, dtype=torch.float32):

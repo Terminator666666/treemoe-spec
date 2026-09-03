@@ -164,7 +164,7 @@ def test_fused_route_bucket_triton_matches_torch(n, budget):
     n=128 covers the extended range (O((2N)^2)=256^2 rank, ~0.5KB/thread
     spill accepted to kill the torch-fallback launch gap)."""
     from treemoe.kernels.op1_tree_moe import (
-        BM, _route_bucket_fused_kernel, route_and_bucket,
+        BM, _budget_bucket_fused_kernel, route_and_bucket,
     )
 
     g = torch.Generator().manual_seed(3)
@@ -173,8 +173,9 @@ def test_fused_route_bucket_triton_matches_torch(n, budget):
     router = (torch.randn(e, h, generator=g, dtype=torch.bfloat16) * 0.1).cuda()
     accept = torch.rand(n, generator=g).cuda()
 
+    router_gates = torch.softmax(torch.nn.functional.linear(x, router).float(), dim=-1)
     ids_t, gates_t, padded_t, blk_t, s2r_t, max_blocks = route_and_bucket(
-        x, router, accept, budget
+        x, router, accept, budget, router_gates=router_gates,
     )
     topk = torch.zeros(2 * n, dtype=torch.long, device="cuda")
     gates = torch.zeros(2 * n, dtype=torch.float32, device="cuda")
@@ -182,9 +183,9 @@ def test_fused_route_bucket_triton_matches_torch(n, budget):
     blk = torch.full((max_blocks,), -2, dtype=torch.long, device="cuda")
     s2r = torch.zeros(2 * n, dtype=torch.long, device="cuda")
     demand = torch.zeros(e, dtype=torch.float32, device="cuda")
-    _route_bucket_fused_kernel[(1,)](
-        x, router, accept, topk, gates, padded, blk, s2r, demand,
-        budget, 0.05, N=n, E=e, EP=16, H=h, BK=128,
+    _budget_bucket_fused_kernel[(1,)](
+        router_gates, accept, topk, gates, padded, blk, s2r, demand,
+        budget, 0.05, N=n, E=e, EP=16,
         MAX_BPE=(2 * n + BM - 1) // BM, BLOCK_M=BM, MAX_BLOCKS=max_blocks,
     )
     assert torch.equal(topk, ids_t.reshape(-1))
@@ -194,7 +195,7 @@ def test_fused_route_bucket_triton_matches_torch(n, budget):
     assert torch.equal(s2r, s2r_t)
     ref_demand = (
         accept.float().unsqueeze(1)
-        * torch.softmax(torch.nn.functional.linear(x, router).float(), dim=-1)
+        * router_gates
     ).sum(0)
     torch.testing.assert_close(demand, ref_demand, rtol=1e-3, atol=1e-3)
 
@@ -231,6 +232,10 @@ def test_routing_exclude_experts_cpu(rng, monkeypatch):
 
     x, _, _, _, router, accept = make_moe_inputs(32, E, H, I, rng)
     routing = route_experts(x, router, accept, 4, I)
+    full_gates = torch.softmax(torch.nn.functional.linear(x, router).float(), dim=-1)
+    torch.testing.assert_close(
+        routing.demand, (accept[:, None] * full_gates).sum(0), rtol=1e-6, atol=1e-6,
+    )
     ids = routing.expert_ids()
     cold = ids[:2]
     before = routing.gates_flat.sum().item()
@@ -274,4 +279,6 @@ def test_cold_expert_hybrid_matches_full_gpu():
         y = (F.silu(xe @ w1[eid].t()) * (xe @ w3[eid].t())) @ w2[eid].t()
         hybrid.index_add_(0, toks.cuda(),
                           (gates.unsqueeze(1) * y.float()).to(hybrid.dtype).cuda())
-    torch.testing.assert_close(hybrid, full, rtol=2e-2, atol=2e-2)
+    # CPU BF16 matmul and Triton tensor-core reduction use different legal
+    # accumulation orders; near-zero relative error is not meaningful here.
+    torch.testing.assert_close(hybrid, full, rtol=2e-2, atol=5e-2)

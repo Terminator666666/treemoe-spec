@@ -184,6 +184,38 @@ def test_offload_staging_matches_resident(tiny_config, rng):
     assert torch.equal(resident, staged)  # bitwise: staging is a pure copy
 
 
+def test_offload_staging_preserves_gate_up_layout(tiny_config, rng):
+    """A loader-provided fused gate_up matrix must keep its GEMM semantics."""
+    import dataclasses
+
+    w = random_weights(tiny_config, rng)
+    layers = [dataclasses.replace(
+        layer,
+        gate_up=torch.cat([layer.w1, layer.w3], dim=1),
+        experts_on_gpu=False,
+    ) for layer in w.layers]
+    w_off = dataclasses.replace(w, layers=layers)
+    ids = torch.randint(0, tiny_config.vocab_size, (5,), generator=rng)
+    pos = torch.arange(5)
+
+    resident_weights = dataclasses.replace(
+        w, layers=[dataclasses.replace(layer, gate_up=off.gate_up)
+                   for layer, off in zip(w.layers, layers, strict=True)],
+    )
+    resident = MixtralForward(
+        resident_weights,
+        PagedKVCache(tiny_config, num_blocks=8, device="cpu", dtype=tiny_config.dtype),
+        moe_fn=naive_moe,
+    ).forward(ids, pos)
+    staged = MixtralForward(
+        w_off,
+        PagedKVCache(tiny_config, num_blocks=8, device="cpu", dtype=tiny_config.dtype),
+        moe_fn=naive_moe,
+    ).forward(ids, pos)
+
+    assert torch.equal(resident, staged)
+
+
 @pytest.mark.model
 @pytest.mark.gpu
 def test_ar_logits_match_hf():

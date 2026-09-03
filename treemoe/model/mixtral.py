@@ -137,37 +137,33 @@ class MixtralForward:
         The performance path is op2's ring-buffer prefetcher (config B)."""
         dev = lw.router.device
         if self._staging is None:
-            if self.moe_fn is naive_moe:
-                self._staging = {
-                    "gate_up": torch.empty(
-                        lw.w1.shape[0], lw.w1.shape[1] + lw.w3.shape[1],
-                        lw.w1.shape[2], dtype=lw.w1.dtype, device=dev,
-                    ),
-                    "w2": torch.empty_like(lw.w2, device=dev),
-                }
-            else:
+            if lw.gate_up is None:
                 self._staging = {
                     "w1": torch.empty_like(lw.w1, device=dev),
                     "w2": torch.empty_like(lw.w2, device=dev),
                     "w3": torch.empty_like(lw.w3, device=dev),
                 }
-        if self.moe_fn is naive_moe:
+            else:
+                self._staging = {
+                    "gate_up": torch.empty_like(lw.gate_up, device=dev),
+                    "w2": torch.empty_like(lw.w2, device=dev),
+                }
+        if lw.gate_up is not None:
+            self._staging["gate_up"].copy_(lw.gate_up, non_blocking=True)
+            self._staging["w2"].copy_(lw.w2, non_blocking=True)
             intermediate_dim = lw.w1.shape[1]
             gate_up = self._staging["gate_up"]
-            staged_w1 = gate_up[:, :intermediate_dim]
-            staged_w3 = gate_up[:, intermediate_dim:]
-            staged_w1.copy_(lw.w1, non_blocking=True)
-            self._staging["w2"].copy_(lw.w2, non_blocking=True)
-            staged_w3.copy_(lw.w3, non_blocking=True)
             return replace(
-                lw, w1=staged_w1, w2=self._staging["w2"], w3=staged_w3,
+                lw, w1=gate_up[:, :intermediate_dim],
+                w2=self._staging["w2"], w3=gate_up[:, intermediate_dim:],
                 gate_up=gate_up, experts_on_gpu=True,
             )
         self._staging["w1"].copy_(lw.w1, non_blocking=True)
         self._staging["w2"].copy_(lw.w2, non_blocking=True)
         self._staging["w3"].copy_(lw.w3, non_blocking=True)
         return replace(lw, w1=self._staging["w1"], w2=self._staging["w2"],
-                       w3=self._staging["w3"], experts_on_gpu=True)
+                       w3=self._staging["w3"], gate_up=None,
+                       experts_on_gpu=True)
 
     # ---------------- attention ----------------
 

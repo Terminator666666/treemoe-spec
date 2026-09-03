@@ -22,7 +22,8 @@ benchmarks/       与 vLLM fused_moe / MegaBlocks / DeepGEMM / CUTLASS 的 kerne
 ## 测试
 
 ```bash
-pytest -m "not gpu and not model"   # CPU 逻辑测试（树/路由/采样参考实现）
-pytest -m gpu                       # kernel 数值对齐（需 CUDA）
-pytest -m model                     # 端到端一致性（需 Mixtral/EAGLE 权重）
+pytest -m "not gpu and not model and not interpret"  # CPU 逻辑测试
+TRITON_INTERPRET=1 pytest -m interpret               # CPU 执行真实 Triton IR
+pytest -m "gpu and not model"                        # kernel 数值对齐（需 CUDA）
+pytest -m "gpu and model"                            # 单独进程跑真实模型一致性
 ```

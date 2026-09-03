@@ -45,6 +45,9 @@ def test_fused_router_ids_match_bf16_reference(rng):
     routing = route_experts(x, router, accept, 4, I)
     topk_ref, _, _, _, _, _ = route_and_bucket(x, router, accept, 4)
     assert torch.equal(routing.ws.topk_flat, topk_ref.reshape(-1))
+    full_gates = torch.softmax(torch.nn.functional.linear(x, router).float(), dim=-1)
+    expected_demand = (accept[:, None] * full_gates).sum(0)
+    torch.testing.assert_close(routing.demand, expected_demand, rtol=1e-5, atol=1e-6)
 
 
 def test_op1_two_phase_routing_interpreted(rng):

@@ -85,15 +85,15 @@ def _mixtral_specs() -> list[Spec]:
     i64, f32, bf16 = "*i64", "*fp32", "*bf16"
     return [
         Spec(
-            "op1 Kernel A (fused route+bucket)", op1._route_bucket_fused_kernel,
-            {"x_ptr": bf16, "router_ptr": bf16, "accept_ptr": f32,
+            "op1 Kernel A (fused budget+bucket)", op1._budget_bucket_fused_kernel,
+            {"gates_ptr": f32, "accept_ptr": f32,
              "topk_ids_ptr": i64, "gates_flat_ptr": f32, "padded_slots_ptr": i64,
              "block_expert_ids_ptr": i64, "slot_to_row_ptr": i64, "demand_ptr": f32,
              "expert_budget": "i32", "tau": "fp32",
              "N": "constexpr", "E": "constexpr", "EP": "constexpr",
-             "H": "constexpr", "BK": "constexpr", "MAX_BPE": "constexpr",
+             "MAX_BPE": "constexpr",
              "BLOCK_M": "constexpr", "MAX_BLOCKS": "constexpr"},
-            {"N": N, "E": E, "EP": 16, "H": H, "BK": BK1,
+            {"N": N, "E": E, "EP": 16,
              "MAX_BPE": (2 * N + BM - 1) // BM, "BLOCK_M": BM, "MAX_BLOCKS": MAX_BLOCKS},
             num_warps=32, num_stages=1, grid=(1,),
             note="single CTA by design; latency-critical, not occupancy-critical",

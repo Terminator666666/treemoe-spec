@@ -88,9 +88,9 @@ treemoe-spec/
 - `tests/test_op1.py`：随机路由/极端路由（全 token 同专家、专家空载）/B∈{2,4,8} 共 12 个 case，
   先对 ref 自测通过。
 
-### Task 2.2 Kernel A（route_and_bucket, Triton）
-- `treemoe/kernels/op1_tree_moe.py::_route_bucket_kernel`：router GEMM(FP32 acc) + top-2 +
-  预算路由（spec §3.3 的 4 步）+ SMEM radix bucket，单 CTA；
+### Task 2.2 Kernel A（budget_and_bucket, Triton）
+- router 使用与 HF 同源的 BF16 `F.linear` + FP32 softmax，避免 Triton 与 cuBLAS reduction 顺序不同导致
+  top-k 翻转；`_budget_bucket_fused_kernel` 将需求统计、预算路由和稳定 bucket 融合为单 CTA；
 - 输出 `sorted_token_ids/expert_offsets` 全 GPU 侧；
 - 测试：与 ref 的 bucket 结果逐元素一致（排序稳定性用 (expert, dfs_order) 双键）。
 

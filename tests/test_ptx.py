@@ -5,7 +5,7 @@ can't silently regress them:
   * all kernels AOT-compile for sm_90a (caught a real int32/i64 bug once)
   * zero register spill at production launch configs
   * L2 eviction hints survive into PTX (Triton may drop them silently)
-  * Kernel A's router GEMM uses Hopper wgmma (N=64 unlocks m64 tiles)
+    * Kernel A consumes exact-HF gates and must not contain a second router GEMM
 
 Skipped when ptxas is unavailable or under TRITON_INTERPRET=1.
 """
@@ -89,10 +89,10 @@ def test_eviction_hints_survive_to_ptx(compiled):
         assert "evict_last" in ptx, f"{name}: reuse hint dropped"
 
 
-def test_kernel_a_uses_wgmma(compiled):
-    s, build = compiled["op1 Kernel A (fused route+bucket)"]
+def test_kernel_a_does_not_duplicate_router_gemm(compiled):
+    s, build = compiled["op1 Kernel A (fused budget+bucket)"]
     ptx = _ptx(build, s.name)
-    assert "wgmma" in ptx, "router GEMM lost Hopper wgmma (N=64 m-tile)"
+    assert "wgmma" not in ptx and "mma.sync" not in ptx
 
 
 def _nvdisasm():
