@@ -145,8 +145,8 @@ if HAS_TRITON:
         computed by PyTorch first so BF16 GEMM and FP32 softmax exactly follow
         the HF path across Triton/cuBLAS versions.
 
-        Serial-friendly sizes: N<=128 nodes, E=8 experts; the O((2N)^2) stable
-        rank is a 128x128 vectorized comparison, trivial for one CTA.
+        Production sizes: N<=64 nodes, E=8 experts; the O((2N)^2) stable rank
+        stays spill-free in one CTA. N=128 uses the exact torch fallback.
         """
         offs_n = tl.arange(0, N)                  # tree nodes (N = pow2 tree size)
         offs_e = tl.arange(0, EP)
@@ -164,18 +164,20 @@ if HAS_TRITON:
         scores = tl.where(e_valid, scores, -float("inf"))
         tl.store(demand_ptr + offs_e, scores, mask=e_valid)
         keep = tl.zeros((EP,), dtype=tl.int1)
-        for i in tl.static_range(E):                          # top-B, first-occurrence ties
-            cand = tl.where(keep, -float("inf"), scores)
-            am = tl.argmax(cand, axis=0)
-            keep = keep | ((offs_e == am) & (i < expert_budget))
+        for rank in tl.static_range(E):                       # top-B, left tie-break
+            candidate = tl.where(keep, -float("inf"), scores)
+            best_expert = tl.argmax(candidate, axis=0)
+            keep = keep | ((offs_e == best_expert) & (rank < expert_budget))
 
         # ---- 3. in-budget top-2 + p/(p1+p2) renorm + tau degradation ----
-        mg = tl.where(keep[None, :], gates, 0.0)
-        i1 = tl.argmax(mg, axis=1)                            # [N]
-        g1 = tl.max(mg, axis=1)
-        mg2 = tl.where(offs_e[None, :] == i1[:, None], 0.0, mg)
-        i2 = tl.argmax(mg2, axis=1)
-        g2 = tl.max(mg2, axis=1)
+        masked_gates = tl.where(keep[None, :], gates, 0.0)
+        i1 = tl.argmax(masked_gates, axis=1)
+        g1 = tl.max(masked_gates, axis=1)
+        second_gates = tl.where(
+            offs_e[None, :] == i1[:, None], 0.0, masked_gates
+        )
+        i2 = tl.argmax(second_gates, axis=1)
+        g2 = tl.max(second_gates, axis=1)
         s = g1 + g2
         tg1 = g1 / s
         tg2 = g2 / s
@@ -575,11 +577,11 @@ def route_experts(
 
     max_bpe = (2 * n + BM - 1) // BM
     # Exact-HF router math followed by a single-CTA budget+bucket kernel.
-    # N<=64: zero spill (nw=32, 64 regs). N=128: the O((2N)^2) rank matrix
-    # spills ~0.5KB/thread (AOT ptxas, sm_90a) -- accepted: single CTA, one
-    # launch per layer, vs the ~570us/layer launch-gap cost of the torch
-    # fallback measured on the 4090 (N=128 was 76% peak vs 89% at N<=64).
-    use_fused_a = ((n & (n - 1)) == 0 and 16 <= n <= 128 and e <= 16
+    # N<=64 compiles with zero spill. N=128's O((2N)^2) rank matrix spills
+    # ~0.5KB/thread and has shown cross-warp argmax miscompilation on sm_89;
+    # keep it on the exact torch fallback rather than expanding the kernel's
+    # correctness domain beyond the production tree sizes.
+    use_fused_a = ((n & (n - 1)) == 0 and 16 <= n <= 64 and e <= 16
                    and os.getenv("TREEMOE_FUSED_A") != "0")  # debug: force torch routing
     logits = F.linear(x, router_weight)
     gates = torch.softmax(logits.float(), dim=-1).contiguous()

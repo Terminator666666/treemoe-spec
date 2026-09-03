@@ -123,6 +123,9 @@ def tree_moe_forward(
    - `expert_offsets[E+1]`：每专家 token 段的前缀和
    - `num_tokens_per_expert[8]`：由 GPU 写出，MoE 路由和分桶阶段不需要逐专家 CPU 读回。
 
+生产 fused 路径覆盖 N≤64。N=128 的二次稳定 rank 矩阵在 sm_89 上产生约 0.5KB/thread spill，并观察到
+跨 warp argmax 错选，因此明确回退到同 gates 的 PyTorch bucket；正式端到端实验只使用 N≤64。
+
 **阶段 B/C — expert-stationary GEMM1/GEMM2（主计算核）**
 
 当前实现分两阶段计算原生 Mixtral FFN：GEMM1 同时读取 w1/w3，融合 SiLU 与逐元素乘法后把 BF16

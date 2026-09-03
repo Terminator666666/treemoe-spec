@@ -72,9 +72,7 @@ def test_op1_atomic_path_interpreted(rng):
 
 
 def test_op1_pipeline_n128_interpreted(rng):
-    """N=128 now takes fused Kernel A (extended from N<=64): exercises the
-    O((2N)^2)=256^2 stable-rank and the RB-blocked inverse scatter at the
-    largest supported tree size."""
+    """N=128 uses the exact torch routing fallback plus Triton expert GEMMs."""
     x, w1, w2, w3, router, accept = make_moe_inputs(128, E, H, I, rng)
     out = tree_moe_forward(x, w1, w2, w3, router, accept, 8, deterministic=True)
     ref = tree_moe_forward_ref(x, w1, w2, w3, router, accept, 8)

@@ -157,12 +157,10 @@ def test_triton_deterministic_bitwise():
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("n", [64, 128])
+@pytest.mark.parametrize("n", [64])
 @pytest.mark.parametrize("budget", [2, 4, 8])
 def test_fused_route_bucket_triton_matches_torch(n, budget):
-    """Fused single-CTA Kernel A vs the torch composition, on device.
-    n=128 covers the extended range (O((2N)^2)=256^2 rank, ~0.5KB/thread
-    spill accepted to kill the torch-fallback launch gap)."""
+    """Fused single-CTA Kernel A vs the torch composition, on device."""
     from treemoe.kernels.op1_tree_moe import (
         BM, _budget_bucket_fused_kernel, route_and_bucket,
     )
@@ -198,6 +196,36 @@ def test_fused_route_bucket_triton_matches_torch(n, budget):
         * router_gates
     ).sum(0)
     torch.testing.assert_close(demand, ref_demand, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("budget", [2, 4, 8])
+def test_n128_production_routing_uses_exact_fallback(budget):
+    """N=128 stays exact rather than entering the spilling fused kernel."""
+    from treemoe.kernels.op1_tree_moe import route_and_bucket, route_experts
+
+    generator = torch.Generator().manual_seed(3)
+    n, experts, hidden = 128, 8, 4096
+    x = torch.randn(n, hidden, generator=generator, dtype=torch.bfloat16).cuda()
+    router = (torch.randn(
+        experts, hidden, generator=generator, dtype=torch.bfloat16,
+    ) * 0.1).cuda()
+    accept = torch.rand(n, generator=generator).cuda()
+
+    routing = route_experts(x, router, accept, budget, inter=14336)
+    ids, gates, padded, blocks, slot_to_row, max_blocks = route_and_bucket(
+        x, router, accept, budget,
+    )
+
+    assert torch.equal(routing.gates_flat, gates.reshape(-1).float())
+    assert torch.equal(routing.padded_slots, padded)
+    assert torch.equal(routing.block_expert_ids, blocks)
+    assert torch.equal(routing.slot_to_row, slot_to_row)
+    assert routing.max_blocks == max_blocks
+    full_gates = torch.softmax(torch.nn.functional.linear(x, router).float(), dim=-1)
+    torch.testing.assert_close(
+        routing.demand, (accept[:, None] * full_gates).sum(0), rtol=1e-6, atol=1e-6,
+    )
 
 
 @pytest.mark.gpu
