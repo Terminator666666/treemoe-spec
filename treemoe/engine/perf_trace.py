@@ -22,6 +22,8 @@ class ExecutionTracer:
         self.current_record: dict | None = None
         self.current_layer: dict | None = None
         self._pending: list[tuple[dict, torch.cuda.Event, torch.cuda.Event]] = []
+        self._record_started = 0.0
+        self._record_start_event: torch.cuda.Event | None = None
 
     def begin_prefill(self, num_tokens: int, device: torch.device) -> dict:
         record = {
@@ -33,6 +35,7 @@ class ExecutionTracer:
         }
         self.prefills.append(record)
         self.current_record = record
+        self._start_record(record)
         return record
 
     def begin_step(self, index: int, root_position: int,
@@ -47,11 +50,29 @@ class ExecutionTracer:
         }
         self.steps.append(record)
         self.current_record = record
+        self._start_record(record)
         return record
 
     def end_record(self) -> None:
+        if self.current_record is not None:
+            timing = self.current_record.setdefault("timing_ms", {}).setdefault(
+                "total", {"host": 0.0, "gpu": 0.0},
+            )
+            timing["host"] += (time.perf_counter() - self._record_started) * 1e3
+            if self._record_start_event is not None:
+                end = torch.cuda.Event(enable_timing=True)
+                end.record()
+                self._pending.append((timing, self._record_start_event, end))
         self.current_record = None
         self.current_layer = None
+        self._record_start_event = None
+
+    def _start_record(self, record: dict) -> None:
+        self._record_started = time.perf_counter()
+        self._record_start_event = None
+        if record["device"] == "cuda" and torch.cuda.is_available():
+            self._record_start_event = torch.cuda.Event(enable_timing=True)
+            self._record_start_event.record()
 
     def begin_layer(self, layer_index: int) -> dict | None:
         if self.current_record is None:

@@ -28,6 +28,7 @@ def test_execution_tracer_records_host_phases_and_tree_paths():
     result = tracer.to_dict()["steps"][0]
 
     assert result["timing_ms"]["draft_tree"]["host"] >= 1.0
+    assert result["timing_ms"]["total"]["host"] >= 1.0
     assert result["tree"]["paths"] == [[0], [0, 1], [0, 1, 2], [0, 3]]
     assert result["tree"]["depth"] == [0, 1, 2, 1]
     assert result["acceptance"]["accepted_path_probability"] == pytest.approx(

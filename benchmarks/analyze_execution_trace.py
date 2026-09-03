@@ -27,6 +27,21 @@ def summarize(config: dict, show_tree: bool = False) -> None:
         print("no verification steps")
         return
 
+    prefills = trace.get("prefills", [])
+    if prefills:
+        print("\nPREFILL (mean ms / prompt)")
+        print("phase                  host       gpu")
+        for phase in ("total", "target", "draft_seed"):
+            host = _mean([_timing(row, phase, "host") for row in prefills])
+            gpu = _mean([_timing(row, phase, "gpu") for row in prefills])
+            print(f"{phase:20s} {host:10.2f} {gpu:9.2f}")
+        planned = _mean([
+            float(sum(copy.get("rows") or 0
+                      for copy in row.get("prefetch_copies", [])))
+            for row in prefills
+        ])
+        print(f"{'planned_rows':20s} {planned:10.1f}")
+
     print("\nPER-STEP TREE / ACCEPTANCE / ENGINE")
     print(
         "step valid depth accepted emitted draftGPU targetGPU verifyGPU "
@@ -92,7 +107,7 @@ def summarize(config: dict, show_tree: bool = False) -> None:
     print("\nENGINE PHASES (mean ms / verification step)")
     print("phase                  host       gpu")
     for phase in (
-        "draft_tree", "tree_snapshot", "target_verify", "verify_commit",
+        "total", "draft_tree", "tree_snapshot", "target_verify", "verify_commit",
         "result_d2h", "draft_commit",
     ):
         host = _mean([_timing(step, phase, "host") for step in steps])
