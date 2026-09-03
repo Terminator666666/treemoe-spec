@@ -10,6 +10,7 @@ Design goals over speed (this is the M1 correctness anchor, plan Task 1.2):
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import replace
 from typing import Callable, Optional
 
@@ -119,6 +120,7 @@ class MixtralForward:
         # op2 LayerPrefetcher (spec §3.2): ahead-of-time side-stream staging of
         # offloaded layers; None falls back to synchronous _stage_experts
         self.prefetcher = prefetcher
+        self.performance_tracer = None
         self.trace_observer: Optional[LayerTraceFn] = None
         self.rope_cos, self.rope_sin = build_rope_cache(self.cfg, weights.embed_tokens.device.type)
         # reusable GPU staging buffers for layout="offload" layers (one layer's
@@ -262,37 +264,53 @@ class MixtralForward:
         if self.prefetcher is not None:
             self.prefetcher.begin()
         for layer_idx, lw in enumerate(self.w.layers):
-            self._trace(layer_idx, "layer.input", x)
-            h = rms_norm(x, lw.input_layernorm, cfg.rms_eps)
-            self._trace(layer_idx, "attn.norm", h)
-            x = x + self._attention(lw, layer_idx, h, positions, tree_mask,
-                                    is_tree, start_pos)
-            self._trace(layer_idx, "attn.residual", x)
-            h = rms_norm(x, lw.post_attn_layernorm, cfg.rms_eps)
-            self._trace(layer_idx, "moe.norm", h)
-            use_prefetch = self.prefetcher is not None and not lw.experts_on_gpu
-            if lw.experts_on_gpu:
-                moe_lw = lw
-            elif use_prefetch:
-                buf = self.prefetcher.acquire(layer_idx)
-                moe_lw = replace(lw, w1=buf["w1"], w2=buf["w2"], w3=buf["w3"],
-                                 experts_on_gpu=True)
-            else:
-                moe_lw = self._stage_experts(lw)
-            if self.trace_observer is not None and self.moe_fn is naive_moe:
-                moe_output = naive_moe(
-                    h, moe_lw, layer_idx,
-                    trace=lambda name, tensor: self._trace(layer_idx, name, tensor),
-                )
-            else:
-                moe_output = self.moe_fn(h, moe_lw, layer_idx)
-            x = x + moe_output
+            tracer = self.performance_tracer
+            layer_record = tracer.begin_layer(layer_idx) if tracer else None
+            phase = tracer.phase(layer_record, "attention") \
+                if tracer else nullcontext()
+            with phase:
+                self._trace(layer_idx, "layer.input", x)
+                h = rms_norm(x, lw.input_layernorm, cfg.rms_eps)
+                self._trace(layer_idx, "attn.norm", h)
+                x = x + self._attention(lw, layer_idx, h, positions, tree_mask,
+                                        is_tree, start_pos)
+                self._trace(layer_idx, "attn.residual", x)
+            phase = tracer.phase(layer_record, "moe_prepare") \
+                if tracer else nullcontext()
+            with phase:
+                h = rms_norm(x, lw.post_attn_layernorm, cfg.rms_eps)
+                self._trace(layer_idx, "moe.norm", h)
+                use_prefetch = self.prefetcher is not None and not lw.experts_on_gpu
+                if lw.experts_on_gpu:
+                    moe_lw = lw
+                elif use_prefetch:
+                    buf = self.prefetcher.acquire(layer_idx)
+                    moe_lw = replace(
+                        lw, w1=buf["w1"], w2=buf["w2"], w3=buf["w3"],
+                        experts_on_gpu=True,
+                    )
+                else:
+                    moe_lw = self._stage_experts(lw)
+            phase = tracer.phase(layer_record, "moe_total") \
+                if tracer else nullcontext()
+            with phase:
+                if self.trace_observer is not None and self.moe_fn is naive_moe:
+                    moe_output = naive_moe(
+                        h, moe_lw, layer_idx,
+                        trace=lambda name, tensor: self._trace(layer_idx, name, tensor),
+                    )
+                else:
+                    moe_output = self.moe_fn(h, moe_lw, layer_idx)
+                x = x + moe_output
             self._trace(layer_idx, "layer.output", x)
             observer = getattr(self, "layer_observer", None)
             if observer is not None:
                 observer(layer_idx, x)
             if use_prefetch:
-                self.prefetcher.release(layer_idx)
+                phase = tracer.phase(layer_record, "prefetch_release") \
+                    if tracer else nullcontext()
+                with phase:
+                    self.prefetcher.release(layer_idx)
         x = rms_norm(x, self.w.final_norm, cfg.rms_eps)
         self._trace(-1, "final.norm", x)
         logits = F.linear(x, self.w.lm_head).float()

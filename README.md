@@ -28,3 +28,23 @@ TRITON_INTERPRET=1 pytest -m interpret               # CPU 执行真实 Triton I
 pytest -m "gpu and not model"                        # kernel 数值对齐（需 CUDA）
 pytest -m "gpu and model"                            # 单独进程跑真实模型一致性
 ```
+
+## 全阶段性能追踪
+
+诊断模式用 host wall clock 和延迟解析的 CUDA Events 记录 prefill、EAGLE 建树、target verification、
+verify/commit、draft commit，以及每层 attention、prefetch wait、route、expert-id D2H、repair、MoE GEMM
+和侧流 H2D。JSON 同时保存完整草稿树的 token/parent/depth/接受概率、每个节点的根路径、实际接受路径，
+以及逐层 staged/routed/missing 专家、slot 数和 demand：
+
+```bash
+python3 -u benchmarks/bench_e2e.py \
+	--layout offload --budgets 4 --tree-sizes 64 \
+	--num-prompts 1 --max-new-tokens 32 --uniform-layer-budget \
+	--no-router-hint \
+	--execution-trace-json artifacts/execution_trace.json
+python3 benchmarks/analyze_execution_trace.py \
+	artifacts/execution_trace.json --show-tree
+```
+
+trace 模式会增加 CUDA Events 和诊断 D2H，只用于归因；论文 TPOT 必须关闭
+`--execution-trace-json` 后单独测量。

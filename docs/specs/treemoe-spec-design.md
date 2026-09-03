@@ -263,6 +263,14 @@ temperature>0 的 rejection sampling 仍走 PyTorch 参考实现，不属于当�
 | EAGLE-2 草稿权重 | `yuhuili/EAGLE-mixtral-instruct-8x7B`（官方已发布；EAGLE-2 是推理时动态树，复用 EAGLE-1 权重无需重训） | 省 2–4 周训练 |
 | 随机数 | PyTorch generator（仅 temperature>0 参考路径） | 正式实验使用 greedy，不进入采样核 |
 
+### 3.7 全阶段可观测性
+
+`--execution-trace-json` 是默认关闭的诊断路径。它以延迟解析的 CUDA Events 记录引擎级和逐层 GPU 阶段，
+并单独记录 host wall time；侧流 prefetch 在自身 stream 上计时，因此可与 current-stream 的 attention/MoE
+对照，而不能简单相加。每步保存完整树拓扑、所有根路径、节点接受概率、实际接受路径，以及逐层
+planned/staged/routed/missing 专家和 repair 字节。`benchmarks/analyze_execution_trace.py` 输出逐步路径、阶段均值
+和 32 层热点。该模式包含额外事件与 D2H，不能用其 TPOT 作为正式性能数字。
+
 ---
 
 ## 4. 实验设计

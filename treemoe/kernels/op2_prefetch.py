@@ -19,6 +19,8 @@ Components:
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
 import torch.nn.functional as F
 
@@ -180,6 +182,7 @@ class LayerPrefetcher:
         self.repair_misses = 0              # cumulative mispredicted experts
         self.staged_rows_total = 0          # expert rows copied ahead of use
         self.repair_rows_total = 0          # expert rows copied synchronously
+        self.performance_tracer = None
         if self.offload_ids:
             first = self.layers[self.offload_ids[0]]
             self.expert_row_bytes = sum(
@@ -304,6 +307,14 @@ class LayerPrefetcher:
         self.staged_rows_total += (
             self.layers[layer_idx].w1.shape[0] if rows is None else len(rows)
         )
+        tracer = self.performance_tracer
+        copy_record = None
+        if tracer is not None:
+            planned = (
+                list(range(self.layers[layer_idx].w1.shape[0]))
+                if rows is None else rows
+            )
+            copy_record = tracer.add_prefetch_copy(layer_idx, planned)
 
         def copy_rows():
             for k in ("w1", "w2", "w3"):
@@ -316,11 +327,20 @@ class LayerPrefetcher:
 
         if self._cuda:
             with torch.cuda.stream(self._stream):
-                self._free[slot].wait(self._stream)   # overwrite-after-use
-                copy_rows()
+                phase = tracer.phase(copy_record, "slot_wait", cuda=True) \
+                    if tracer else nullcontext()
+                with phase:
+                    self._free[slot].wait(self._stream)   # overwrite-after-use
+                phase = tracer.phase(copy_record, "h2d", cuda=True) \
+                    if tracer else nullcontext()
+                with phase:
+                    copy_rows()
                 self._ready[slot].record(self._stream)
         else:
-            copy_rows()
+            phase = tracer.phase(copy_record, "h2d", cuda=False) \
+                if tracer else nullcontext()
+            with phase:
+                copy_rows()
 
     def acquire(self, layer_idx: int) -> dict[str, torch.Tensor]:
         """Return the staged w1/w2/w3 for this layer, ordered after its copy."""

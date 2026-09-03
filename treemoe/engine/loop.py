@@ -11,6 +11,7 @@ Graph capture wraps step() (Task 3.2, engine/graph.py).
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
@@ -41,6 +42,7 @@ class SpecDecodeEngine:
         expert_budget: int = 8,       # B=8 == lossless mode (spec §3.3)
         temperature: float = 0.0,
         layer_budget_allocator: LayerBudgetAllocator | None = None,
+        performance_tracer=None,
     ):
         self.target = target
         self.draft = draft
@@ -49,6 +51,10 @@ class SpecDecodeEngine:
         self.expert_budget = expert_budget
         self.temperature = temperature
         self.layer_budget_allocator = layer_budget_allocator
+        self.performance_tracer = performance_tracer
+        self.target.performance_tracer = performance_tracer
+        if self.target.prefetcher is not None:
+            self.target.prefetcher.performance_tracer = performance_tracer
         self.stats = GenerationStats()
 
     def _configure_moe(self, budgets: torch.Tensor, observe_demand: bool) -> None:
@@ -71,6 +77,11 @@ class SpecDecodeEngine:
         position i pairs token_i with target feature_{i-1}) — without this the
         first tree drafts from a single-token context.
         """
+        tracer = self.performance_tracer
+        record = (
+            tracer.begin_prefill(token_ids.shape[0], token_ids.device)
+            if tracer is not None else None
+        )
         positions = torch.arange(token_ids.shape[0], device=token_ids.device)
         fn = getattr(self.target, "moe_fn", None)
         if fn is not None and hasattr(fn, "current_accept_prob"):
@@ -88,9 +99,19 @@ class SpecDecodeEngine:
         if self.layer_budget_allocator is not None and pf is not None \
                 and hasattr(pf, "set_budget_plan"):
             pf.set_budget_plan(None)
-        logits, hidden = self.target.forward(token_ids, positions, return_hidden=True)
+        phase = tracer.phase(record, "target") if tracer else nullcontext()
+        with phase:
+            logits, hidden = self.target.forward(
+                token_ids, positions, return_hidden=True,
+            )
         if hasattr(self.draft, "extend_committed") and token_ids.shape[0] > 1:
-            self.draft.extend_committed(token_ids[1:], hidden[:-1], positions[1:])
+            phase = tracer.phase(record, "draft_seed") if tracer else nullcontext()
+            with phase:
+                self.draft.extend_committed(
+                    token_ids[1:], hidden[:-1], positions[1:],
+                )
+        if tracer is not None:
+            tracer.end_record()
         return logits[-1], hidden[-1]
 
     @torch.inference_mode()
@@ -98,14 +119,25 @@ class SpecDecodeEngine:
         """One draft-verify-commit iteration. Returns (new_tokens list, next_feature)."""
         kv = self.target.kv
         root_pos = kv.seq_len
-
-        if hasattr(self.draft, "begin_tree"):
-            self.draft.begin_tree()  # drop the previous tree's scratch KV
-        tree = build_eagle2_tree(
-            self.draft.step, last_token, root_feature, root_pos,
-            tree_size=self.tree_size, max_depth=self.max_depth,
-            device=last_token.device.type,
+        tracer = self.performance_tracer
+        record = (
+            tracer.begin_step(self.stats.steps, root_pos, last_token.device)
+            if tracer is not None else None
         )
+
+        phase = tracer.phase(record, "draft_tree") if tracer else nullcontext()
+        with phase:
+            if hasattr(self.draft, "begin_tree"):
+                self.draft.begin_tree()  # drop the previous tree's scratch KV
+            tree = build_eagle2_tree(
+                self.draft.step, last_token, root_feature, root_pos,
+                tree_size=self.tree_size, max_depth=self.max_depth,
+                device=last_token.device.type,
+                performance_tracer=tracer,
+            )
+        if tracer is not None:
+            with tracer.phase(record, "tree_snapshot", cuda=False):
+                tracer.record_tree(record, tree)
 
         allocator = self.layer_budget_allocator
         if allocator is None:
@@ -137,18 +169,22 @@ class SpecDecodeEngine:
 
         # verification forward over the whole tree (root token occupies slot 0)
         positions = root_pos + _depths(tree.parent, self.max_depth)
-        logits, hidden = self.target.forward(
-            tree.tokens.clamp(min=0), positions,
-            tree_mask=tree.attn_mask, return_hidden=True,
-        )
+        phase = tracer.phase(record, "target_verify") if tracer else nullcontext()
+        with phase:
+            logits, hidden = self.target.forward(
+                tree.tokens.clamp(min=0), positions,
+                tree_mask=tree.attn_mask, return_hidden=True,
+            )
         if allocator is not None:
             allocator.finish_observation()
 
         draft_probs = torch.zeros_like(logits)  # greedy mode: unused by verifier
-        res = fused_verify_commit(
-            logits.float(), draft_probs, tree.tokens, tree.parent, tree.children,
-            kv=kv, temperature=self.temperature, max_depth=self.max_depth,
-        )
+        phase = tracer.phase(record, "verify_commit") if tracer else nullcontext()
+        with phase:
+            res = fused_verify_commit(
+                logits.float(), draft_probs, tree.tokens, tree.parent, tree.children,
+                kv=kv, temperature=self.temperature, max_depth=self.max_depth,
+            )
 
         # next root feature = target hidden (post-final-norm) at the last
         # accepted node (spec §3.4 step 6) — pure tensor indexing, stays on GPU.
@@ -160,11 +196,22 @@ class SpecDecodeEngine:
 
         # ONE device->host copy for everything the host actually needs
         # (token ids for output/EOS). The old code did 3+num tiny syncs.
-        vals = torch.cat([
-            res.num_accepted.view(1), res.bonus_token.view(1), res.accepted_tokens,
-        ]).tolist()
+        phase = tracer.phase(record, "result_d2h", cuda=False) \
+            if tracer else nullcontext()
+        with phase:
+            vals = torch.cat([
+                res.num_accepted.view(1), res.bonus_token.view(1),
+                res.accepted_tokens,
+            ]).tolist()
         num = vals[0]
         new_tokens = vals[2:2 + num] + [vals[1]]
+        accepted_slots = (
+            res.accepted_slots[:num].tolist() if tracer is not None else []
+        )
+        if tracer is not None:
+            tracer.record_acceptance(
+                record, accepted_slots, vals[2:2 + num], vals[1],
+            )
 
         if hasattr(self.draft, "extend_committed"):
             # commit [root, a_1..a_m] into the draft's committed KV with TARGET
@@ -178,10 +225,15 @@ class SpecDecodeEngine:
                 [torch.zeros(1, dtype=torch.long, device=dev), slots])[:num]
             feats = torch.cat([root_feature.unsqueeze(0), hidden[prev_slots]])
             poss = root_pos + torch.arange(num + 1, device=dev)
-            self.draft.extend_committed(toks, feats, poss)
+            phase = tracer.phase(record, "draft_commit") \
+                if tracer else nullcontext()
+            with phase:
+                self.draft.extend_committed(toks, feats, poss)
 
         self.stats.steps += 1
         self.stats.tokens += len(new_tokens)
+        if tracer is not None:
+            tracer.end_record()
         return new_tokens, next_feature
 
     @torch.inference_mode()

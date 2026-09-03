@@ -9,6 +9,7 @@ path), keep the best `tree_size` nodes overall, then re-serialize in DFS order
 from __future__ import annotations
 
 import inspect
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
@@ -39,6 +40,7 @@ def build_eagle2_tree(
     max_depth: int = 6,
     branch_k: int = 4,
     device: str = "cuda",
+    performance_tracer=None,
 ) -> DraftTree:
     """Grow the candidate tree breadth-first, then prune to top tree_size nodes."""
     # candidate pool entries: (token, parent_idx_in_pool, depth, logprob_path, feature)
@@ -63,32 +65,39 @@ def build_eagle2_tree(
     for depth in range(1, max_depth + 1):
         if not frontier:
             break
+        level_record = (
+            performance_tracer.begin_draft_level(depth, len(frontier), kv_count)
+            if performance_tracer is not None else None
+        )
         toks = torch.tensor([pool_tokens[i] for i in frontier], device=device)
         feats = torch.stack([pool_feat[i] for i in frontier])
         poss = torch.tensor([root_pos + pool_depth[i] for i in frontier], device=device)
-        if _wants_mask:
-            t = len(frontier)
-            m = torch.zeros(t, kv_count + t, dtype=torch.bool)
-            for r, pool_i in enumerate(frontier):
-                m[r, kv_count + r] = True  # self
-                p = pool_parent[pool_i]
-                while p != -1:             # ancestors were processed in a prior level
-                    m[r, kv_index[p]] = True
-                    p = pool_parent[p]
-            new_feats, logits = draft_step_fn(toks, feats, poss,
-                                              tree_mask=m.to(device))
-            for r, pool_i in enumerate(frontier):
-                kv_index[pool_i] = kv_count + r
-            kv_count += t
-        else:
-            new_feats, logits = draft_step_fn(toks, feats, poss)
-        logprobs = torch.log_softmax(logits.float(), dim=-1)
-        topv, topi = logprobs.topk(branch_k, dim=-1)
-        # ONE packed D2H per level. The old per-element int(topi[fi,k]) /
-        # float(topv[fi,k]) pulls cost 2*branch_k*|frontier| GPU syncs per
-        # level (~hundreds per step, ~5-10us each) -- rivaling a whole MoE
-        # layer. token ids (<32000) are exact in fp32.
-        packed = torch.cat([topi.float(), topv], dim=1).tolist()
+        phase = performance_tracer.phase(level_record, "draft_forward") \
+            if performance_tracer is not None else nullcontext()
+        with phase:
+            if _wants_mask:
+                t = len(frontier)
+                m = torch.zeros(t, kv_count + t, dtype=torch.bool)
+                for r, pool_i in enumerate(frontier):
+                    m[r, kv_count + r] = True  # self
+                    p = pool_parent[pool_i]
+                    while p != -1:
+                        m[r, kv_index[p]] = True
+                        p = pool_parent[p]
+                new_feats, logits = draft_step_fn(toks, feats, poss,
+                                                  tree_mask=m.to(device))
+                for r, pool_i in enumerate(frontier):
+                    kv_index[pool_i] = kv_count + r
+                kv_count += t
+            else:
+                new_feats, logits = draft_step_fn(toks, feats, poss)
+        phase = performance_tracer.phase(level_record, "candidate_select") \
+            if performance_tracer is not None else nullcontext()
+        with phase:
+            logprobs = torch.log_softmax(logits.float(), dim=-1)
+            topv, topi = logprobs.topk(branch_k, dim=-1)
+            # ONE packed D2H per level. token ids (<32000) are exact in fp32.
+            packed = torch.cat([topi.float(), topv], dim=1).tolist()
         next_frontier = []
         for fi, pool_i in enumerate(frontier):
             row = packed[fi]
@@ -102,6 +111,9 @@ def build_eagle2_tree(
         # EAGLE-2 dynamic expansion: only the globally most promising nodes expand
         next_frontier.sort(key=lambda i: -pool_logp[i])
         frontier = next_frontier[: max(2, branch_k * 2)]
+        if level_record is not None:
+            level_record["generated_candidates"] = len(next_frontier)
+            level_record["next_frontier_nodes"] = len(frontier)
 
     # global top-(tree_size-1) selection by acceptance proxy exp(logp); root always kept
     order = sorted(range(1, len(pool_tokens)), key=lambda i: -pool_logp[i])

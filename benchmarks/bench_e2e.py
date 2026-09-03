@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 from functools import partial
 import json
 import os
@@ -94,6 +95,10 @@ def run_config(engine_factory, budget: int, tree_size: int, prompts: list[torch.
             allocator.demand_trace if allocator is not None else None
         ),
         "expert_trace": getattr(eng.target.moe_fn, "expert_trace", None),
+        "execution_trace": (
+            eng.performance_tracer.to_dict()
+            if eng.performance_tracer is not None else None
+        ),
     }
     if pf is not None and pf.routed_total:
         r["hit_rate"] = 1.0 - pf.repair_misses / pf.routed_total
@@ -249,12 +254,16 @@ def main() -> None:
     ap.add_argument("--budget-trace-json", type=Path, default=None,
                     help="write per-verification per-layer budgets for "
                          "adaptive allocation diagnosis")
+    ap.add_argument("--execution-trace-json", type=Path, default=None,
+                    help="write opt-in full-stage CUDA/host timings, routing, "
+                         "prefetch, tree topology, and accepted paths")
     args = ap.parse_args()
     if args.check_lossless and args.top1_threshold != 0:
         ap.error("--check-lossless requires --top1-threshold 0")
 
     from treemoe.engine.loop import SpecDecodeEngine
     from treemoe.engine.layer_budget import LayerBudgetAllocator
+    from treemoe.engine.perf_trace import ExecutionTracer
     from treemoe.kernels.op1_tree_moe import route_experts, tree_moe_forward
     from treemoe.kernels.op2_prefetch import LayerPrefetcher
     from treemoe.model.config import MixtralConfig
@@ -329,6 +338,7 @@ def main() -> None:
 
     def factory(budget: int, tree_size: int, routing_objective: str | None = None):
         objective = routing_objective or args.routing_objective
+        tracer = ExecutionTracer() if args.execution_trace_json is not None else None
         kv = PagedKVCache(cfg, num_blocks=256)
         pf = None
         if args.layout == "offload":
@@ -349,19 +359,34 @@ def main() -> None:
             layer_budget = (
                 int(layer_budgets[layer_idx]) if layer_budgets is not None else _b
             )
-            routing = route_experts(x, lw.router, accept, layer_budget,
-                                    inter=lw.w1.shape[1],
-                                    top1_threshold=args.top1_threshold,
-                                    routing_objective=objective)
+            layer_record = tracer.current_layer if tracer is not None else None
+            phase = tracer.phase(layer_record, "route") \
+                if tracer else nullcontext()
+            with phase:
+                routing = route_experts(
+                    x, lw.router, accept, layer_budget,
+                    inter=lw.w1.shape[1],
+                    top1_threshold=args.top1_threshold,
+                    routing_objective=objective,
+                )
             observer = getattr(moe_fn, "demand_observer", None)
             if observer is not None:
                 observer(layer_idx, routing.demand)
             cold_x = []
+            ids = None
+            if pf is not None or tracer is not None:
+                phase = tracer.phase(layer_record, "expert_ids_d2h", cuda=False) \
+                    if tracer else nullcontext()
+                with phase:
+                    ids = routing.expert_ids()
+            routed_ids = (ids or []).copy()
+            staged_snapshot = None
+            missing_before_repair = []
+            staged_nonrouted = None
             if pf is not None:
                 # exact-offload contract: one small D2H, then on-demand copies
                 # for mispredicted experts BEFORE the GEMMs read lw.w1/w2/w3
                 # (lw.* aliases the prefetcher's staged ring buffer here)
-                ids = routing.expert_ids()
                 if args.budget_trace_json is not None \
                         and layer_budget < cfg.num_experts:
                     if layer_idx == 0:
@@ -370,6 +395,7 @@ def main() -> None:
                         )
                     moe_fn.expert_trace[-1][layer_idx] = ids.copy()
                 staged = pf._staged_rows.get(layer_idx)
+                staged_snapshot = None if staged is None else set(staged)
                 if args.cpu_expert_threshold > 0 and staged is not None:
                     counts = (routing.padded_slots.view(
                         routing.ws.num_experts, -1) >= 0).sum(-1).tolist()
@@ -385,15 +411,62 @@ def main() -> None:
                         for e, toks, gates in routing.exclude_experts(cold):
                             dev_toks = toks.to(x.device)
                             cold_x.append((e, dev_toks, gates, x[dev_toks].cpu()))
+                if staged_snapshot is not None:
+                    missing_before_repair = sorted(set(ids) - staged_snapshot)
+                    staged_nonrouted = sorted(staged_snapshot - set(ids))
                 pf.routed_total += len(ids)
-                pf.repair(layer_idx, ids)
-            out = tree_moe_forward(x, lw.w1, lw.w2, lw.w3, lw.router,
-                                   accept, layer_budget, routing=routing)
-            for e, dev_toks, gates, xc in cold_x:
-                hw = host_layers[layer_idx]
-                y = (F.silu(xc @ hw.w1[e].t()) * (xc @ hw.w3[e].t())) @ hw.w2[e].t()
-                out.index_add_(0, dev_toks, (gates.unsqueeze(1) * y.float())
-                               .to(out.dtype).to(x.device))
+                phase = tracer.phase(layer_record, "repair") \
+                    if tracer else nullcontext()
+                with phase:
+                    repair_rows = pf.repair(layer_idx, ids)
+            else:
+                repair_rows = 0
+            if tracer is not None:
+                phase = tracer.phase(layer_record, "routing_snapshot")
+                with phase:
+                    slot_counts = (routing.padded_slots.view(
+                        routing.ws.num_experts, -1) >= 0).sum(-1).tolist()
+                    demand = routing.demand.detach().float().cpu().tolist()
+                staged = pf._staged_rows.get(layer_idx) if pf is not None else None
+                layer_record.update({
+                    "budget": layer_budget,
+                    "tree_nodes": x.shape[0],
+                    "routed_experts": routed_ids,
+                    "gpu_experts": ids or [],
+                    "cold_experts": [item[0] for item in cold_x],
+                    "staged_experts_before_repair": (
+                        None if staged_snapshot is None else sorted(staged_snapshot)
+                    ),
+                    "staged_experts_after_repair": (
+                        None if staged is None else sorted(staged)
+                    ),
+                    "staged_nonrouted_experts": staged_nonrouted,
+                    "repair_rows": repair_rows,
+                    "missing_experts": missing_before_repair,
+                    "slot_counts": slot_counts,
+                    "acceptance_weighted_demand": demand,
+                    "expert_row_bytes": (
+                        pf.expert_row_bytes if pf is not None else 0
+                    ),
+                })
+            phase = tracer.phase(layer_record, "expert_gemm") \
+                if tracer else nullcontext()
+            with phase:
+                out = tree_moe_forward(
+                    x, lw.w1, lw.w2, lw.w3, lw.router,
+                    accept, layer_budget, routing=routing,
+                )
+            phase = tracer.phase(layer_record, "cold_cpu") \
+                if tracer and cold_x else nullcontext()
+            with phase:
+                for e, dev_toks, gates, xc in cold_x:
+                    hw = host_layers[layer_idx]
+                    y = ((F.silu(xc @ hw.w1[e].t()) * (xc @ hw.w3[e].t()))
+                         @ hw.w2[e].t())
+                    out.index_add_(
+                        0, dev_toks,
+                        (gates.unsqueeze(1) * y.float()).to(out.dtype).to(x.device),
+                    )
             return out
 
         moe_fn.current_accept_prob = torch.ones(tree_size, device="cuda")
@@ -417,6 +490,7 @@ def main() -> None:
         return SpecDecodeEngine(
             target, draft, tree_size=tree_size, expert_budget=budget,
             layer_budget_allocator=allocator,
+            performance_tracer=tracer,
         ), pf
 
         print(f"{'B':>3} {'N':>5} {'TPOT(ms)':>10} {'accept_len':>11} {'steps':>6} "
@@ -454,6 +528,7 @@ def main() -> None:
         return
 
     trace_rows = []
+    execution_trace_rows = []
     objectives = (
         ["mass", "critical_path"]
         if args.compare_routing_objectives else [args.routing_objective]
@@ -476,6 +551,15 @@ def main() -> None:
                         "demand_trace": r["demand_trace"],
                         "expert_trace": r["expert_trace"],
                     })
+                if args.execution_trace_json is not None:
+                    execution_trace_rows.append({
+                        "routing_objective": objective,
+                        "budget": b,
+                        "tree_size": n,
+                        "num_prompts": args.num_prompts,
+                        "max_new_tokens": args.max_new_tokens,
+                        "trace": r["execution_trace"],
+                    })
                 histogram = r["budget_histogram"]
                 if histogram is None:
                     plan_hist = "-"
@@ -497,6 +581,12 @@ def main() -> None:
         args.budget_trace_json.parent.mkdir(parents=True, exist_ok=True)
         args.budget_trace_json.write_text(json.dumps(trace_rows, indent=2) + "\n")
         print(f"budget trace: {args.budget_trace_json}", flush=True)
+    if args.execution_trace_json is not None:
+        args.execution_trace_json.parent.mkdir(parents=True, exist_ok=True)
+        args.execution_trace_json.write_text(
+            json.dumps(execution_trace_rows, indent=2) + "\n"
+        )
+        print(f"execution trace: {args.execution_trace_json}", flush=True)
 
 
 if __name__ == "__main__":

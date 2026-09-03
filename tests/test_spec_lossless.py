@@ -142,6 +142,31 @@ def test_adaptive_budget_engine_uses_full_prefill_then_observes_verification(
     assert torch.equal(allocator.plan.prefetch_bitmap.sum(1), allocator.plan.budgets)
 
 
+def test_execution_tracer_integrates_with_generate(engine_pair):
+    from treemoe.engine.perf_trace import ExecutionTracer
+
+    fresh, config = engine_pair
+    tracer = ExecutionTracer()
+    engine = SpecDecodeEngine(
+        fresh(), TinyDraft(config.vocab_size), tree_size=8, max_depth=3,
+        expert_budget=8, performance_tracer=tracer,
+    )
+    engine.generate(torch.arange(5), max_new_tokens=8, eos_token_id=-1)
+    result = tracer.to_dict()
+
+    assert len(result["prefills"]) == 1
+    assert len(result["prefills"][0]["layers"]) == config.num_layers
+    assert result["steps"]
+    first = result["steps"][0]
+    assert len(first["layers"]) == config.num_layers
+    assert first["tree"]["paths"][0] == [0]
+    assert first["acceptance"]["emitted_tokens"] >= 1
+    for layer in first["layers"]:
+        assert {"attention", "moe_prepare", "moe_total"} <= set(
+            layer["timing_ms"]
+        )
+
+
 def test_e2e_lossless_check_writes_matching_artifact(engine_pair, tmp_path):
     from benchmarks.bench_e2e import run_lossless_check
 
