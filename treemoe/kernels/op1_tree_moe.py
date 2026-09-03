@@ -34,7 +34,9 @@ _INTERPRET = os.getenv("TRITON_INTERPRET", "0") == "1"
 
 from treemoe.ref.tree_moe_ref import budget_route_ref, tree_moe_forward_ref
 
-BM = 16    # slot rows per block (M is tiny: <=16 tokens/expert typically)
+BM = int(os.getenv("TREEMOE_BLOCK_M", "16"))
+if BM not in {16, 32}:
+    raise ValueError("TREEMOE_BLOCK_M must be 16 or 32")
 # Per-GEMM tiles, chosen by GPU-less static analysis (benchmarks/static_analysis.py:
 # AOT compile for sm_90a + ptxas -v register counts -> theoretical occupancy).
 # Both GEMMs are memory-bound streams; occupancy = latency hiding = bandwidth.
@@ -50,10 +52,11 @@ BK2 = 128  # gemm2 K over I (within split-K segment). 4090 sweep
 # SPLIT_K=2 (sweep): larger K segments per CTA beat extra parallelism, and it
 # halves the det-path fp32 partial round-trip as a bonus
 SPLIT_K = 2
-# launch configs as module constants so benchmarks/sweep_op1.py can patch
-# them for on-silicon tuning
-GEMM1_WARPS, GEMM1_STAGES = 8, 3   # ptxas sweep: 80 regs, zero spill, 38% occ
-GEMM2_WARPS, GEMM2_STAGES = 8, 3   # 4090 sweep top-1 (ties within noise)
+# Launch configs remain module constants so benchmarks/sweep_op1.py can patch
+# them for on-silicon tuning. BM32 needs 16 warps to distribute its larger
+# accumulator tile; BM16 keeps the measured 4090 optimum.
+GEMM1_WARPS, GEMM1_STAGES = (16 if BM == 32 else 8), 3
+GEMM2_WARPS, GEMM2_STAGES = (16 if BM == 32 else 8), 3
 
 
 # --------------------------------------------------------------------------

@@ -383,8 +383,9 @@ def test_compact_workspace_capacity_is_independent_of_sparse_expert_regions(
     x, _, _, _, router, accept = make_moe_inputs(64, E, H, I, rng)
     routing = route_experts(x, router, accept, 8, I)
 
+    expected_blocks = {16: 15, 32: 11}[BM]
     assert routing.max_blocks == 16
-    assert routing.launch_blocks == 15
+    assert routing.launch_blocks == expected_blocks
     assert routing.ws.max_blocks == 16
     assert routing.ws.rows == 16 * BM
     assert routing.padded_slots.numel() == 16 * BM

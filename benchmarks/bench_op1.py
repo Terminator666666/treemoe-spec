@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import os
 import sys
 import time
 from pathlib import Path
@@ -124,11 +125,14 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tree-sizes", type=int, nargs="+", default=[32, 64, 128])
     ap.add_argument("--budget", type=int, default=8)
+    ap.add_argument("--block-m", type=int, choices=(16, 32), default=16,
+                    help="expert token tile; run separate processes to compare BM16/BM32")
     ap.add_argument("--peak-gbs", type=float, default=None,
                     help="HBM peak GB/s for utilization %% (auto-detected for known cards)")
     ap.add_argument("--profile", action="store_true",
                     help="print a per-kernel CUDA time breakdown per tree size (atomic path)")
     args = ap.parse_args()
+    os.environ["TREEMOE_BLOCK_M"] = str(args.block_m)
     assert torch.cuda.is_available(), "kernel benchmark requires a GPU"
     peak = args.peak_gbs or detect_peak_gbs()
     print(f"device: {torch.cuda.get_device_name(0)}"
@@ -139,6 +143,9 @@ def main() -> None:
     except ImportError:
         print("vllm: not installed (baseline column will be skipped)")
     print("scope: hidden states -> router logits -> exact top-2 MoE; BF16 weights/activations")
+    from treemoe.kernels.op1_tree_moe import GEMM1_WARPS, GEMM2_WARPS
+    print(f"tile: BM={args.block_m}, gemm1_warps={GEMM1_WARPS}, "
+          f"gemm2_warps={GEMM2_WARPS}")
 
     g = torch.Generator(device="cuda").manual_seed(0)
     w1 = torch.randn(E, I, H, device="cuda", dtype=torch.bfloat16, generator=g) * 0.02

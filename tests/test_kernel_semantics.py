@@ -69,14 +69,22 @@ def test_block_expert_ids_consistent(rng):
             assert (rows >= 0).any()   # used block must carry >=1 real slot
 
 
-@pytest.mark.parametrize("budget, expected", [(2, 16), (4, 16), (8, 16)])
-def test_compact_n64_capacity_replaces_64_sparse_blocks(budget, expected):
-    assert compact_block_capacity(2 * N, budget, BM) == expected
+@pytest.mark.parametrize("budget", [2, 4, 8])
+def test_compact_n64_capacity_replaces_64_sparse_blocks(budget):
+    expected = {
+        16: {2: 16, 4: 16, 8: 16},
+        32: {2: 8, 4: 8, 8: 16},
+    }
+    assert compact_block_capacity(2 * N, budget, BM) == expected[BM][budget]
 
 
-@pytest.mark.parametrize("budget, expected", [(2, 9), (4, 11), (8, 15)])
-def test_compact_n64_launch_bound_avoids_power_of_two_padding(budget, expected):
-    assert compact_block_limit(2 * N, budget, BM) == expected
+@pytest.mark.parametrize("budget", [2, 4, 8])
+def test_compact_n64_launch_bound_avoids_power_of_two_padding(budget):
+    expected = {
+        16: {2: 9, 4: 11, 8: 15},
+        32: {2: 5, 4: 7, 8: 11},
+    }
+    assert compact_block_limit(2 * N, budget, BM) == expected[BM][budget]
 
 
 # ---------------- op4 kernel: greedy DFS simulation vs reference ----------------
