@@ -109,6 +109,12 @@ treemoe-spec/
 - loop.py 换用算子 1；跑 B∈{2,3,4,5,6,8} 的 τ-TPOT Pareto；
 - `test_spec_lossless.py` 在 B=8 下必须仍然通过。
 
+### Task 2.6 关键路径风险保护（已实现，真机待判定）
+- 从完整 router gates 取每个专家覆盖节点的最大接受概率 $c_e$，按 $(c_e,s_e)$ 词典序选择专家；
+- `--routing-objective mass|critical_path` 形成严格单变量消融，Triton `constexpr` 分支保证 mass 无额外开销；
+- CPU 构造反例验证根 top-2 保护，interpreter 对拍完整 Kernel A/GEMM，GPU 对拍 fused 与 torch fallback；
+- B=4、N=64 单提示 pilot 必须提高接受长度且 TPOT 恶化不超过 3%，否则立即取消，不进入正式实验。
+
 ---
 
 ## Phase 3 — greedy 验证与提交（部分完成）

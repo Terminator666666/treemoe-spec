@@ -42,6 +42,68 @@ def test_low_prob_nodes_degrade_to_top1(rng):
     assert torch.equal(g[:, 0], torch.ones(N))
 
 
+def test_critical_path_protects_root_top2_against_fringe_mass():
+    gates = torch.tensor([
+        [0.40, 0.35, 0.15, 0.10],
+        [0.05, 0.05, 0.50, 0.40],
+        [0.05, 0.05, 0.50, 0.40],
+        [0.05, 0.05, 0.50, 0.40],
+    ])
+    accept = torch.tensor([1.0, 0.8, 0.8, 0.8])
+
+    mass_ids, _ = budget_route_ref(
+        gates, accept, expert_budget=2, top1_threshold=0.0,
+        routing_objective="mass",
+    )
+    critical_ids, _ = budget_route_ref(
+        gates, accept, expert_budget=2, top1_threshold=0.0,
+        routing_objective="critical_path",
+    )
+
+    assert set(mass_ids.unique().tolist()) == {2, 3}
+    assert set(critical_ids.unique().tolist()) == {0, 1}
+    assert set(critical_ids[0].tolist()) == {0, 1}
+
+
+def test_critical_path_b8_is_lossless(rng):
+    gates = torch.softmax(torch.randn(N, E, generator=rng), dim=-1)
+    accept = torch.rand(N, generator=rng)
+    ids, weights = budget_route_ref(
+        gates, accept, 8, top1_threshold=0.0,
+        routing_objective="critical_path",
+    )
+    ref_weights, ref_ids = gates.topk(2, dim=-1)
+
+    assert torch.equal(ids, ref_ids)
+    torch.testing.assert_close(
+        weights, ref_weights / ref_weights.sum(-1, keepdim=True),
+    )
+
+
+def test_critical_path_ignores_degraded_second_slot():
+    gates = torch.tensor([
+        [0.40, 0.35, 0.15, 0.10],
+        [0.05, 0.05, 0.50, 0.40],
+    ])
+    accept = torch.tensor([1.0, 0.01])
+    ids, weights = budget_route_ref(
+        gates, accept, 2, top1_threshold=0.05,
+        routing_objective="critical_path",
+    )
+
+    assert set(ids[0].tolist()) == {0, 1}
+    assert weights[1].tolist() == [1.0, 0.0]
+
+
+def test_budget_route_rejects_invalid_contract():
+    gates = torch.full((2, 4), 0.25)
+    accept = torch.ones(2)
+    with pytest.raises(ValueError, match="expert_budget"):
+        budget_route_ref(gates, accept, 1)
+    with pytest.raises(ValueError, match="routing_objective"):
+        budget_route_ref(gates, accept, 2, routing_objective="unknown")
+
+
 # ---------------- bucketing (kernel A semantics) ----------------
 
 def test_bucket_offsets_and_stability(rng):
@@ -185,6 +247,7 @@ def test_fused_route_bucket_triton_matches_torch(n, budget):
         router_gates, accept, topk, gates, padded, blk, s2r, demand,
         budget, 0.05, N=n, E=e, EP=16,
         MAX_BPE=(2 * n + BM - 1) // BM, BLOCK_M=BM, MAX_BLOCKS=max_blocks,
+        CRITICAL_PATH=False,
     )
     assert torch.equal(topk, ids_t.reshape(-1))
     torch.testing.assert_close(gates, gates_t.reshape(-1).float(), rtol=1e-3, atol=1e-3)
@@ -226,6 +289,35 @@ def test_n128_production_routing_uses_exact_fallback(budget):
     torch.testing.assert_close(
         routing.demand, (accept[:, None] * full_gates).sum(0), rtol=1e-6, atol=1e-6,
     )
+
+
+@pytest.mark.gpu
+def test_critical_path_fused_routing_matches_torch():
+    from treemoe.kernels.op1_tree_moe import route_and_bucket, route_experts
+
+    generator = torch.Generator().manual_seed(31)
+    n, experts, hidden = 64, 8, 4096
+    x = torch.randn(n, hidden, generator=generator, dtype=torch.bfloat16).cuda()
+    router = torch.randn(
+        experts, hidden, generator=generator, dtype=torch.bfloat16,
+    ).cuda()
+    accept = torch.rand(n, generator=generator).cuda()
+    routing = route_experts(
+        x, router, accept, 4, inter=14336,
+        routing_objective="critical_path",
+    )
+    expected = route_and_bucket(
+        x, router, accept, 4, return_demand=True,
+        routing_objective="critical_path",
+    )
+    _, gates, padded, blocks, slot_to_row, max_blocks, demand = expected
+
+    assert torch.equal(routing.gates_flat, gates.reshape(-1).float())
+    assert torch.equal(routing.padded_slots, padded)
+    assert torch.equal(routing.block_expert_ids, blocks)
+    assert torch.equal(routing.slot_to_row, slot_to_row)
+    assert routing.max_blocks == max_blocks
+    torch.testing.assert_close(routing.demand, demand, rtol=1e-6, atol=1e-6)
 
 
 @pytest.mark.gpu

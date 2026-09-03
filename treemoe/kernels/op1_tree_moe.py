@@ -69,6 +69,7 @@ def route_and_bucket(
     top1_threshold: float = 0.05,
     return_demand: bool = False,
     router_gates: torch.Tensor | None = None,
+    routing_objective: str = "mass",
 ):
     """Returns (topk_ids, topk_gates, padded_slots, block_expert_ids, num_blocks_max).
 
@@ -83,8 +84,11 @@ def route_and_bucket(
         gates = torch.softmax(logits.float(), dim=-1)
     else:
         gates = router_gates
-    topk_ids, topk_gates = budget_route_ref(gates, node_accept_prob, expert_budget,
-                                            top1_threshold=top1_threshold)
+    topk_ids, topk_gates = budget_route_ref(
+        gates, node_accept_prob, expert_budget,
+        top1_threshold=top1_threshold,
+        routing_objective=routing_objective,
+    )
 
     flat_expert = topk_ids.reshape(-1)                       # [2N]
     order = torch.argsort(flat_expert, stable=True)          # DFS-stable in-expert
@@ -136,6 +140,7 @@ if HAS_TRITON:
         expert_budget, tau,
         N: tl.constexpr, E: tl.constexpr, EP: tl.constexpr,   # EP = 16 (pow2 pad)
         MAX_BPE: tl.constexpr, BLOCK_M: tl.constexpr, MAX_BLOCKS: tl.constexpr,
+        CRITICAL_PATH: tl.constexpr,
     ):
         """Fuse acceptance-weighted budgeting and bucketing in one program.
 
@@ -164,10 +169,34 @@ if HAS_TRITON:
         scores = tl.where(e_valid, scores, -float("inf"))
         tl.store(demand_ptr + offs_e, scores, mask=e_valid)
         keep = tl.zeros((EP,), dtype=tl.int1)
-        for rank in tl.static_range(E):                       # top-B, left tie-break
-            candidate = tl.where(keep, -float("inf"), scores)
-            best_expert = tl.argmax(candidate, axis=0)
-            keep = keep | ((offs_e == best_expert) & (rank < expert_budget))
+        if CRITICAL_PATH:
+            full_i1 = tl.argmax(gates, axis=1)
+            full_second = tl.where(
+                offs_e[None, :] == full_i1[:, None], -float("inf"), gates
+            )
+            full_i2 = tl.argmax(full_second, axis=1)
+            needed = ((offs_e[None, :] == full_i1[:, None])
+                             | ((offs_e[None, :] == full_i2[:, None])
+                                 & (accept[:, None] >= tau)))
+            criticality = tl.max(
+                tl.where(needed, accept[:, None], -float("inf")), axis=0,
+            )
+            for rank in tl.static_range(E):
+                available = ~keep & e_valid
+                best_criticality = tl.max(
+                    tl.where(available, criticality, -float("inf")), axis=0,
+                )
+                same_risk = criticality == best_criticality
+                candidate = tl.where(
+                    available & same_risk, scores, -float("inf")
+                )
+                best_expert = tl.argmax(candidate, axis=0)
+                keep = keep | ((offs_e == best_expert) & (rank < expert_budget))
+        else:
+            for rank in tl.static_range(E):
+                candidate = tl.where(keep, -float("inf"), scores)
+                best_expert = tl.argmax(candidate, axis=0)
+                keep = keep | ((offs_e == best_expert) & (rank < expert_budget))
 
         # ---- 3. in-budget top-2 + p/(p1+p2) renorm + tau degradation ----
         masked_gates = tl.where(keep[None, :], gates, 0.0)
@@ -563,11 +592,18 @@ def route_experts(
     expert_budget: int,
     inter: int,
     top1_threshold: float = 0.05,
+    routing_objective: str = "mass",
 ) -> Routing:
     """Phase 1 of tree_moe_forward: op3 budget routing + bucketing (fused
     Kernel A or the torch fallback). Needs only the resident router weights;
     `inter` is the FFN intermediate size (host-known, avoids touching w1).
     Pass the result to tree_moe_forward(routing=...) to run the GEMMs."""
+    if not 2 <= expert_budget <= router_weight.shape[0]:
+        raise ValueError(
+            f"expert_budget must be in [2, {router_weight.shape[0]}]"
+        )
+    if routing_objective not in {"mass", "critical_path"}:
+        raise ValueError("routing_objective must be 'mass' or 'critical_path'")
     n, hidden = x.shape
     e = router_weight.shape[0]
     key = (n, e, hidden, inter, x.device.index if x.is_cuda else -1, x.dtype)
@@ -593,6 +629,7 @@ def route_experts(
             expert_budget, top1_threshold,
             N=n, E=e, EP=16,
             MAX_BPE=max_bpe, BLOCK_M=BM, MAX_BLOCKS=ws.max_blocks,
+            CRITICAL_PATH=routing_objective == "critical_path",
             # 32 warps: ptxas shows the O((2N)^2) rank matrix spills 7.6KB/thread
             # at 4 warps; spreading it over 1024 threads -> regs 255->64,
             # spill -> ~1KB (static_analysis.py sweep). Single-CTA latency win.
@@ -607,6 +644,7 @@ def route_experts(
         top1_threshold=top1_threshold,
         return_demand=True,
         router_gates=gates,
+        routing_objective=routing_objective,
     )
     gates_flat = topk_gates.reshape(-1).float().contiguous()   # index by slot id
     return Routing(ws, gates_flat, padded_slots, block_expert_ids,
@@ -624,6 +662,7 @@ def tree_moe_forward(
     out: torch.Tensor | None = None,
     deterministic: bool = True,
     routing: Routing | None = None,
+    routing_objective: str = "mass",
 ) -> torch.Tensor:
     """Spec §3.1 entry point. Falls back to the reference on CPU / no Triton.
 
@@ -640,14 +679,16 @@ def tree_moe_forward(
     """
     if not HAS_TRITON or not (x.is_cuda or _INTERPRET):
         return tree_moe_forward_ref(
-            x, w1, w2, w3, router_weight, node_accept_prob, expert_budget
+            x, w1, w2, w3, router_weight, node_accept_prob, expert_budget,
+            routing_objective=routing_objective,
         )
 
     n, hidden = x.shape
     e, inter, _ = w1.shape
     if routing is None:
         routing = route_experts(x, router_weight, node_accept_prob,
-                                expert_budget, inter)
+                                expert_budget, inter,
+                                routing_objective=routing_objective)
     ws = routing.ws
     gates_flat = routing.gates_flat
     padded_slots, block_expert_ids = routing.padded_slots, routing.block_expert_ids

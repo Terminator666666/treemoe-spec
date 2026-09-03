@@ -230,6 +230,10 @@ def main() -> None:
                         "the offload regime this saves GEMM flops only "
                         "(staged bytes unchanged) but perturbs verification "
                         "logits for most deep nodes.")
+    ap.add_argument("--routing-objective", choices=["mass", "critical_path"],
+                    default="mass",
+                    help="select the layer expert set by aggregate mass or "
+                         "protect experts needed by high-acceptance nodes")
     ap.add_argument("--ar-baseline", action="store_true",
                     help="run plain greedy AR through the same offload plumbing "
                          "instead of the sweep (speedup denominator). Uses "
@@ -343,7 +347,8 @@ def main() -> None:
             )
             routing = route_experts(x, lw.router, accept, layer_budget,
                                     inter=lw.w1.shape[1],
-                                    top1_threshold=args.top1_threshold)
+                                    top1_threshold=args.top1_threshold,
+                                    routing_objective=args.routing_objective)
             observer = getattr(moe_fn, "demand_observer", None)
             if observer is not None:
                 observer(layer_idx, routing.demand)
@@ -410,10 +415,10 @@ def main() -> None:
             layer_budget_allocator=allocator,
         ), pf
 
+        print(f"routing objective: {args.routing_objective}", flush=True)
         print(f"{'B':>3} {'N':>5} {'TPOT(ms)':>10} {'accept_len':>11} {'steps':>6} "
-            f"{'expert_hit':>10} {'budget_hist':>18} {'planR/s':>8} "
-            f"{'repairR/s':>9} {'H2DGiB/tok':>10} {'cold':>6}",
-          flush=True)
+                    f"{'expert_hit':>10} {'budget_hist':>18} {'planR/s':>8} "
+                    f"{'repairR/s':>9} {'H2DGiB/tok':>10} {'cold':>6}", flush=True)
     if args.check_lossless:
         run_lossless_check(
             factory, args.tree_sizes[0], prompts, args.max_new_tokens,

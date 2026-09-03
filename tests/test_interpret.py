@@ -50,6 +50,19 @@ def test_fused_router_ids_match_bf16_reference(rng):
     torch.testing.assert_close(routing.demand, expected_demand, rtol=1e-5, atol=1e-6)
 
 
+def test_critical_path_pipeline_interpreted(rng):
+    x, w1, w2, w3, router, accept = make_moe_inputs(N, E, H, I, rng)
+    out = tree_moe_forward(
+        x, w1, w2, w3, router, accept, 4, deterministic=True,
+        routing_objective="critical_path",
+    )
+    ref = tree_moe_forward_ref(
+        x, w1, w2, w3, router, accept, 4,
+        routing_objective="critical_path",
+    )
+    torch.testing.assert_close(out, ref, rtol=1e-4, atol=5e-5)
+
+
 def test_op1_two_phase_routing_interpreted(rng):
     """route_experts + tree_moe_forward(routing=...) on the interpreter:
     bitwise-equal to the single-call path; expert_ids() exposes the routed

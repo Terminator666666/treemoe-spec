@@ -16,6 +16,7 @@ def budget_route_ref(
     node_accept_prob: torch.Tensor, # [N] fp32 EAGLE-2 global acceptance prob
     expert_budget: int,             # B in [2, E]
     top1_threshold: float = 0.05,   # tau: nodes below get top-1 routing (spec §3.3 step 4)
+    routing_objective: str = "mass",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return (topk_ids [N,2], topk_gates [N,2]); evicted slots renormalized.
 
@@ -26,8 +27,28 @@ def budget_route_ref(
       4. low-probability nodes degrade to top-1 (second slot weight = 0)
     """
     n, e = gates.shape
+    if not 2 <= expert_budget <= e:
+        raise ValueError(f"expert_budget must be in [2, {e}]")
+    if routing_objective not in {"mass", "critical_path"}:
+        raise ValueError("routing_objective must be 'mass' or 'critical_path'")
     scores = (node_accept_prob.unsqueeze(1) * gates).sum(0)          # [E]
-    keep = torch.topk(scores, k=expert_budget).indices                # [B]
+    demand_order = torch.argsort(scores, descending=True, stable=True)
+    if routing_objective == "critical_path":
+        unrestricted = gates.topk(2, dim=-1).indices
+        expert_axis = torch.arange(e, device=gates.device)
+        needed = unrestricted[:, :1] == expert_axis
+        second_needed = ((unrestricted[:, 1:2] == expert_axis)
+                 & (node_accept_prob >= top1_threshold).unsqueeze(1))
+        needed = needed | second_needed
+        criticality = torch.where(
+            needed, node_accept_prob.unsqueeze(1), -torch.inf,
+        ).amax(0)
+        critical_order = torch.argsort(
+            criticality[demand_order], descending=True, stable=True,
+        )
+        keep = demand_order[critical_order[:expert_budget]]
+    else:
+        keep = demand_order[:expert_budget]
     keep_mask = torch.zeros(e, dtype=torch.bool, device=gates.device)
     keep_mask[keep] = True
 
@@ -51,6 +72,7 @@ def route_and_bucket_ref(
     router_weight: torch.Tensor,   # [E, H]
     node_accept_prob: torch.Tensor,
     expert_budget: int,
+    routing_objective: str = "mass",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Kernel A reference. Returns (topk_ids, topk_gates, sorted_slots, expert_offsets).
 
@@ -60,7 +82,10 @@ def route_and_bucket_ref(
     """
     logits = F.linear(x, router_weight)
     gates = torch.softmax(logits.float(), dim=-1)
-    topk_ids, topk_gates = budget_route_ref(gates, node_accept_prob, expert_budget)
+    topk_ids, topk_gates = budget_route_ref(
+        gates, node_accept_prob, expert_budget,
+        routing_objective=routing_objective,
+    )
 
     n = x.shape[0]
     e = router_weight.shape[0]
@@ -82,10 +107,12 @@ def tree_moe_forward_ref(
     router_weight: torch.Tensor,   # [E, H]
     node_accept_prob: torch.Tensor,
     expert_budget: int,
+    routing_objective: str = "mass",
 ) -> torch.Tensor:
     """Full op1 reference: route+bucket then expert-major FFN accumulation."""
     topk_ids, topk_gates, sorted_slots, expert_offsets = route_and_bucket_ref(
-        x, router_weight, node_accept_prob, expert_budget
+        x, router_weight, node_accept_prob, expert_budget,
+        routing_objective=routing_objective,
     )
     out = torch.zeros_like(x)
     e = w1.shape[0]

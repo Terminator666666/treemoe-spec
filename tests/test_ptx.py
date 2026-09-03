@@ -60,7 +60,7 @@ def _ptx(build: str, name: str) -> str:
 
 
 def test_all_kernels_compile_sm90a(compiled):
-    assert len(compiled) == 9
+    assert len(compiled) == 10
 
 
 def test_zero_spill_everywhere(compiled):
@@ -90,9 +90,11 @@ def test_eviction_hints_survive_to_ptx(compiled):
 
 
 def test_kernel_a_does_not_duplicate_router_gemm(compiled):
-    s, build = compiled["op1 Kernel A (fused budget+bucket)"]
-    ptx = _ptx(build, s.name)
-    assert "wgmma" not in ptx and "mma.sync" not in ptx
+    for name in ("op1 Kernel A (fused budget+bucket)",
+                 "op1 Kernel A (critical-path)"):
+        s, build = compiled[name]
+        ptx = _ptx(build, s.name)
+        assert "wgmma" not in ptx and "mma.sync" not in ptx
 
 
 def _nvdisasm():

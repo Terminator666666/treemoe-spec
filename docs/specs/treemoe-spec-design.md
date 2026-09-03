@@ -1,7 +1,8 @@
-# TreeMoE-Spec 当前实现规格（v4）
+# TreeMoE-Spec 当前实现规格（v5）
 
 > 一个不依赖 vLLM/SGLang 的 MoE 推测解码原型，目标模型为 Mixtral-8x7B-Instruct，草稿模型使用
-> EAGLE-2 动态树。当前保留的算法机制是接受概率感知的层内专家选择。全局传输约束下的层自适应
+> EAGLE-2 动态树。当前保留的算法机制是接受概率加权的层内专家选择；关键路径风险保护是已严格实现、
+> 等待真机淘汰实验的第二候选。全局传输约束下的层自适应
 > 专家预算已被真机实验和固定计算回放否定，仅作为负结果保留。树感知 MoE 核、可修复权重流送、greedy 树验证和 KV
 > 提交是承载上述机制的系统实现优化，不作为独立算法创新。
 > 参考库：Tencent HPC-Ops、DeepSeek DeepGEMM、Databricks MegaBlocks、FlashInfer、vLLM fused_moe。
@@ -11,6 +12,7 @@
 | 模块 | 当前状态 | 论文口径 |
 |---|---|---|
 | 接受概率感知的层内专家选择 | 已内嵌路由核，B=8 可回到原始 top-2 | 核心贡献 1 |
+| 关键路径风险保护 | 参考实现与 fused Kernel A 已接入；B≥2 保证根节点原始 top-2 | 候选贡献 2，4090 pilot 通过后保留 |
 | 全局传输约束下的层自适应专家预算 | 计算预算版本恶化接受长度；固定计算的预取回放也未降低 repair | 失败消融，不作为贡献 |
 | EAGLE feature router hint | 已完成 pilot，但相对 temporal-only 仅改善 0.74% TPOT，且未改变聚合命中率 | 失败消融，不作为贡献 |
 | 树感知 expert-stationary MoE | 已实现并接入，承载预算后的专家分桶和计算 | 系统实现优化，不单列创新 |
@@ -201,7 +203,7 @@ uniform 预测得到 46.50 repair rows/step，与真机计数完全一致；全�
 temporal-only 只改善 0.74% TPOT，聚合命中率同为 0.650，因此降为失败消融。系统不训练预测器，也不使用
 CUDA Graph。
 
-### 3.3 核心贡献：接受概率感知的层内专家选择（内嵌于算子 1 Kernel A）
+### 3.3 核心贡献 1：接受概率感知的层内专家选择（内嵌于算子 1 Kernel A）
 
 逐层执行，输入本层真实 router 输出（非预测）：
 
@@ -209,20 +211,37 @@ CUDA Graph。
    其中 $p_{\text{accept}}(n)$ 是 EAGLE-2 树构建时的节点全局接受概率（现成的，无需额外计算），
    $g_{n,e}$ 是 token n 对专家 e 的 gating 权重。**用接受概率加权是与 MoE-Spec（均匀计数）的差异**：
    深层低概率分支的 token 反正大概率被拒绝，它们的专家需求不值得付权重读取；
-2. 保留 $\text{TopB}(s)$ 专家集合 $\mathcal{K}$；
+2. mass 基线保留 $\text{TopB}(s)$ 专家集合 $\mathcal{K}$；
 3. 重路由：token n 的 top-2 中被逐出的专家 → 替换为该 token 路由分布中 $\mathcal{K}$ 内得分最高者，
    gating 权重重新归一化（保证 $\sum g = 1$，避免输出幅值漂移）；
 4. 可选近似：$p_{\text{accept}}(n) < \tau$ 的节点退化为 top-1。正式主实验默认 $\tau=0$；
   $\tau=0.05$ 只作为消融，因为它会改变验证 logits，却不能减少已 staged 的 PCIe 字节。
 
-B 的选择：静态扫描统一 B∈{2,3,4,5,6,8} 得到基线 Pareto 曲线；自适应模式在相同
-$L B_{avg}$ 计划传输量下比较，不通过多搬专家换取质量或接受长度。
+B 的选择：静态扫描统一 B∈{2,3,4,5,6,8} 得到基线 Pareto 曲线。已否定的跨层自适应模式
+不进入正式主实验。
 
 **正确性红线**：预算路由改变了目标模型输出分布，严格的 speculative sampling 无损性不再成立。
 论文处理方式（与 MoE-Spec 相同）：报告下游任务分数（GSM8K/HumanEval/MT-Bench judge）证明无统计显著退化，
 并提供 B=8 无损模式作为对照。
 
-### 3.4 算子 4：greedy 树验证与 KV 提交
+### 3.4 候选贡献 2：关键路径风险保护
+
+mass 目标优化所有树节点的加权平均，却可能让大量外围节点的累计需求挤掉根节点或高概率路径的原始 top-2
+专家。对每个专家定义尾部风险：
+
+$$c_e=\max_{n:e\in\operatorname{Top2}(g_n)}p_{\mathrm{accept}}(n).$$
+
+若节点低于 top-1 降级阈值，其第二专家不计入 $c_e$。`critical_path` 策略按 $(c_e,s_e)$ 词典序降序选择
+B 个专家：先覆盖可能被接受的最高概率节点，再用贡献 1 的 acceptance-weighted mass 打破同风险专家的平局。
+因为根节点 $p_{\mathrm{accept}}=1$ 且 B≥2，其原始 top-2 必然保留；B=8 时严格退化为原始 Mixtral top-2。
+该选择与 demand、稳定 bucket 一起内嵌在 Kernel A，`CRITICAL_PATH` 是 Triton `constexpr`，因此 mass 对照
+不会执行 criticality 逻辑。
+
+真机采用同一 prompt、B=4、N=64、uniform 预算和 temporal prefetch，只切换
+`--routing-objective mass|critical_path`。保留候选的硬门槛是接受长度高于 mass 且 TPOT 不恶化超过 3%；
+若接受长度无改善，或额外 repair/H2D 抵消收益，则将其降为失败消融，不进行 20-prompt 正式实验。
+
+### 3.5 算子 4：greedy 树验证与 KV 提交
 
 正式实验使用 temperature=0。GPU 路径由三个阶段组成：
 
@@ -234,7 +253,7 @@ temperature>0 的 rejection sampling 仍走 PyTorch 参考实现，不属于当�
 取回接受 token 和 bonus token，以便 Python 处理 EOS 和输出列表。因此本模块减少了逐节点同步，但没有做到
 零 CPU 同步，也没有形成单 kernel 或整步 CUDA Graph。
 
-### 3.5 非贡献组件的选型（不重造轮子）
+### 3.6 非贡献组件的选型（不重造轮子）
 
 | 组件 | 选型 | 理由 |
 |---|---|---|
