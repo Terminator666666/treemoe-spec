@@ -202,6 +202,9 @@ def main() -> None:
                                     "same demand bitmap and repair machinery")
     ap.add_argument("--layer-budget-min", type=int, default=2,
                     help="minimum experts retained per layer in adaptive mode")
+    ap.add_argument("--layer-budget-max", type=int, default=None,
+                    help="maximum experts retained per layer in adaptive mode "
+                         "(default: all experts)")
     ap.add_argument("--budget-ema-decay", type=float, default=0.8,
                     help="EMA decay for adaptive layer demand")
     ap.add_argument("--random-weights", action="store_true",
@@ -374,6 +377,7 @@ def main() -> None:
             allocator = LayerBudgetAllocator(
                 cfg.num_layers, cfg.num_experts, average_budget=budget,
                 min_budget=args.layer_budget_min,
+                max_budget=args.layer_budget_max,
                 ema_decay=args.budget_ema_decay,
                 adaptive=args.adaptive_layer_budget,
             )

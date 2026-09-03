@@ -163,12 +163,14 @@ $$d^{(t)}_{l,e}=\sum_n p_{\mathrm{accept}}(n)g^{(t)}_{l,n,e},\qquad
 q^{(t)}_{l,e}=d^{(t)}_{l,e}/\sum_jd^{(t)}_{l,j}.$$
 
 对 $q$ 做 EMA 后，将每层专家按需求降序记为 $q_{l,(1)}\ge\cdots\ge q_{l,(8)}$。给定平均预算
-$B_{avg}$ 和下界 $B_{min}=2$，分配器求解：
+$B_{avg}$ 和信赖域 $[B_{min},B_{max}]$，分配器求解：
 
 $$\max_{B_1,\ldots,B_L}\sum_l\sum_{k=1}^{B_l}\bar q_{l,(k)},\quad
-B_{min}\le B_l\le8,\quad\sum_lB_l=L B_{avg}.$$
+B_{min}\le B_l\le B_{max},\quad\sum_lB_l=L B_{avg}.$$
 
-实现先给每层 $B_{min}$，再按归一化边际收益 $\bar q_{l,(k)}$ 全局降序分配剩余 expert row。该离散问题
+实现先给每层 $B_{min}$，再按归一化边际收益 $\bar q_{l,(k)}$ 全局降序分配剩余 expert row。默认
+$B_{max}=8$；保守配置可限制 $B_l\in[B_{avg}-1,B_{avg}+1]$，避免少数层过度增配并迫使大量层降至
+低预算。该离散问题
 具有前缀收益递减结构，因此贪心分配得到最优整数解，并且严格满足总计划传输量。上一轮需求形成第 t+1 轮
 的 `LayerBudgetPlan`：`budgets[l]` 控制本层接受概率感知路由，需求排名前 $B_l$ 的专家形成同一计划的
 prefetch bitmap。每次只需回传 $L\times E=256$ 个 FP32 数，即 1 KiB。

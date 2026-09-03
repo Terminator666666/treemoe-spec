@@ -87,6 +87,33 @@ def test_uniform_control_uses_same_exact_plan_without_cross_layer_reallocation()
     assert torch.equal(plan.prefetch_bitmap.sum(1), plan.budgets)
 
 
+def test_allocator_trust_region_preserves_exact_global_budget():
+    allocator = LayerBudgetAllocator(
+        4, 8, average_budget=4, min_budget=3, max_budget=5,
+        ema_decay=0.0,
+    )
+    demand = torch.tensor([
+        [0.70, 0.10, 0.08, 0.05, 0.03, 0.02, 0.01, 0.01],
+        [0.20, 0.18, 0.16, 0.14, 0.12, 0.10, 0.06, 0.04],
+        [0.40, 0.20, 0.15, 0.10, 0.06, 0.04, 0.03, 0.02],
+        [0.30, 0.20, 0.15, 0.12, 0.09, 0.06, 0.05, 0.03],
+    ])
+    allocator.start_observation()
+    for layer_idx in range(4):
+        allocator.observe(layer_idx, demand[layer_idx])
+    plan = allocator.finish_observation()
+
+    assert int(plan.budgets.sum()) == 16
+    assert int(plan.budgets.min()) >= 3
+    assert int(plan.budgets.max()) <= 5
+    assert torch.equal(plan.prefetch_bitmap.sum(1), plan.budgets)
+
+
+def test_allocator_rejects_infeasible_trust_region():
+    with pytest.raises(ValueError, match="min_budget <= average_budget"):
+        LayerBudgetAllocator(4, 8, average_budget=4, min_budget=3, max_budget=3)
+
+
 def test_marginal_greedy_matches_exhaustive_prefix_optimum():
     demand = torch.tensor([
         [0.70, 0.20, 0.09, 0.01],

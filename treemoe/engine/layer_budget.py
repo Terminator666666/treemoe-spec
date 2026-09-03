@@ -65,11 +65,15 @@ class LayerBudgetAllocator:
         num_experts: int,
         average_budget: int,
         min_budget: int = 2,
+        max_budget: int | None = None,
         ema_decay: float = 0.8,
         adaptive: bool = True,
     ) -> None:
-        if not min_budget <= average_budget <= num_experts:
-            raise ValueError("average_budget must be between min_budget and num_experts")
+        upper = num_experts if max_budget is None else max_budget
+        if not min_budget <= average_budget <= upper <= num_experts:
+            raise ValueError(
+                "require min_budget <= average_budget <= max_budget <= num_experts"
+            )
         if not 0.0 <= ema_decay < 1.0:
             raise ValueError("ema_decay must be in [0, 1)")
         self.num_layers = num_layers
@@ -77,6 +81,7 @@ class LayerBudgetAllocator:
         self.total_budget = num_layers * average_budget
         self.average_budget = average_budget
         self.min_budget = min_budget
+        self.max_budget = upper
         self.ema_decay = ema_decay
         self.adaptive = adaptive
         initial = torch.full((num_layers,), average_budget, dtype=torch.long)
@@ -133,7 +138,7 @@ class LayerBudgetAllocator:
                 self._ema_demand,
                 self.total_budget,
                 min_budget=self.min_budget,
-                max_budget=self.num_experts,
+                max_budget=self.max_budget,
             )
         else:
             budgets = torch.full(
