@@ -24,6 +24,59 @@ import torch
 import torch.nn.functional as F
 
 
+def _profiler_error_artifact(
+    output_dir: Path, label: str, artifact: str, error: Exception,
+) -> str:
+    path = output_dir / f"{label}.{artifact}-error.txt"
+    message = f"{type(error).__name__}: {error}\n"
+    try:
+        path.write_text(message)
+    except OSError:
+        print(f"profiler {artifact} export failed: {message.strip()}",
+              file=sys.stderr, flush=True)
+    return str(path)
+
+
+def _export_profiler_artifacts(
+    profiler, output_dir: Path, label: str, profile_memory: bool,
+) -> dict[str, str]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    artifacts = {}
+
+    chrome_path = output_dir / f"{label}.chrome.json"
+    try:
+        profiler.export_chrome_trace(str(chrome_path))
+        artifacts["chrome_trace"] = str(chrome_path)
+    except Exception as error:
+        artifacts["chrome_trace"] = _profiler_error_artifact(
+            output_dir, label, "chrome", error,
+        )
+
+    table_path = output_dir / f"{label}.operators.txt"
+    try:
+        table_path.write_text(profiler.key_averages(
+            group_by_input_shape=True,
+        ).table(sort_by="self_cuda_time_total", row_limit=500))
+        artifacts["operator_table"] = str(table_path)
+    except Exception as error:
+        artifacts["operator_table"] = _profiler_error_artifact(
+            output_dir, label, "operators", error,
+        )
+
+    if profile_memory:
+        memory_path = output_dir / f"{label}.memory.html"
+        try:
+            profiler.export_memory_timeline(str(memory_path), device="cuda:0")
+            artifacts["memory_timeline"] = str(memory_path)
+        except Exception as error:
+            artifacts["memory_timeline"] = _profiler_error_artifact(
+                output_dir, label, "memory", error,
+            )
+    else:
+        artifacts["memory_timeline"] = "disabled; see execution JSON snapshots"
+    return artifacts
+
+
 @torch.inference_mode()
 def ar_generate(target, prompt: torch.Tensor, max_new_tokens: int,
                 eos_token_id: int = 2) -> list[int]:
@@ -43,7 +96,9 @@ def ar_generate(target, prompt: torch.Tensor, max_new_tokens: int,
 def run_config(engine_factory, budget: int, tree_size: int, prompts: list[torch.Tensor],
                max_new_tokens: int = 128,
                profiler_dir: Path | None = None,
-               profiler_label: str = "run") -> dict:
+               profiler_label: str = "run",
+               profiler_memory: bool = False,
+               profiler_with_stack: bool = False) -> dict:
     eng, pf = engine_factory(budget=budget, tree_size=tree_size)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
@@ -56,8 +111,8 @@ def run_config(engine_factory, budget: int, tree_size: int, prompts: list[torch.
                 torch.profiler.ProfilerActivity.CUDA,
             ],
             record_shapes=True,
-            profile_memory=True,
-            with_stack=True,
+            profile_memory=profiler_memory,
+            with_stack=profiler_with_stack,
         )
     with profiler_context as profiler:
         for i, p in enumerate(prompts):
@@ -69,26 +124,9 @@ def run_config(engine_factory, budget: int, tree_size: int, prompts: list[torch.
                   file=sys.stderr, flush=True)
     profiler_artifacts = None
     if profiler is not None:
-        profiler_dir.mkdir(parents=True, exist_ok=True)
-        chrome_path = profiler_dir / f"{profiler_label}.chrome.json"
-        table_path = profiler_dir / f"{profiler_label}.operators.txt"
-        memory_path = profiler_dir / f"{profiler_label}.memory.html"
-        profiler.export_chrome_trace(str(chrome_path))
-        table_path.write_text(profiler.key_averages(
-            group_by_input_shape=True,
-        ).table(sort_by="self_cuda_time_total", row_limit=500))
-        memory_artifact = str(memory_path)
-        try:
-            profiler.export_memory_timeline(str(memory_path), device="cuda:0")
-        except (RuntimeError, ValueError) as error:
-            error_path = profiler_dir / f"{profiler_label}.memory-error.txt"
-            error_path.write_text(f"{type(error).__name__}: {error}\n")
-            memory_artifact = str(error_path)
-        profiler_artifacts = {
-            "chrome_trace": str(chrome_path),
-            "operator_table": str(table_path),
-            "memory_timeline": memory_artifact,
-        }
+        profiler_artifacts = _export_profiler_artifacts(
+            profiler, profiler_dir, profiler_label, profiler_memory,
+        )
     torch.cuda.synchronize()
     wall = time.perf_counter() - t0
     target_steps = eng.stats.steps
@@ -296,7 +334,13 @@ def main() -> None:
                          "prefetch, tree topology, and accepted paths")
     ap.add_argument("--torch-profiler-dir", type=Path, default=None,
                     help="write full CPU/CUDA kernel Chrome trace, operator "
-                         "table, and GPU memory timeline (diagnostic only)")
+                         "table, and optional GPU memory timeline")
+    ap.add_argument("--torch-profiler-memory", action="store_true",
+                    help="capture per-allocation memory events and timeline; "
+                         "disabled by default due Kineto compatibility bugs")
+    ap.add_argument("--torch-profiler-with-stack", action="store_true",
+                    help="capture Python stacks; substantially increases trace "
+                         "size and may trigger old Kineto decoding bugs")
     args = ap.parse_args()
     if args.check_lossless and args.top1_threshold != 0:
         ap.error("--check-lossless requires --top1-threshold 0")
@@ -610,7 +654,9 @@ def main() -> None:
                                profiler_dir=args.torch_profiler_dir,
                                profiler_label=(
                                    f"{objective}-b{b}-n{n}"
-                               ))
+                               ),
+                               profiler_memory=args.torch_profiler_memory,
+                               profiler_with_stack=args.torch_profiler_with_stack)
                 if args.budget_trace_json is not None:
                     trace_rows.append({
                         "routing_objective": objective,

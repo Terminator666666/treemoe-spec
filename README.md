@@ -41,7 +41,7 @@ expert-id D2H、repair、MoE GEMM 和侧流 H2D。JSON 同时保存：
 - 每层每节点的八专家 router 概率、原始 top-2、预算后 top-2、staged/routed/missing 专家和 demand；
 - 每次 planned H2D/repair、ring-slot wait、GPU 已分配/保留/空闲/峰值显存及运行环境。
 
-同时打开 PyTorch profiler 会生成全部 CPU/CUDA 算子、kernel、memcpy、stream、输入形状与内存事件：
+同时打开 PyTorch profiler 会生成全部 CPU/CUDA 算子、kernel、memcpy、stream 和输入形状：
 
 ```bash
 python3 -u benchmarks/bench_e2e.py \
@@ -56,7 +56,10 @@ python3 benchmarks/analyze_execution_trace.py \
 ```
 
 `artifacts/profiler` 下的 `*.chrome.json` 用 `chrome://tracing` 或 Perfetto 打开，
-`*.operators.txt` 按 self CUDA time 列出前 500 个 shape-aware 算子，`*.memory.html` 是显存时间线。
+`*.operators.txt` 按 self CUDA time 列出前 500 个 shape-aware 算子。逐分配显存事件和 Python 栈
+分别用 `--torch-profiler-memory`、`--torch-profiler-with-stack` 打开；部分 PyTorch/Kineto 版本对这两个
+选项存在非 UTF-8 事件名缺陷，所以默认关闭，逐步显存快照仍保存在 execution JSON 中。任一 profiler
+产物导出失败时会生成对应的 `*.error.txt`，benchmark 会继续完成并写出其余结果。
 `--show-all` 可能输出数万行，完整报告应重定向到文件。
 
 trace/profiler 模式会增加 CUDA Events、log-softmax、精确 rank 计算、诊断 D2H、栈采集和大量 I/O，

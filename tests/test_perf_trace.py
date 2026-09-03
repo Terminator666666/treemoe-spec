@@ -6,6 +6,36 @@ import torch
 from treemoe.engine.perf_trace import ExecutionTracer
 
 
+def test_profiler_export_errors_do_not_abort_other_artifacts(tmp_path):
+    from benchmarks.bench_e2e import _export_profiler_artifacts
+
+    decode_error = UnicodeDecodeError(
+        "utf-8", b"\x80", 0, 1, "invalid start byte",
+    )
+
+    class BrokenKinetoProfiler:
+        def export_chrome_trace(self, path):
+            with open(path, "w") as output:
+                output.write("{}")
+
+        def key_averages(self, **_kwargs):
+            raise decode_error
+
+        def export_memory_timeline(self, *_args, **_kwargs):
+            raise decode_error
+
+    artifacts = _export_profiler_artifacts(
+        BrokenKinetoProfiler(), tmp_path, "mass-b4-n64", profile_memory=True,
+    )
+
+    assert artifacts["chrome_trace"].endswith(".chrome.json")
+    assert artifacts["operator_table"].endswith(".operators-error.txt")
+    assert artifacts["memory_timeline"].endswith(".memory-error.txt")
+    assert "UnicodeDecodeError" in open(
+        artifacts["operator_table"],
+    ).read()
+
+
 def test_execution_tracer_records_host_phases_and_tree_paths():
     tracer = ExecutionTracer()
     record = tracer.begin_step(0, 7, torch.device("cpu"))
