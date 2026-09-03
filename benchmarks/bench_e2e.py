@@ -122,13 +122,13 @@ def run_config(engine_factory, budget: int, tree_size: int, prompts: list[torch.
             print(f"  B={budget} N={tree_size} prompt {i + 1}/{len(prompts)} "
                   f"({el:.0f}s elapsed, {el / total_tokens * 1e3:.0f}ms/tok)",
                   file=sys.stderr, flush=True)
+            torch.cuda.synchronize()
+            inference_wall = time.perf_counter() - t0
     profiler_artifacts = None
     if profiler is not None:
         profiler_artifacts = _export_profiler_artifacts(
             profiler, profiler_dir, profiler_label, profiler_memory,
         )
-    torch.cuda.synchronize()
-    wall = time.perf_counter() - t0
     target_steps = eng.stats.steps
     staged_rows = getattr(pf, "staged_rows_total", 0) if pf is not None else 0
     repair_rows = getattr(pf, "repair_rows_total", 0) if pf is not None else 0
@@ -145,7 +145,7 @@ def run_config(engine_factory, budget: int, tree_size: int, prompts: list[torch.
     r = {
         "budget": budget,
         "tree_size": tree_size,
-        "tpot_ms": wall / total_tokens * 1e3,
+        "tpot_ms": inference_wall / total_tokens * 1e3,
         "accept_len": eng.stats.mean_accept_len,
         "target_steps": target_steps,
         "hit_rate": float("nan"),
