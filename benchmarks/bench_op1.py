@@ -9,9 +9,11 @@ Baselines are optional imports; missing ones are reported and skipped.
 from __future__ import annotations
 
 import argparse
+import importlib
 import sys
 import time
 from pathlib import Path
+from typing import Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -67,18 +69,49 @@ def profile_ours(x, w1, w2, w3, router, accept, budget, deterministic=False):
     print(prof.key_averages().table(sort_by="self_cuda_time_total", row_limit=12))
 
 
-def bench_vllm(x, w1, w2, w3, router):
+def resolve_vllm_fused_moe() -> tuple[str, Callable] | None:
+    """Resolve the legacy fused_moe or current fused_experts API."""
     try:
-        from vllm.model_executor.layers.fused_moe import fused_moe
+        package = importlib.import_module("vllm.model_executor.layers.fused_moe")
     except ImportError:
         return None
+
+    candidate = getattr(package, "fused_moe", None)
+    if callable(candidate):
+        return "fused_moe", candidate
+    candidate = getattr(package, "fused_experts", None)
+    if callable(candidate):
+        return "fused_experts", candidate
+
+    try:
+        module = importlib.import_module(
+            "vllm.model_executor.layers.fused_moe.fused_moe"
+        )
+    except ImportError:
+        return None
+    candidate = getattr(module, "fused_moe", None)
+    if callable(candidate):
+        return "fused_moe", candidate
+    candidate = getattr(module, "fused_experts", None)
+    return ("fused_experts", candidate) if callable(candidate) else None
+
+
+def bench_vllm(x, w1, w2, w3, router):
+    resolved = resolve_vllm_fused_moe()
+    if resolved is None:
+        return None
+    api, fused_moe = resolved
     w13 = torch.cat([w1, w3], dim=1).contiguous()  # vLLM packs gate+up
 
     def run():
         # Match op1's input/output boundary: both timings start from hidden
         # states and include router-logit computation plus exact top-2 MoE.
-        gating = x.float() @ router.t().float()
-        return fused_moe(x, w13, w2, gating, topk=2, renormalize=True)
+        gating = torch.nn.functional.linear(x, router).float()
+        if api == "fused_moe":
+            return fused_moe(x, w13, w2, gating, topk=2, renormalize=True)
+        topk_logits, topk_ids = gating.topk(2, dim=-1)
+        topk_weights = torch.softmax(topk_logits, dim=-1)
+        return fused_moe(x, w13, w2, topk_weights, topk_ids)
 
     return timed(run)
 
