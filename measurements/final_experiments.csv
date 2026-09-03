@@ -11,11 +11,11 @@ pilot_budget_b5_n64,pilot_budget,MT-Bench,offload,spec,5,64,2,32,0,2,true,true,0
 pilot_budget_b6_n64,pilot_budget,MT-Bench,offload,spec,6,64,2,32,0,2,true,true,0,1,complete,1141.81,0.8758,1.3532,,3.45,0.825,,,,,,,logs/pilot_budget_order_b4_b8_b5_b6_n64.log,,2026-09-02,Pilot point is dominated by B=8 on both TPOT and accept length
 pilot_budget_b2_n64,pilot_budget,MT-Bench,offload,spec,2,64,2,32,0,2,true,true,0,1,complete,719.76,1.3894,2.1466,,2.44,0.434,,,,,,,,,,2026-09-02,Reported console result; fastest pilot but approximate quality is not yet evaluated
 pilot_budget_b3_n64,pilot_budget,MT-Bench,offload,spec,3,64,2,32,0,2,true,true,0,1,complete,979.09,1.0214,1.5781,,2.25,0.552,,,,,,,,,,2026-09-02,Reported console result; dominated by B=2 in this two-prompt pilot and accept length is non-monotonic
-budget_b2_n64,main_budget,MT-Bench,offload,spec,2,64,20,128,0,2,true,true,0,3,pending,,,,,,,,,,,,,,,,,
-budget_b3_n64,main_budget,MT-Bench,offload,spec,3,64,20,128,0,2,true,true,0,3,pending,,,,,,,,,,,,,,,,,
-budget_b4_n64,main_budget,MT-Bench,offload,spec,4,64,20,128,0,2,true,true,0,3,pending,,,,,,,,,,,,,,,,,
-budget_b5_n64,main_budget,MT-Bench,offload,spec,5,64,20,128,0,2,true,true,0,3,pending,,,,,,,,,,,,,,,,,
-budget_b6_n64,main_budget,MT-Bench,offload,spec,6,64,20,128,0,2,true,true,0,3,pending,,,,,,,,,,,,,,,,,
+budget_b2_n64,main_budget,MT-Bench,offload,spec,2,64,20,128,0,2,true,true,0,1,complete,623.12,1.6048,2.4796,,2.41,0.412,,,,,,,logs/main_budget_20x128_n64_run1.log,,2026-09-03,Single completed run; approximate budget requires separate quality evaluation
+budget_b3_n64,main_budget,MT-Bench,offload,spec,3,64,20,128,0,2,true,true,0,1,complete,860.23,1.1625,1.7961,,2.44,0.543,,,,,,,logs/main_budget_20x128_n64_run1.log,,2026-09-03,Single completed run; approximate budget requires separate quality evaluation
+budget_b4_n64,main_budget,MT-Bench,offload,spec,4,64,20,128,0,2,true,true,0,1,complete,1054.47,0.9483,1.4653,,2.40,0.643,,,,,,,logs/main_budget_20x128_n64_run1.log,,2026-09-03,Single completed run; approximate budget requires separate quality evaluation
+budget_b5_n64,main_budget,MT-Bench,offload,spec,5,64,20,128,0,2,true,true,0,1,complete,1222.31,0.8181,1.2641,,2.40,0.736,,,,,,,logs/main_budget_20x128_n64_run1.log,,2026-09-03,Single completed run; approximate budget requires separate quality evaluation
+budget_b6_n64,main_budget,MT-Bench,offload,spec,6,64,20,128,0,2,true,true,0,1,complete,1289.50,0.7755,1.1982,,2.56,0.819,,,,,,,logs/main_budget_20x128_n64_run1.log,,2026-09-03,Single completed run; approximate budget requires separate quality evaluation
 budget_b8_n64,main_budget,MT-Bench,offload,spec,8,64,20,128,0,2,true,true,0,3,pending,,,,,,,,,,,,,,,,,
 tree_b2_n16,tree_size,MT-Bench,offload,spec,2,16,20,128,0,2,true,true,0,3,pending,,,,,,,,,,,,,,,,,
 tree_b2_n32,tree_size,MT-Bench,offload,spec,2,32,20,128,0,2,true,true,0,3,pending,,,,,,,,,,,,,,,,,
