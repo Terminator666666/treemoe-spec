@@ -103,6 +103,7 @@ class LayerBudgetAllocator:
         self._observed: torch.Tensor | None = None
         self._seen = torch.zeros(num_layers, dtype=torch.bool)
         self.budget_histogram = torch.zeros(num_experts + 1, dtype=torch.long)
+        self.budget_trace: list[list[int]] = []
 
     def reset(self) -> None:
         self.plan = LayerBudgetPlan(
@@ -120,6 +121,7 @@ class LayerBudgetAllocator:
         self.budget_histogram.add_(
             torch.bincount(self.plan.budgets, minlength=self.num_experts + 1)
         )
+        self.budget_trace.append(self.plan.budgets.tolist())
 
     def observe(self, layer_idx: int, demand: torch.Tensor) -> None:
         if demand.shape != (self.num_experts,):

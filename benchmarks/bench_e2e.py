@@ -85,6 +85,10 @@ def run_config(engine_factory, budget: int, tree_size: int, prompts: list[torch.
             if eng.layer_budget_allocator is not None else None
         ),
         "budget_histogram": budget_histogram,
+        "budget_trace": (
+            eng.layer_budget_allocator.budget_trace
+            if eng.layer_budget_allocator is not None else None
+        ),
     }
     if pf is not None and pf.routed_total:
         r["hit_rate"] = 1.0 - pf.repair_misses / pf.routed_total
@@ -231,6 +235,9 @@ def main() -> None:
                          "prompt and save a detailed JSON artifact")
     ap.add_argument("--output-json", type=Path,
                     default=Path("artifacts/e2e_lossless.json"))
+    ap.add_argument("--budget-trace-json", type=Path, default=None,
+                    help="write per-verification per-layer budgets for "
+                         "adaptive allocation diagnosis")
     args = ap.parse_args()
     if args.check_lossless and args.top1_threshold != 0:
         ap.error("--check-lossless requires --top1-threshold 0")
@@ -424,10 +431,19 @@ def main() -> None:
               f"{hit:>9.3f} {'-':>6}", flush=True)
         return
 
+    trace_rows = []
     for n in args.tree_sizes:
         for b in args.budgets:
             r = run_config(factory, b, n, prompts,
                            max_new_tokens=args.max_new_tokens)
+            if args.budget_trace_json is not None:
+                trace_rows.append({
+                    "budget": b,
+                    "tree_size": n,
+                    "target_steps": r["target_steps"],
+                    "mean_accept_len": r["accept_len"],
+                    "budget_trace": r["budget_trace"],
+                })
             histogram = r["budget_histogram"]
             if histogram is None:
                 plan_hist = "-"
@@ -442,6 +458,10 @@ def main() -> None:
                 f"{r['planned_rows_per_step']:>8.1f} "
                 f"{r['repair_rows_per_step']:>9.1f} "
                 f"{r['h2d_gib_per_token']:>10.2f} {r['cold']:>6}", flush=True)
+    if args.budget_trace_json is not None:
+        args.budget_trace_json.parent.mkdir(parents=True, exist_ok=True)
+        args.budget_trace_json.write_text(json.dumps(trace_rows, indent=2) + "\n")
+        print(f"budget trace: {args.budget_trace_json}", flush=True)
 
 
 if __name__ == "__main__":

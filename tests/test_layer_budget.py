@@ -3,7 +3,11 @@ from itertools import product
 import pytest
 import torch
 
-from treemoe.engine.layer_budget import LayerBudgetAllocator, allocate_layer_budgets
+from treemoe.engine.layer_budget import (
+    LayerBudgetAllocator,
+    LayerBudgetPlan,
+    allocate_layer_budgets,
+)
 
 
 def test_allocate_layer_budgets_respects_exact_global_constraint():
@@ -98,6 +102,18 @@ def test_allocator_reset_drops_cross_prompt_history():
     assert allocator._ema_demand is None
     assert allocator.plan.prefetch_bitmap is None
     assert torch.equal(allocator.plan.budgets, torch.tensor([3, 3]))
+
+
+def test_allocator_records_per_step_layer_budget_trace():
+    allocator = LayerBudgetAllocator(
+        2, 4, average_budget=3, min_budget=2, max_budget=4,
+    )
+    allocator.record_plan_use()
+    allocator.plan = LayerBudgetPlan(torch.tensor([2, 4]), None)
+    allocator.record_plan_use()
+
+    assert allocator.budget_trace == [[3, 3], [2, 4]]
+    assert allocator.budget_histogram.tolist() == [0, 0, 1, 2, 1]
 
 
 def test_uniform_control_uses_same_exact_plan_without_cross_layer_reallocation():

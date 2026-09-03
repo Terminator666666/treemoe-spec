@@ -125,7 +125,7 @@ treemoe-spec/
 
 ---
 
-## Phase 4 — 核心贡献：全局传输约束的层自适应预算（代码已实现，真机消融待补）
+## Phase 4 — 全局传输约束的层自适应预算（代码已实现，当前为负结果）
 
 ### Task 4.1 训练式跨层路由预测器（取消）
 - `RouterPredictor` 和 `measurements/train_predictor.py` 保留为实验原型；
@@ -137,14 +137,16 @@ treemoe-spec/
 - `repair()` 在真实路由后补齐漏预测专家，因此预测错误不影响输出正确性；
 - 累计报告 staged/repair expert rows 与真实字节，不能用表面 hit rate 代替传输成本。
 
-### Task 4.3 层自适应预算分配（已实现，4090 待测）
+### Task 4.3 层自适应预算分配（已实现，4090 pilot 未通过）
 - `treemoe/engine/layer_budget.py` 从上一轮完整 target router demand 构造 EMA；
 - 在可配置信赖域 $B_{min}\le B_l\le B_{max}$、$\sum_lB_l=L B_{avg}$ 下最大化各层 retained mass
   的乘积，按对数边际收益分配并输出预算和预取位图；线性 mass 目标只保留为消融；
 - prefill 强制 B=8/full-copy，首轮 verification 使用 uniform/full-copy，prompt 间重置历史；
 - `bench_e2e.py --adaptive-layer-budget` 与 `--uniform-layer-budget` 在相同 $B_{avg}$ 下比较
   TPOT、接受长度、质量及
-  staged/repair GiB；CPU 与 Triton interpreter 回归已覆盖，RTX 4090 实测待完成。
+  staged/repair GiB；CPU 与 Triton interpreter 回归已覆盖；RTX 4090 上 mass 与 log-mass 都降低
+  repair/step，但因接受长度下降而显著慢于 uniform，暂不列为核心贡献；
+- 增加逐 verification 的逐层预算轨迹，下一步诊断敏感层降配和预算振荡，不继续盲调目标或 EMA。
 
 ---
 
