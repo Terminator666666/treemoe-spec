@@ -146,14 +146,15 @@ treemoe-spec/
   TPOT、接受长度、质量及
   staged/repair GiB；CPU 与 Triton interpreter 回归已覆盖；RTX 4090 上 mass 与 log-mass 都降低
   repair/step，但因接受长度下降而显著慢于 uniform，暂不列为核心贡献；
-- 增加逐 verification 的逐层预算轨迹，下一步诊断敏感层降配和预算振荡，不继续盲调目标或 EMA。
+- 固定 uniform B4 计算的真实 trace 回放与实测 repair 完全一致；仅重分配预取预算的 `[3,5]` 方案从
+  46.50 恶化至 46.60 repair rows/step，因此 demand-only 层预算路线终止，相关正式实验取消。
 
 ---
 
 ## Phase 5 — 论文实验与收尾（进行中）
 
-- RTX 4090 上完成 AR、B∈{2,3,4,5,6,8} uniform 主实验、tree-size，以及固定总传输预算下的
-  adaptive-vs-uniform 消融；
+- RTX 4090 上完成 AR、B∈{2,3,4,5,6,8} uniform 主实验和 tree-size；层自适应预算只报告已完成的
+  负结果，不再运行 20-prompt adaptive 消融；
 - 使用 MT-Bench 验证 B<8 质量，B=8 作为 lossless 对照；
 - 所有最终配置和结果维护在 `measurements/final_experiments.csv`。
 
@@ -167,5 +168,5 @@ treemoe-spec/
 | M1 | 正确的最小推测解码系统 | 3 周 |
 | M2 | 树级专家预算与支撑 MoE kernel 落地 | 7 周 |
 | M3 | greedy Triton verify/KV commit；CUDA Graph 取消 | 已完成（不含 Graph） |
-| M4 | 全局约束层预算与精确可修复预取接入，正式消融待测 | 进行中 |
+| M4 | 全局约束层预算与精确可修复预取接入；候选创新经真机与回放否定 | 已完成（负结果） |
 | M5 | 4090 论文实验齐全 | 进行中 |

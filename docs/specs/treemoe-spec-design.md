@@ -1,8 +1,8 @@
 # TreeMoE-Spec 当前实现规格（v4）
 
 > 一个不依赖 vLLM/SGLang 的 MoE 推测解码原型，目标模型为 Mixtral-8x7B-Instruct，草稿模型使用
-> EAGLE-2 动态树。当前已验证的算法机制是接受概率感知的层内专家选择。全局传输约束下的层自适应
-> 专家预算已接入端到端路径，但现有 demand-only 目标未获得收益，暂作为负结果与诊断对象。树感知 MoE 核、可修复权重流送、greedy 树验证和 KV
+> EAGLE-2 动态树。当前保留的算法机制是接受概率感知的层内专家选择。全局传输约束下的层自适应
+> 专家预算已被真机实验和固定计算回放否定，仅作为负结果保留。树感知 MoE 核、可修复权重流送、greedy 树验证和 KV
 > 提交是承载上述机制的系统实现优化，不作为独立算法创新。
 > 参考库：Tencent HPC-Ops、DeepSeek DeepGEMM、Databricks MegaBlocks、FlashInfer、vLLM fused_moe。
 
@@ -11,7 +11,7 @@
 | 模块 | 当前状态 | 论文口径 |
 |---|---|---|
 | 接受概率感知的层内专家选择 | 已内嵌路由核，B=8 可回到原始 top-2 | 核心贡献 1 |
-| 全局传输约束下的层自适应专家预算 | 执行契约成立；mass、信赖域和 log-mass 均降低 repair/step 但恶化接受长度与 TPOT | 失败消融，待层敏感度诊断后再决定是否作为贡献 |
+| 全局传输约束下的层自适应专家预算 | 计算预算版本恶化接受长度；固定计算的预取回放也未降低 repair | 失败消融，不作为贡献 |
 | EAGLE feature router hint | 已完成 pilot，但相对 temporal-only 仅改善 0.74% TPOT，且未改变聚合命中率 | 失败消融，不作为贡献 |
 | 树感知 expert-stationary MoE | 已实现并接入，承载预算后的专家分桶和计算 | 系统实现优化，不单列创新 |
 | greedy 树验证与 KV 提交 | 已实现 Triton 三核路径 | 系统实现优化 |
@@ -182,7 +182,10 @@ prefetch bitmap。每次只需回传 $L\times E=256$ 个 FP32 数，即 1 KiB。
 46.5 repair rows/step。mass 信赖域 `[3,5]` 虽将 repair 降至 40.1 rows/step，接受长度降至 2.54，
 TPOT 增至 1182.39 ms；log-mass 进一步得到 41.4 repair rows/step、2.43 接受长度和 1282.44 ms TPOT。
 因此“更高 retained router mass 会保持 draft-target 一致性”这一代理假设被否定。当前实现保留用于负结果复现，
-不进入正式主实验；下一步先记录逐 verification 的 32 层预算轨迹，区分固定敏感层降配与跨步预算振荡。
+不进入正式主实验。进一步在完全固定 uniform B4 计算与真实专家集合的 trace 上离线回放，仅重分配预取行数：
+uniform 预测得到 46.50 repair rows/step，与真机计数完全一致；全局 `[3,5]` 方案得到 46.60 rows/step，
+恶化 0.2%，且每个预测步平均改变 19.8 层预算。这排除了“只需将计算预算与预取预算解耦”的解释，也说明
+上一轮 demand 的跨层边际不可预测下一轮的 repair 收益。至此停止 demand-only 层预算路线，不再作为候选创新。
 
 **因果与边界规则**：当前层需求只有执行目标 router 后才真实可知，因此本轮不能用本轮所有层需求反过来
 决定自身预算。首个 verification 使用统一 $B_{avg}$ 且全量预取；之后使用上一轮计划。不同 prompt 之间
