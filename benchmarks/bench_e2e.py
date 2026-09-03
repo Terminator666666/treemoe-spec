@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from functools import partial
 import json
 import os
 import sys
@@ -234,6 +235,8 @@ def main() -> None:
                     default="mass",
                     help="select the layer expert set by aggregate mass or "
                          "protect experts needed by high-acceptance nodes")
+    ap.add_argument("--compare-routing-objectives", action="store_true",
+                    help="run mass then critical_path after one weight load")
     ap.add_argument("--ar-baseline", action="store_true",
                     help="run plain greedy AR through the same offload plumbing "
                          "instead of the sweep (speedup denominator). Uses "
@@ -324,7 +327,8 @@ def main() -> None:
             ids = tok(text, return_tensors="pt", add_special_tokens=False).input_ids
             prompts.append(ids[0].cuda())
 
-    def factory(budget: int, tree_size: int):
+    def factory(budget: int, tree_size: int, routing_objective: str | None = None):
+        objective = routing_objective or args.routing_objective
         kv = PagedKVCache(cfg, num_blocks=256)
         pf = None
         if args.layout == "offload":
@@ -348,7 +352,7 @@ def main() -> None:
             routing = route_experts(x, lw.router, accept, layer_budget,
                                     inter=lw.w1.shape[1],
                                     top1_threshold=args.top1_threshold,
-                                    routing_objective=args.routing_objective)
+                                    routing_objective=objective)
             observer = getattr(moe_fn, "demand_observer", None)
             if observer is not None:
                 observer(layer_idx, routing.demand)
@@ -415,17 +419,18 @@ def main() -> None:
             layer_budget_allocator=allocator,
         ), pf
 
-        print(f"routing objective: {args.routing_objective}", flush=True)
         print(f"{'B':>3} {'N':>5} {'TPOT(ms)':>10} {'accept_len':>11} {'steps':>6} "
                     f"{'expert_hit':>10} {'budget_hist':>18} {'planR/s':>8} "
                     f"{'repairR/s':>9} {'H2DGiB/tok':>10} {'cold':>6}", flush=True)
     if args.check_lossless:
+        print(f"routing objective: {args.routing_objective}", flush=True)
         run_lossless_check(
             factory, args.tree_sizes[0], prompts, args.max_new_tokens,
             args.output_json,
         )
         return
     if args.ar_baseline:
+        print(f"routing objective: {args.routing_objective}", flush=True)
         # same kv/prefetcher/moe_fn plumbing as the spec arms, no draft/tree:
         # prefill, then one token per forward. budget=8 => exact AR outputs.
         eng, pf = factory(budget=8, tree_size=16)
@@ -449,34 +454,45 @@ def main() -> None:
         return
 
     trace_rows = []
-    for n in args.tree_sizes:
-        for b in args.budgets:
-            r = run_config(factory, b, n, prompts,
-                           max_new_tokens=args.max_new_tokens)
-            if args.budget_trace_json is not None:
-                trace_rows.append({
-                    "budget": b,
-                    "tree_size": n,
-                    "target_steps": r["target_steps"],
-                    "mean_accept_len": r["accept_len"],
-                    "budget_trace": r["budget_trace"],
-                    "demand_trace": r["demand_trace"],
-                    "expert_trace": r["expert_trace"],
-                })
-            histogram = r["budget_histogram"]
-            if histogram is None:
-                plan_hist = "-"
-            else:
-                plan_hist = "/".join(
-                    f"{budget}x{count}" for budget, count in enumerate(histogram)
-                    if count
+    objectives = (
+        ["mass", "critical_path"]
+        if args.compare_routing_objectives else [args.routing_objective]
+    )
+    for objective in objectives:
+        print(f"routing objective: {objective}", flush=True)
+        configured_factory = partial(factory, routing_objective=objective)
+        for n in args.tree_sizes:
+            for b in args.budgets:
+                r = run_config(configured_factory, b, n, prompts,
+                               max_new_tokens=args.max_new_tokens)
+                if args.budget_trace_json is not None:
+                    trace_rows.append({
+                        "routing_objective": objective,
+                        "budget": b,
+                        "tree_size": n,
+                        "target_steps": r["target_steps"],
+                        "mean_accept_len": r["accept_len"],
+                        "budget_trace": r["budget_trace"],
+                        "demand_trace": r["demand_trace"],
+                        "expert_trace": r["expert_trace"],
+                    })
+                histogram = r["budget_histogram"]
+                if histogram is None:
+                    plan_hist = "-"
+                else:
+                    plan_hist = "/".join(
+                        f"{budget}x{count}"
+                        for budget, count in enumerate(histogram) if count
+                    )
+                print(
+                    f"{r['budget']:>3} {r['tree_size']:>5} {r['tpot_ms']:>10.2f} "
+                    f"{r['accept_len']:>11.2f} {r['target_steps']:>6} "
+                    f"{r['hit_rate']:>10.3f} {plan_hist:>18} "
+                    f"{r['planned_rows_per_step']:>8.1f} "
+                    f"{r['repair_rows_per_step']:>9.1f} "
+                    f"{r['h2d_gib_per_token']:>10.2f} {r['cold']:>6}",
+                    flush=True,
                 )
-            print(f"{r['budget']:>3} {r['tree_size']:>5} {r['tpot_ms']:>10.2f} "
-                f"{r['accept_len']:>11.2f} {r['target_steps']:>6} "
-                f"{r['hit_rate']:>10.3f} {plan_hist:>18} "
-                f"{r['planned_rows_per_step']:>8.1f} "
-                f"{r['repair_rows_per_step']:>9.1f} "
-                f"{r['h2d_gib_per_token']:>10.2f} {r['cold']:>6}", flush=True)
     if args.budget_trace_json is not None:
         args.budget_trace_json.parent.mkdir(parents=True, exist_ok=True)
         args.budget_trace_json.write_text(json.dumps(trace_rows, indent=2) + "\n")
