@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from copy import deepcopy
+import math
+import platform
 import time
 
 import torch
@@ -24,6 +26,21 @@ class ExecutionTracer:
         self._pending: list[tuple[dict, torch.cuda.Event, torch.cuda.Event]] = []
         self._record_started = 0.0
         self._record_start_event: torch.cuda.Event | None = None
+        self.metadata = {
+            "python": platform.python_version(),
+            "pytorch": torch.__version__,
+            "cuda_runtime": torch.version.cuda,
+            "cudnn": torch.backends.cudnn.version(),
+            "cuda_available": torch.cuda.is_available(),
+        }
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            self.metadata["gpu"] = {
+                "name": props.name,
+                "compute_capability": f"{props.major}.{props.minor}",
+                "total_memory_bytes": props.total_memory,
+                "multiprocessors": props.multi_processor_count,
+            }
 
     def begin_prefill(self, num_tokens: int, device: torch.device) -> dict:
         record = {
@@ -63,6 +80,9 @@ class ExecutionTracer:
                 end = torch.cuda.Event(enable_timing=True)
                 end.record()
                 self._pending.append((timing, self._record_start_event, end))
+            if self.current_record.get("device") == "cuda" \
+                    and torch.cuda.is_available():
+                self.current_record["memory_end"] = self._memory_snapshot()
         self.current_record = None
         self.current_layer = None
         self._record_start_event = None
@@ -71,8 +91,20 @@ class ExecutionTracer:
         self._record_started = time.perf_counter()
         self._record_start_event = None
         if record["device"] == "cuda" and torch.cuda.is_available():
+            record["memory_start"] = self._memory_snapshot()
             self._record_start_event = torch.cuda.Event(enable_timing=True)
             self._record_start_event.record()
+
+    @staticmethod
+    def _memory_snapshot() -> dict[str, int]:
+        free, total = torch.cuda.mem_get_info()
+        return {
+            "allocated_bytes": torch.cuda.memory_allocated(),
+            "reserved_bytes": torch.cuda.memory_reserved(),
+            "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+            "free_bytes": free,
+            "total_bytes": total,
+        }
 
     def begin_layer(self, layer_index: int) -> dict | None:
         if self.current_record is None:
@@ -126,7 +158,16 @@ class ExecutionTracer:
             start_event.record()
         started = time.perf_counter()
         try:
-            yield
+            if "layer" in record:
+                label = f"layer_{record['layer']:02d}/{name}"
+            elif "depth" in record:
+                label = f"draft_depth_{record['depth']}/{name}"
+            elif record.get("kind") == "verification":
+                label = f"step_{record['index']:03d}/{name}"
+            else:
+                label = f"prefill/{name}"
+            with torch.profiler.record_function(label):
+                yield
         finally:
             timing["host"] += (time.perf_counter() - started) * 1e3
             if start_event is not None and end_event is not None:
@@ -176,9 +217,95 @@ class ExecutionTracer:
             "emitted_tokens": len(accepted_tokens) + 1,
         }
 
+    def record_target_decisions(
+        self,
+        record: dict,
+        tree,
+        logits: torch.Tensor,
+        accepted_slots: list[int],
+        top_k: int = 8,
+    ) -> None:
+        valid = tree.num_valid
+        scores = logits[:valid].float()
+        log_probs = torch.log_softmax(scores, dim=-1)
+        top_values, top_tokens = log_probs.topk(top_k, dim=-1)
+        parent = tree.parent[:valid]
+        tokens = tree.tokens[:valid]
+        child_rows = torch.arange(1, valid, device=logits.device)
+        predictor_rows = parent[1:valid]
+        proposed_tokens = tokens[1:valid]
+        proposed_logits = scores[predictor_rows, proposed_tokens]
+        proposed_log_probs = log_probs[predictor_rows, proposed_tokens]
+        proposed_ranks = (
+            scores[predictor_rows] > proposed_logits.unsqueeze(1)
+        ).sum(dim=1) + 1
+        packed = torch.cat([
+            top_tokens.float(), top_values,
+            proposed_logits.new_full((valid, 3), float("nan")),
+        ], dim=1)
+        packed[child_rows, 2 * top_k] = proposed_logits
+        packed[child_rows, 2 * top_k + 1] = proposed_log_probs
+        packed[child_rows, 2 * top_k + 2] = proposed_ranks.float()
+        rows = packed.detach().cpu().tolist()
+        tree_tokens = record["tree"]["tokens"]
+        tree_parent = record["tree"]["parent"]
+        accepted = set(accepted_slots)
+        visited_parents = {0, *accepted_slots}
+
+        def decision(node: int) -> str:
+            if node == 0:
+                return "root"
+            parent_node = tree_parent[node]
+            if parent_node not in visited_parents:
+                return "not_visited"
+            if node in accepted:
+                return "accepted"
+            accepted_child = next(
+                (child for child in tree.children[parent_node]
+                 if child in accepted),
+                None,
+            )
+            if accepted_child is None:
+                return "rejected"
+            siblings = tree.children[parent_node]
+            if siblings.index(node) < siblings.index(accepted_child):
+                return "rejected_before_accept"
+            return "not_evaluated_after_accept"
+
+        record["target_nodes"] = [
+            {
+                "node": node,
+                "predicts_children": tree.children[node],
+                "target_top_tokens": [int(value) for value in row[:top_k]],
+                "target_top_logprob": row[top_k:2 * top_k],
+                "target_top_probability": [
+                    math.exp(value)
+                    for value in row[top_k:2 * top_k]
+                ],
+                "proposed_token": tree_tokens[node] if node > 0 else None,
+                "predicting_parent": tree_parent[node] if node > 0 else None,
+                "proposed_target_logit": row[2 * top_k] if node > 0 else None,
+                "proposed_target_logprob": row[2 * top_k + 1] if node > 0 else None,
+                "proposed_target_probability": (
+                    math.exp(row[2 * top_k + 1])
+                    if node > 0 else None
+                ),
+                "proposed_target_rank": (
+                    int(row[2 * top_k + 2]) if node > 0 else None
+                ),
+                "accepted": node in accepted,
+                "decision": decision(node),
+            }
+            for node, row in enumerate(rows)
+        ]
+
     def to_dict(self) -> dict:
         for timing, start, end in self._pending:
             end.synchronize()
             timing["gpu"] += start.elapsed_time(end)
         self._pending.clear()
-        return deepcopy({"prefills": self.prefills, "steps": self.steps})
+        return deepcopy({
+            "metadata": self.metadata,
+            "prefills": self.prefills,
+            "steps": self.steps,
+        })

@@ -529,12 +529,15 @@ class Routing:
     needs before the GEMMs read the weights, so a lossy prefetch can be
     repaired into an exact one (cf. DualDeadline 2026 / MoE-SpeQ 2025)."""
 
-    __slots__ = ("ws", "gates_flat", "padded_slots", "block_expert_ids",
-                 "slot_to_row", "max_blocks", "demand")
+    __slots__ = ("ws", "router_gates", "topk_ids", "gates_flat",
+                 "padded_slots", "block_expert_ids", "slot_to_row",
+                 "max_blocks", "demand")
 
-    def __init__(self, ws, gates_flat, padded_slots, block_expert_ids,
-                 slot_to_row, max_blocks, demand):
+    def __init__(self, ws, router_gates, topk_ids, gates_flat, padded_slots,
+                 block_expert_ids, slot_to_row, max_blocks, demand):
         self.ws = ws
+        self.router_gates = router_gates
+        self.topk_ids = topk_ids
         self.gates_flat = gates_flat
         self.padded_slots = padded_slots
         self.block_expert_ids = block_expert_ids
@@ -635,7 +638,8 @@ def route_experts(
             # spill -> ~1KB (static_analysis.py sweep). Single-CTA latency win.
             num_warps=32,
         )
-        return Routing(ws, ws.gates_flat, ws.padded_slots,
+        return Routing(ws, gates, ws.topk_flat.view(n, 2), ws.gates_flat,
+               ws.padded_slots,
                    ws.block_expert_ids, ws.slot_to_row, ws.max_blocks,
                    ws.demand)
     (_topk_ids, topk_gates, padded_slots, block_expert_ids,
@@ -647,7 +651,8 @@ def route_experts(
         routing_objective=routing_objective,
     )
     gates_flat = topk_gates.reshape(-1).float().contiguous()   # index by slot id
-    return Routing(ws, gates_flat, padded_slots, block_expert_ids,
+    return Routing(ws, gates, _topk_ids, gates_flat, padded_slots,
+                   block_expert_ids,
                    slot_to_row, max_blocks, demand)
 
 

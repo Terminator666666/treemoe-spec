@@ -181,37 +181,48 @@ class MixtralForward:
     ) -> torch.Tensor:
         cfg = self.cfg
         t = x.shape[0]
-        q_proj = F.linear(x, lw.attn["q_proj"])
-        k_proj = F.linear(x, lw.attn["k_proj"])
-        v_proj = F.linear(x, lw.attn["v_proj"])
+        tracer = self.performance_tracer
+        layer_record = tracer.current_layer if tracer is not None else None
+        phase = tracer.phase(layer_record, "attention_qkv") \
+            if tracer else nullcontext()
+        with phase:
+            q_proj = F.linear(x, lw.attn["q_proj"])
+            k_proj = F.linear(x, lw.attn["k_proj"])
+            v_proj = F.linear(x, lw.attn["v_proj"])
         self._trace(layer_idx, "attn.q_proj", q_proj)
         self._trace(layer_idx, "attn.k_proj", k_proj)
         self._trace(layer_idx, "attn.v_proj", v_proj)
         q = q_proj.view(t, cfg.num_heads, cfg.head_dim)
         k = k_proj.view(t, cfg.num_kv_heads, cfg.head_dim)
         v = v_proj.view(t, cfg.num_kv_heads, cfg.head_dim)
-        q = apply_rope(q, self.rope_cos, self.rope_sin, positions)
-        k = apply_rope(k, self.rope_cos, self.rope_sin, positions)
+        phase = tracer.phase(layer_record, "attention_rope") \
+            if tracer else nullcontext()
+        with phase:
+            q = apply_rope(q, self.rope_cos, self.rope_sin, positions)
+            k = apply_rope(k, self.rope_cos, self.rope_sin, positions)
         self._trace(layer_idx, "attn.q_rope", q)
         self._trace(layer_idx, "attn.k_rope", k)
         self._trace(layer_idx, "attn.value_states", v)
 
-        if is_tree:
-            self.kv.write_tree(layer_idx, k, v)
-            # fused prefix-gather + tail append: one prefix copy, not two
-            full_k, full_v = self.kv.gather_with_tail(layer_idx, k, v)
-            prefix_len = full_k.shape[0] - t
-            mask = torch.zeros(t, prefix_len + t, dtype=torch.bool, device=x.device)
-            mask[:, :prefix_len] = True
-            mask[:, prefix_len:] = tree_mask  # [N, N] bool, ancestors incl. self
-        else:
-            self.kv.append(layer_idx, k, v, start_pos=start_pos)
-            full_k, full_v = self.kv.gather(layer_idx)
-            total = full_k.shape[0]
-            # causal mask without per-row int(positions[i]) D2H syncs
-            # (was 32 hidden syncs/step in the AR decode path)
-            mask = (torch.arange(total, device=x.device)[None, :]
-                    <= positions[:, None])
+        phase = tracer.phase(layer_record, "attention_kv_mask") \
+            if tracer else nullcontext()
+        with phase:
+            if is_tree:
+                self.kv.write_tree(layer_idx, k, v)
+                # fused prefix-gather + tail append: one prefix copy, not two
+                full_k, full_v = self.kv.gather_with_tail(layer_idx, k, v)
+                prefix_len = full_k.shape[0] - t
+                mask = torch.zeros(
+                    t, prefix_len + t, dtype=torch.bool, device=x.device,
+                )
+                mask[:, :prefix_len] = True
+                mask[:, prefix_len:] = tree_mask
+            else:
+                self.kv.append(layer_idx, k, v, start_pos=start_pos)
+                full_k, full_v = self.kv.gather(layer_idx)
+                total = full_k.shape[0]
+                mask = (torch.arange(total, device=x.device)[None, :]
+                        <= positions[:, None])
         self._trace(layer_idx, "attn.mask", mask)
 
         qh = q.transpose(0, 1).unsqueeze(0)       # [1, heads, T, hd]
@@ -233,15 +244,21 @@ class MixtralForward:
         # enable_gqa: SDPA maps q head h -> kv head h // (heads/kv_heads)
         # internally, same grouping as the old repeat_interleave but without
         # materializing a 4x copy of the whole K/V prefix per layer per step.
-        o = F.scaled_dot_product_attention(
-            qh, kh, vh, attn_mask=attention_mask, dropout_p=0.0,
-            is_causal=is_causal, scale=cfg.head_dim**-0.5, enable_gqa=True,
-        )
-        o = o.transpose(1, 2).contiguous().reshape(
-            1, t, cfg.num_heads * cfg.head_dim,
-        )[0]
+        phase = tracer.phase(layer_record, "attention_sdpa") \
+            if tracer else nullcontext()
+        with phase:
+            o = F.scaled_dot_product_attention(
+                qh, kh, vh, attn_mask=attention_mask, dropout_p=0.0,
+                is_causal=is_causal, scale=cfg.head_dim**-0.5, enable_gqa=True,
+            )
+            o = o.transpose(1, 2).contiguous().reshape(
+                1, t, cfg.num_heads * cfg.head_dim,
+            )[0]
         self._trace(layer_idx, "attn.context", o)
-        output = F.linear(o, lw.attn["o_proj"])
+        phase = tracer.phase(layer_record, "attention_output") \
+            if tracer else nullcontext()
+        with phase:
+            output = F.linear(o, lw.attn["o_proj"])
         self._trace(layer_idx, "attn.output", output)
         return output
 

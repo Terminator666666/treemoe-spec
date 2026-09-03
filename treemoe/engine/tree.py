@@ -98,6 +98,18 @@ def build_eagle2_tree(
             topv, topi = logprobs.topk(branch_k, dim=-1)
             # ONE packed D2H per level. token ids (<32000) are exact in fp32.
             packed = torch.cat([topi.float(), topv], dim=1).tolist()
+        if level_record is not None:
+            level_record.update({
+                "frontier_pool_nodes": frontier.copy(),
+                "input_tokens": [pool_tokens[i] for i in frontier],
+                "positions": [root_pos + pool_depth[i] for i in frontier],
+                "candidate_token_ids": [
+                    [int(value) for value in row[:branch_k]] for row in packed
+                ],
+                "candidate_logprob": [
+                    [float(value) for value in row[branch_k:]] for row in packed
+                ],
+            })
         next_frontier = []
         for fi, pool_i in enumerate(frontier):
             row = packed[fi]
@@ -114,6 +126,7 @@ def build_eagle2_tree(
         if level_record is not None:
             level_record["generated_candidates"] = len(next_frontier)
             level_record["next_frontier_nodes"] = len(frontier)
+            level_record["selected_frontier_pool_nodes"] = frontier.copy()
 
     # global top-(tree_size-1) selection by acceptance proxy exp(logp); root always kept
     order = sorted(range(1, len(pool_tokens)), key=lambda i: -pool_logp[i])

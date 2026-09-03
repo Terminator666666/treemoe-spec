@@ -212,6 +212,10 @@ class SpecDecodeEngine:
             tracer.record_acceptance(
                 record, accepted_slots, vals[2:2 + num], vals[1],
             )
+            with tracer.phase(record, "target_diagnostics"):
+                tracer.record_target_decisions(
+                    record, tree, logits, accepted_slots,
+                )
 
         if hasattr(self.draft, "extend_committed"):
             # commit [root, a_1..a_m] into the draft's committed KV with TARGET

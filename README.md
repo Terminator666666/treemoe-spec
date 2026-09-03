@@ -32,19 +32,32 @@ pytest -m "gpu and model"                            # 单独进程跑真实模�
 ## 全阶段性能追踪
 
 诊断模式用 host wall clock 和延迟解析的 CUDA Events 记录 prefill、EAGLE 建树、target verification、
-verify/commit、draft commit，以及每层 attention、prefetch wait、route、expert-id D2H、repair、MoE GEMM
-和侧流 H2D。JSON 同时保存完整草稿树的 token/parent/depth/接受概率、每个节点的根路径、实际接受路径，
-以及逐层 staged/routed/missing 专家、slot 数和 demand：
+verify/commit、draft commit，以及每层 QKV、RoPE、KV/cache mask、SDPA、输出投影、prefetch wait、route、
+expert-id D2H、repair、MoE GEMM 和侧流 H2D。JSON 同时保存：
+
+- 完整草稿树的 token、parent、depth、接受概率、根路径和实际接受路径；
+- 每层级全部 frontier、候选 token/logprob 和下一层入选节点；
+- 每个 target 节点的 top-8、提议 token 的精确 rank/probability 及接受、拒绝、未访问状态；
+- 每层每节点的八专家 router 概率、原始 top-2、预算后 top-2、staged/routed/missing 专家和 demand；
+- 每次 planned H2D/repair、ring-slot wait、GPU 已分配/保留/空闲/峰值显存及运行环境。
+
+同时打开 PyTorch profiler 会生成全部 CPU/CUDA 算子、kernel、memcpy、stream、输入形状与内存事件：
 
 ```bash
 python3 -u benchmarks/bench_e2e.py \
 	--layout offload --budgets 4 --tree-sizes 64 \
 	--num-prompts 1 --max-new-tokens 32 --uniform-layer-budget \
 	--no-router-hint \
-	--execution-trace-json artifacts/execution_trace.json
+	--execution-trace-json artifacts/execution_trace.json \
+	--torch-profiler-dir artifacts/profiler
 python3 benchmarks/analyze_execution_trace.py \
-	artifacts/execution_trace.json --show-tree
+	artifacts/execution_trace.json --show-all \
+	> artifacts/execution_trace_report.txt
 ```
 
-trace 模式会增加 CUDA Events 和诊断 D2H，只用于归因；论文 TPOT 必须关闭
-`--execution-trace-json` 后单独测量。
+`artifacts/profiler` 下的 `*.chrome.json` 用 `chrome://tracing` 或 Perfetto 打开，
+`*.operators.txt` 按 self CUDA time 列出前 500 个 shape-aware 算子，`*.memory.html` 是显存时间线。
+`--show-all` 可能输出数万行，完整报告应重定向到文件。
+
+trace/profiler 模式会增加 CUDA Events、log-softmax、精确 rank 计算、诊断 D2H、栈采集和大量 I/O，
+只用于归因；论文 TPOT 必须同时关闭 `--execution-trace-json` 和 `--torch-profiler-dir` 后单独测量。

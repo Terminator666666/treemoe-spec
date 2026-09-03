@@ -41,18 +41,54 @@ def ar_generate(target, prompt: torch.Tensor, max_new_tokens: int,
 
 
 def run_config(engine_factory, budget: int, tree_size: int, prompts: list[torch.Tensor],
-               max_new_tokens: int = 128) -> dict:
+               max_new_tokens: int = 128,
+               profiler_dir: Path | None = None,
+               profiler_label: str = "run") -> dict:
     eng, pf = engine_factory(budget=budget, tree_size=tree_size)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     total_tokens = 0
-    for i, p in enumerate(prompts):
-        out = eng.generate(p, max_new_tokens=max_new_tokens)
-        total_tokens += len(out)
-        el = time.perf_counter() - t0
-        print(f"  B={budget} N={tree_size} prompt {i + 1}/{len(prompts)} "
-              f"({el:.0f}s elapsed, {el / total_tokens * 1e3:.0f}ms/tok)",
-              file=sys.stderr, flush=True)
+    profiler_context = nullcontext(None)
+    if profiler_dir is not None:
+        profiler_context = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        )
+    with profiler_context as profiler:
+        for i, p in enumerate(prompts):
+            out = eng.generate(p, max_new_tokens=max_new_tokens)
+            total_tokens += len(out)
+            el = time.perf_counter() - t0
+            print(f"  B={budget} N={tree_size} prompt {i + 1}/{len(prompts)} "
+                  f"({el:.0f}s elapsed, {el / total_tokens * 1e3:.0f}ms/tok)",
+                  file=sys.stderr, flush=True)
+    profiler_artifacts = None
+    if profiler is not None:
+        profiler_dir.mkdir(parents=True, exist_ok=True)
+        chrome_path = profiler_dir / f"{profiler_label}.chrome.json"
+        table_path = profiler_dir / f"{profiler_label}.operators.txt"
+        memory_path = profiler_dir / f"{profiler_label}.memory.html"
+        profiler.export_chrome_trace(str(chrome_path))
+        table_path.write_text(profiler.key_averages(
+            group_by_input_shape=True,
+        ).table(sort_by="self_cuda_time_total", row_limit=500))
+        memory_artifact = str(memory_path)
+        try:
+            profiler.export_memory_timeline(str(memory_path), device="cuda:0")
+        except (RuntimeError, ValueError) as error:
+            error_path = profiler_dir / f"{profiler_label}.memory-error.txt"
+            error_path.write_text(f"{type(error).__name__}: {error}\n")
+            memory_artifact = str(error_path)
+        profiler_artifacts = {
+            "chrome_trace": str(chrome_path),
+            "operator_table": str(table_path),
+            "memory_timeline": memory_artifact,
+        }
     torch.cuda.synchronize()
     wall = time.perf_counter() - t0
     target_steps = eng.stats.steps
@@ -99,6 +135,7 @@ def run_config(engine_factory, budget: int, tree_size: int, prompts: list[torch.
             eng.performance_tracer.to_dict()
             if eng.performance_tracer is not None else None
         ),
+        "profiler_artifacts": profiler_artifacts,
     }
     if pf is not None and pf.routed_total:
         r["hit_rate"] = 1.0 - pf.repair_misses / pf.routed_total
@@ -257,6 +294,9 @@ def main() -> None:
     ap.add_argument("--execution-trace-json", type=Path, default=None,
                     help="write opt-in full-stage CUDA/host timings, routing, "
                          "prefetch, tree topology, and accepted paths")
+    ap.add_argument("--torch-profiler-dir", type=Path, default=None,
+                    help="write full CPU/CUDA kernel Chrome trace, operator "
+                         "table, and GPU memory timeline (diagnostic only)")
     args = ap.parse_args()
     if args.check_lossless and args.top1_threshold != 0:
         ap.error("--check-lossless requires --top1-threshold 0")
@@ -427,6 +467,12 @@ def main() -> None:
                     slot_counts = (routing.padded_slots.view(
                         routing.ws.num_experts, -1) >= 0).sum(-1).tolist()
                     demand = routing.demand.detach().float().cpu().tolist()
+                    original_prob, original_ids = routing.router_gates.topk(2, dim=-1)
+                    routing_detail = torch.cat([
+                        routing.router_gates,
+                        original_ids.float(), original_prob,
+                        routing.topk_ids.float(), routing.gates_flat.view(-1, 2),
+                    ], dim=-1).detach().float().cpu().tolist()
                 staged = pf._staged_rows.get(layer_idx) if pf is not None else None
                 layer_record.update({
                     "budget": layer_budget,
@@ -445,6 +491,28 @@ def main() -> None:
                     "missing_experts": missing_before_repair,
                     "slot_counts": slot_counts,
                     "acceptance_weighted_demand": demand,
+                    "nodes": [
+                        {
+                            "node": node,
+                            "accept_probability": float(accept[node]),
+                            "router_probability": row[:cfg.num_experts],
+                            "original_top2_experts": [
+                                int(value) for value in
+                                row[cfg.num_experts:cfg.num_experts + 2]
+                            ],
+                            "original_top2_probability": row[
+                                cfg.num_experts + 2:cfg.num_experts + 4
+                            ],
+                            "selected_experts": [
+                                int(value) for value in
+                                row[cfg.num_experts + 4:cfg.num_experts + 6]
+                            ],
+                            "selected_gates": row[
+                                cfg.num_experts + 6:cfg.num_experts + 8
+                            ],
+                        }
+                        for node, row in enumerate(routing_detail)
+                    ],
                     "expert_row_bytes": (
                         pf.expert_row_bytes if pf is not None else 0
                     ),
@@ -492,10 +560,6 @@ def main() -> None:
             layer_budget_allocator=allocator,
             performance_tracer=tracer,
         ), pf
-
-        print(f"{'B':>3} {'N':>5} {'TPOT(ms)':>10} {'accept_len':>11} {'steps':>6} "
-                    f"{'expert_hit':>10} {'budget_hist':>18} {'planR/s':>8} "
-                    f"{'repairR/s':>9} {'H2DGiB/tok':>10} {'cold':>6}", flush=True)
     if args.check_lossless:
         print(f"routing objective: {args.routing_objective}", flush=True)
         run_lossless_check(
@@ -533,13 +597,20 @@ def main() -> None:
         ["mass", "critical_path"]
         if args.compare_routing_objectives else [args.routing_objective]
     )
+    print(f"{'B':>3} {'N':>5} {'TPOT(ms)':>10} {'accept_len':>11} {'steps':>6} "
+          f"{'expert_hit':>10} {'budget_hist':>18} {'planR/s':>8} "
+          f"{'repairR/s':>9} {'H2DGiB/tok':>10} {'cold':>6}", flush=True)
     for objective in objectives:
         print(f"routing objective: {objective}", flush=True)
         configured_factory = partial(factory, routing_objective=objective)
         for n in args.tree_sizes:
             for b in args.budgets:
                 r = run_config(configured_factory, b, n, prompts,
-                               max_new_tokens=args.max_new_tokens)
+                               max_new_tokens=args.max_new_tokens,
+                               profiler_dir=args.torch_profiler_dir,
+                               profiler_label=(
+                                   f"{objective}-b{b}-n{n}"
+                               ))
                 if args.budget_trace_json is not None:
                     trace_rows.append({
                         "routing_objective": objective,
@@ -559,6 +630,7 @@ def main() -> None:
                         "num_prompts": args.num_prompts,
                         "max_new_tokens": args.max_new_tokens,
                         "trace": r["execution_trace"],
+                        "profiler_artifacts": r["profiler_artifacts"],
                     })
                 histogram = r["budget_histogram"]
                 if histogram is None:
@@ -577,6 +649,9 @@ def main() -> None:
                     f"{r['h2d_gib_per_token']:>10.2f} {r['cold']:>6}",
                     flush=True,
                 )
+                if r["profiler_artifacts"] is not None:
+                    for artifact, path in r["profiler_artifacts"].items():
+                        print(f"  profiler {artifact}: {path}", flush=True)
     if args.budget_trace_json is not None:
         args.budget_trace_json.parent.mkdir(parents=True, exist_ok=True)
         args.budget_trace_json.write_text(json.dumps(trace_rows, indent=2) + "\n")

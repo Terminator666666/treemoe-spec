@@ -15,7 +15,9 @@ def _mean(values: list[float]) -> float:
     return sum(values) / max(len(values), 1)
 
 
-def summarize(config: dict, show_tree: bool = False) -> None:
+def summarize(config: dict, show_tree: bool = False,
+              show_draft: bool = False, show_target: bool = False,
+              show_routing: bool = False) -> None:
     trace = config["trace"]
     steps = trace["steps"]
     print(
@@ -23,6 +25,7 @@ def summarize(config: dict, show_tree: bool = False) -> None:
         f"N={config['tree_size']} prompts={config['num_prompts']} "
         f"steps={len(steps)}"
     )
+    print(f"ENVIRONMENT {trace.get('metadata', {})}")
     if not steps:
         print("no verification steps")
         return
@@ -84,6 +87,85 @@ def summarize(config: dict, show_tree: bool = False) -> None:
                     f"{tree['depth'][node]:5d} {tree['tokens'][node]:5d} "
                     f"{tree['accept_probability'][node]:11.6f} {path}"
                 )
+        if show_draft:
+            print("  DRAFT CANDIDATES:")
+            for level in step.get("draft_levels", []):
+                print(
+                    f"    depth={level['depth']} frontier="
+                    f"{level.get('frontier_pool_nodes', [])} selected="
+                    f"{level.get('selected_frontier_pool_nodes', [])}"
+                )
+                for row, pool_node in enumerate(
+                        level.get("frontier_pool_nodes", [])):
+                    candidates = " ".join(
+                        f"{token}:{logprob:.7f}"
+                        for token, logprob in zip(
+                            level["candidate_token_ids"][row],
+                            level["candidate_logprob"][row], strict=True,
+                        )
+                    )
+                    print(
+                        f"      pool={pool_node} input="
+                        f"{level['input_tokens'][row]} pos="
+                        f"{level['positions'][row]} candidates={candidates}"
+                    )
+        if show_target and step.get("target_nodes"):
+            print("  TARGET DECISIONS:")
+            for node in step["target_nodes"]:
+                top = " ".join(
+                    f"{token}:{prob:.7f}"
+                    for token, prob in zip(
+                        node["target_top_tokens"],
+                        node["target_top_probability"], strict=True,
+                    )
+                )
+                print(
+                    f"    node={node['node']} parent={node['predicting_parent']} "
+                    f"proposed={node['proposed_token']} "
+                    f"rank={node['proposed_target_rank']} "
+                    f"p={node['proposed_target_probability']} "
+                    f"decision={node.get('decision')} children="
+                    f"{node['predicts_children']} top8={top}"
+                )
+        if show_routing:
+            print("  ROUTING BY LAYER / NODE:")
+            for layer in step["layers"]:
+                print(
+                    f"    layer={layer['layer']} budget={layer.get('budget')} "
+                    f"routed={layer.get('routed_experts')} "
+                    f"staged_before={layer.get('staged_experts_before_repair')} "
+                    f"missing={layer.get('missing_experts')} "
+                    f"repair_rows={layer.get('repair_rows')} "
+                    f"slots={layer.get('slot_counts')} demand="
+                    f"{layer.get('acceptance_weighted_demand')}"
+                )
+                for node in layer.get("nodes", []):
+                    probs = " ".join(
+                        f"e{expert}={value:.7f}"
+                        for expert, value in enumerate(
+                            node["router_probability"]
+                        )
+                    )
+                    print(
+                        f"      node={node['node']} accept_p="
+                        f"{node['accept_probability']:.7f} "
+                        f"original={node['original_top2_experts']}/"
+                        f"{node['original_top2_probability']} selected="
+                        f"{node['selected_experts']}/{node['selected_gates']} "
+                        f"router=[{probs}]"
+                    )
+            print("  PREFETCH COPIES:")
+            for copy in step.get("prefetch_copies", []):
+                print(
+                    f"    layer={copy['layer']} experts={copy.get('experts')} "
+                    f"rows={copy.get('rows')} wait_gpu_ms="
+                    f"{_timing(copy, 'slot_wait', 'gpu'):.4f} h2d_gpu_ms="
+                    f"{_timing(copy, 'h2d', 'gpu'):.4f}"
+                )
+            print(
+                f"  MEMORY start={step.get('memory_start')} "
+                f"end={step.get('memory_end')}"
+            )
 
     print("\nDRAFT TREE LEVELS (mean ms / occurrence)")
     print("depth frontier candidates next  forwardGPU selectGPU selectHost")
@@ -115,7 +197,9 @@ def summarize(config: dict, show_tree: bool = False) -> None:
         print(f"{phase:20s} {host:10.2f} {gpu:9.2f}")
 
     layer_phases = (
-        "attention", "moe_prepare", "moe_total", "route", "expert_ids_d2h",
+        "attention", "attention_qkv", "attention_rope", "attention_kv_mask",
+        "attention_sdpa", "attention_output", "moe_prepare", "moe_total",
+        "route", "expert_ids_d2h",
         "repair", "routing_snapshot", "expert_gemm", "cold_cpu",
         "prefetch_release",
     )
@@ -155,8 +239,11 @@ def summarize(config: dict, show_tree: bool = False) -> None:
         )
 
     print("\nTARGET BREAKDOWN (sum of layer means, ms / step)")
-    for phase in ("attention", "moe_prepare", "moe_total", "route", "repair",
-                  "expert_gemm"):
+    for phase in (
+        "attention", "attention_qkv", "attention_rope", "attention_kv_mask",
+        "attention_sdpa", "attention_output", "moe_prepare", "moe_total",
+        "route", "repair", "expert_gemm",
+    ):
         total = 0.0
         for layer_index in range(layer_count):
             rows = [
@@ -185,10 +272,24 @@ def main() -> None:
     parser.add_argument("trace", type=Path)
     parser.add_argument("--show-tree", action="store_true",
                         help="print every valid draft node and its root path")
+    parser.add_argument("--show-draft", action="store_true",
+                        help="print every draft frontier candidate and logprob")
+    parser.add_argument("--show-target", action="store_true",
+                        help="print per-node target top-k and proposed-token rank")
+    parser.add_argument("--show-routing", action="store_true",
+                        help="print every layer/node router probability and copy")
+    parser.add_argument("--show-all", action="store_true",
+                        help="enable every verbose structural diagnostic")
     args = parser.parse_args()
     configs = json.loads(args.trace.read_text())
     for config in configs:
-        summarize(config, show_tree=args.show_tree)
+        summarize(
+            config,
+            show_tree=args.show_tree or args.show_all,
+            show_draft=args.show_draft or args.show_all,
+            show_target=args.show_target or args.show_all,
+            show_routing=args.show_routing or args.show_all,
+        )
 
 
 if __name__ == "__main__":
