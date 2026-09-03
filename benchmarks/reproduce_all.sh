@@ -37,12 +37,14 @@ echo "== tree-size ablation (N=64 reuses the main experiment) =="
 	--budgets 2 4 8 --tree-sizes 16 32 \
 	--num-prompts 20 --max-new-tokens 128 --top1-threshold 0
 
-echo "== prefetch ablation: temporal only =="
-"$PYTHON" benchmarks/bench_e2e.py --layout offload --no-router-hint \
+echo "== staging ablation: predictive temporal only =="
+"$PYTHON" benchmarks/bench_e2e.py --layout offload --predictive-prefetch \
+	--no-router-hint \
 	--budgets 4 --tree-sizes 64 --num-prompts 20 --max-new-tokens 128 \
 	--top1-threshold 0
 
-echo "== prefetch ablation: full copy =="
-"$PYTHON" benchmarks/bench_e2e.py --layout offload --no-auto-bitmap --no-router-hint \
+echo "== staging ablation: predictive full copy =="
+"$PYTHON" benchmarks/bench_e2e.py --layout offload --predictive-prefetch \
+	--no-auto-bitmap --no-router-hint \
 	--budgets 4 --tree-sizes 64 --num-prompts 20 --max-new-tokens 128 \
 	--top1-threshold 0

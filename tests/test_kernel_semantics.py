@@ -13,7 +13,12 @@ import pytest
 import torch
 
 from tests.conftest import make_moe_inputs
-from treemoe.kernels.op1_tree_moe import BM, route_and_bucket
+from treemoe.kernels.op1_tree_moe import (
+    BM,
+    compact_block_capacity,
+    compact_block_limit,
+    route_and_bucket,
+)
 from treemoe.ref.tree_moe_ref import route_and_bucket_ref
 from treemoe.ref.verify_ref import tree_verify_ref
 
@@ -31,10 +36,11 @@ def test_padded_layout_matches_ref_segments(rng, budget):
     )
     assert torch.equal(ids_r, ids_k) and torch.allclose(gates_r, gates_k)
 
-    max_bpe = (2 * N + BM - 1) // BM
     for e in range(E):
         seg_ref = sorted_slots[offsets[e] : offsets[e + 1]]
-        region = padded[e * max_bpe * BM : (e + 1) * max_bpe * BM]
+        blocks = torch.where(blk_experts == e)[0]
+        rows = blocks[:, None] * BM + torch.arange(BM)
+        region = padded[rows.reshape(-1)]
         seg_pad = region[region >= 0]
         assert torch.equal(seg_pad, seg_ref)  # same slots, same DFS order
         # -1 padding must be a strict suffix of the region (dense prefix)
@@ -52,14 +58,25 @@ def test_slot_to_row_is_exact_inverse(rng):
 def test_block_expert_ids_consistent(rng):
     x, _, _, _, router, accept = make_moe_inputs(N, E, H, I, rng)
     _, _, padded, blk_experts, _, max_blocks = route_and_bucket(x, router, accept, 4)
-    max_bpe = max_blocks // E
+    previous_expert = -1
     for b in range(max_blocks):
         rows = padded[b * BM : (b + 1) * BM]
         if blk_experts[b] < 0:
             assert (rows == -1).all()  # masked block: kernel exits, rows unused
         else:
-            assert blk_experts[b] == b // max_bpe
+            assert int(blk_experts[b]) >= previous_expert
+            previous_expert = int(blk_experts[b])
             assert (rows >= 0).any()   # used block must carry >=1 real slot
+
+
+@pytest.mark.parametrize("budget, expected", [(2, 16), (4, 16), (8, 16)])
+def test_compact_n64_capacity_replaces_64_sparse_blocks(budget, expected):
+    assert compact_block_capacity(2 * N, budget, BM) == expected
+
+
+@pytest.mark.parametrize("budget, expected", [(2, 9), (4, 11), (8, 15)])
+def test_compact_n64_launch_bound_avoids_power_of_two_padding(budget, expected):
+    assert compact_block_limit(2 * N, budget, BM) == expected
 
 
 # ---------------- op4 kernel: greedy DFS simulation vs reference ----------------
@@ -153,8 +170,7 @@ def _simulate_fused_route_bucket(x, router, accept, budget, tau=0.05, ep=16):
     """Line-by-line torch port of _budget_bucket_fused_kernel (op1_tree_moe.py)."""
     n = x.shape[0]
     e = router.shape[0]
-    max_bpe = (2 * n + BM - 1) // BM
-    max_blocks = e * max_bpe
+    max_blocks = compact_block_capacity(2 * n, budget, BM)
 
     logits = torch.full((n, ep), float("-inf"))
     logits[:, :e] = (x @ router.t()).float()
@@ -187,18 +203,22 @@ def _simulate_fused_route_bucket(x, router, accept, budget, tau=0.05, ep=16):
     eq = fe[:, None] == fe[None, :]
     lower = slots[None, :] < slots[:, None]
     rank = (eq & lower).sum(1)
-    dest = fe * (max_bpe * BM) + rank
+    counts = (fe[None, :] == torch.arange(ep)[:, None]).sum(1)
+    blocks_needed = (counts + BM - 1) // BM
+    block_starts = torch.zeros(ep, dtype=torch.long)
+    block_starts[1:] = blocks_needed.cumsum(0)[:-1]
+    dest = block_starts[fe] * BM + rank
 
     pos = torch.arange(max_blocks * BM)
     hit = pos[:, None] == dest[None, :]
     padded = (hit * (slots[None, :] + 1)).sum(1) - 1             # -1 where no slot
 
-    counts = (fe[None, :] == torch.arange(ep)[:, None]).sum(1)
-    blocks_needed = (counts + BM - 1) // BM
     blk = torch.arange(max_blocks)
-    need = blocks_needed[blk // max_bpe]
-    used = (blk % max_bpe) < need
-    blk_ids = torch.where(used, blk // max_bpe, torch.full((), -1, dtype=torch.long))
+    owns = ((blk[:, None] >= block_starts[None, :])
+            & (blk[:, None] < (block_starts + blocks_needed)[None, :]))
+    used = owns.any(1)
+    blk_ids = torch.full((max_blocks,), -1, dtype=torch.long)
+    blk_ids[used] = owns[used].long().argmax(1)
     topk_flat = torch.stack([i1, i2], dim=1).reshape(-1)
     gates_flat = torch.stack([tg1, tg2], dim=1).reshape(-1)
     return topk_flat, gates_flat, padded, blk_ids, dest

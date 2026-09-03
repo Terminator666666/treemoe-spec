@@ -246,7 +246,7 @@ def test_fused_route_bucket_triton_matches_torch(n, budget):
     _budget_bucket_fused_kernel[(1,)](
         router_gates, accept, topk, gates, padded, blk, s2r, demand,
         budget, 0.05, N=n, E=e, EP=16,
-        MAX_BPE=(2 * n + BM - 1) // BM, BLOCK_M=BM, MAX_BLOCKS=max_blocks,
+        BLOCK_M=BM, MAX_BLOCKS=max_blocks,
         CRITICAL_PATH=False,
     )
     assert torch.equal(topk, ids_t.reshape(-1))
@@ -372,6 +372,22 @@ def test_routing_exclude_experts_cpu(rng, monkeypatch):
     # skipped blocks' partial rows are zeroed -> the fixed-order combine
     # adds exact zeros for the excluded slots
     assert routing.ws.partial is not None
+
+
+def test_compact_workspace_capacity_is_independent_of_sparse_expert_regions(
+    rng, monkeypatch,
+):
+    monkeypatch.setenv("TREEMOE_FUSED_A", "0")
+    from treemoe.kernels.op1_tree_moe import BM, route_experts
+
+    x, _, _, _, router, accept = make_moe_inputs(64, E, H, I, rng)
+    routing = route_experts(x, router, accept, 8, I)
+
+    assert routing.max_blocks == 16
+    assert routing.launch_blocks == 15
+    assert routing.ws.max_blocks == 16
+    assert routing.ws.rows == 16 * BM
+    assert routing.padded_slots.numel() == 16 * BM
 
 
 @pytest.mark.gpu

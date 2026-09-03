@@ -47,7 +47,9 @@ def main():
     fwd(op1, inputs, fused=True, pack=True)  # populates ws.* via Kernel A
     key = (N, E, H, I, x.device.index, x.dtype)
     ws = op1._ws_cache[key]
-    tids, tgates, tslots, tblk, ts2r, _ = op1.route_and_bucket(x, router, accept, BUDGET)
+    tids, tgates, tslots, tblk, ts2r, compact_blocks = op1.route_and_bucket(
+        x, router, accept, BUDGET,
+    )
     tgates_flat = tgates.reshape(-1).float()
 
     print("\n== fused Kernel A vs torch route_and_bucket ==")
@@ -56,8 +58,8 @@ def main():
           + ("" if id_eq else f"   ({(ws.topk_flat != tids.reshape(-1)).sum().item()}/{2*N} slots differ)"))
     gd = (ws.gates_flat - tgates_flat).abs().max().item()
     print(f"gates max|d|:          {gd:.3e}")
-    for name, a, b in (("padded_slots", ws.padded_slots, tslots),
-                       ("block_expert_ids", ws.block_expert_ids, tblk),
+    for name, a, b in (("padded_slots", ws.padded_slots[:compact_blocks * op1.BM], tslots),
+                       ("block_expert_ids", ws.block_expert_ids[:compact_blocks], tblk),
                        ("slot_to_row", ws.slot_to_row, ts2r)):
         print(f"{name:22s} equal: {torch.equal(a, b)}")
 

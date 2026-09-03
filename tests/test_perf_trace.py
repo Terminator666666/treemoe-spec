@@ -1,9 +1,32 @@
+import sys
 import time
 
 import pytest
 import torch
 
 from treemoe.engine.perf_trace import ExecutionTracer
+
+
+def test_trace_baseline_first_requires_trace_output(monkeypatch):
+    from benchmarks.bench_e2e import main
+
+    monkeypatch.setattr(sys, "argv", [
+        "bench_e2e.py", "--execution-trace-baseline-first",
+    ])
+    with pytest.raises(SystemExit) as error:
+        main()
+    assert error.value.code == 2
+
+
+def test_lossless_check_rejects_atomic_moe(monkeypatch):
+    from benchmarks.bench_e2e import main
+
+    monkeypatch.setattr(sys, "argv", [
+        "bench_e2e.py", "--check-lossless", "--atomic-moe",
+    ])
+    with pytest.raises(SystemExit) as error:
+        main()
+    assert error.value.code == 2
 
 
 def test_profiler_export_errors_do_not_abort_other_artifacts(tmp_path):
@@ -137,4 +160,33 @@ def test_execution_trace_analyzer_prints_stage_and_path_report(capsys):
     assert "ROUTING BY LAYER / NODE" in output
     assert "router=[e0=0.7000000" in output
     assert "0>1" in output
+
+
+def test_progressive_trace_skips_large_draft_and_target_diagnostics():
+    tracer = ExecutionTracer(detail="progressive")
+    record = tracer.begin_step(0, 0, torch.device("cpu"))
+    with tracer.phase(record, "draft_tree"):
+        pass
+
+    class Tree:
+        num_valid = 2
+        parent = torch.tensor([-1, 0])
+        tokens = torch.tensor([10, 11])
+        accept_prob = torch.tensor([1.0, 0.5])
+        children = [[1], []]
+
+    tracer.record_tree(record, Tree())
+    assert tracer.begin_draft_level(1, 1, 0) == {}
+    tracer.record_target_decisions(
+        record, Tree(), torch.zeros(2, 20), accepted_slots=[],
+    )
+    tracer.record_acceptance(record, [], [], 12)
+    tracer.end_record()
+    result = tracer.to_dict()["steps"][0]
+
+    assert "draft_levels" not in result
+    assert "target_nodes" not in result
+    assert "draft_tree" not in result.get("timing_ms", {})
+    assert result["tree"]["parent"] == [-1, 0]
+    assert result["acceptance"]["bonus_token"] == 12
 

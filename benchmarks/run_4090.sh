@@ -51,8 +51,10 @@ else
   E2E_W="--random-weights --num-prompts 3 --max-new-tokens 32 --budgets 4 8 --no-router-hint"
 fi
 python benchmarks/bench_e2e.py --layout offload --prefetch-depth 2 $E2E_W
-python benchmarks/bench_e2e.py --layout offload --prefetch-depth 2 --no-auto-bitmap $E2E_W
-# hit_rate column: auto_bitmap temporal predictor vs full-copy baseline
+python benchmarks/bench_e2e.py --layout offload --prefetch-depth 2 --predictive-prefetch $E2E_W
+python benchmarks/bench_e2e.py --layout offload --prefetch-depth 2 \
+  --predictive-prefetch --no-auto-bitmap $E2E_W
+# default exact JIT vs temporal prediction+repair vs full-copy baseline
 
 if [ -d checkpoints/mixtral-8x7b-instruct ] || [ -d /root/autodl-tmp/Mixtral-8x7B-Instruct-v0.1 ]; then
   echo "== tier 3: red-line tests (offloaded, slow: expect ~30-60 min) =="

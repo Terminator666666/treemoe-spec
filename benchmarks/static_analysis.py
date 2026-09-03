@@ -56,8 +56,9 @@ REG_ALLOC_UNIT = 256    # regs allocated per warp in units of 256
 N, E, H, I = 64, 8, 4096, 14336
 BM, SPLIT_K = op1.BM, op1.SPLIT_K
 BN1, BK1, BN2, BK2 = op1.BN1, op1.BK1, op1.BN2, op1.BK2
-MAX_BLOCKS = E * ((2 * N + BM - 1) // BM)   # 64
-ROWS = MAX_BLOCKS * BM                       # 1024
+MAX_BLOCKS = op1.compact_block_capacity(2 * N, E, BM)  # 16
+ROWS = MAX_BLOCKS * BM                              # 256
+LAUNCH_BLOCKS = op1.compact_block_limit(2 * N, E, BM)  # 15
 
 
 @dataclass
@@ -91,12 +92,11 @@ def _mixtral_specs() -> list[Spec]:
              "block_expert_ids_ptr": i64, "slot_to_row_ptr": i64, "demand_ptr": f32,
              "expert_budget": "i32", "tau": "fp32",
              "N": "constexpr", "E": "constexpr", "EP": "constexpr",
-             "MAX_BPE": "constexpr",
              "BLOCK_M": "constexpr", "MAX_BLOCKS": "constexpr",
              "CRITICAL_PATH": "constexpr"},
             {"N": N, "E": E, "EP": 16,
-             "MAX_BPE": (2 * N + BM - 1) // BM, "BLOCK_M": BM,
-             "MAX_BLOCKS": MAX_BLOCKS, "CRITICAL_PATH": False},
+             "BLOCK_M": BM, "MAX_BLOCKS": MAX_BLOCKS,
+             "CRITICAL_PATH": False},
             num_warps=32, num_stages=1, grid=(1,),
             note="single CTA by design; latency-critical, not occupancy-critical",
         ),
@@ -107,11 +107,11 @@ def _mixtral_specs() -> list[Spec]:
              "block_expert_ids_ptr": i64, "slot_to_row_ptr": i64, "demand_ptr": f32,
              "expert_budget": "i32", "tau": "fp32",
              "N": "constexpr", "E": "constexpr", "EP": "constexpr",
-             "MAX_BPE": "constexpr", "BLOCK_M": "constexpr",
-             "MAX_BLOCKS": "constexpr", "CRITICAL_PATH": "constexpr"},
+             "BLOCK_M": "constexpr", "MAX_BLOCKS": "constexpr",
+             "CRITICAL_PATH": "constexpr"},
             {"N": N, "E": E, "EP": 16,
-             "MAX_BPE": (2 * N + BM - 1) // BM, "BLOCK_M": BM,
-             "MAX_BLOCKS": MAX_BLOCKS, "CRITICAL_PATH": True},
+             "BLOCK_M": BM, "MAX_BLOCKS": MAX_BLOCKS,
+             "CRITICAL_PATH": True},
             num_warps=32, num_stages=1, grid=(1,),
             note="lexicographic acceptance-risk coverage; separate constexpr variant",
         ),
@@ -124,7 +124,7 @@ def _mixtral_specs() -> list[Spec]:
             {"H": H, "I": I, "BLOCK_M": BM, "BLOCK_N": BN1, "BLOCK_K": BK1,
              "PACK_W": 1},
             num_warps=op1.GEMM1_WARPS, num_stages=op1.GEMM1_STAGES,
-            grid=(MAX_BLOCKS, I // BN1),
+            grid=(LAUNCH_BLOCKS, I // BN1),
             note="dominant kernel: streams w1+w3 (2/3 of expert bytes)",
         ),
         Spec(
@@ -137,7 +137,7 @@ def _mixtral_specs() -> list[Spec]:
             {"R": ROWS, "H": H, "I": I, "BLOCK_M": BM, "BLOCK_N": BN2,
              "BLOCK_K": min(BK2, I // SPLIT_K), "SPLIT": SPLIT_K, "PACK_W": 1},
             num_warps=op1.GEMM2_WARPS, num_stages=op1.GEMM2_STAGES,
-            grid=(MAX_BLOCKS, H // BN2, SPLIT_K),
+            grid=(LAUNCH_BLOCKS, H // BN2, SPLIT_K),
             note="streams w2 (1/3 of expert bytes)",
         ),
         Spec(
@@ -150,7 +150,7 @@ def _mixtral_specs() -> list[Spec]:
             {"H": H, "I": I, "BLOCK_M": BM, "BLOCK_N": BN2,
              "BLOCK_K": min(BK2, I // SPLIT_K), "SPLIT": SPLIT_K, "PACK_W": 1},
             num_warps=op1.GEMM2_WARPS, num_stages=op1.GEMM2_STAGES,
-            grid=(MAX_BLOCKS, H // BN2, SPLIT_K),
+            grid=(LAUNCH_BLOCKS, H // BN2, SPLIT_K),
         ),
         Spec(
             "op1 combine (fixed-order reduce)", op1._combine_kernel,

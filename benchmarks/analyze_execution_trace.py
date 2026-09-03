@@ -23,7 +23,7 @@ def summarize(config: dict, show_tree: bool = False,
     print(
         f"\nCONFIG objective={config['routing_objective']} B={config['budget']} "
         f"N={config['tree_size']} prompts={config['num_prompts']} "
-        f"steps={len(steps)}"
+        f"steps={len(steps)} staging={config.get('staging_mode', 'predictive')}"
     )
     print(f"ENVIRONMENT {trace.get('metadata', {})}")
     if not steps:
@@ -44,17 +44,24 @@ def summarize(config: dict, show_tree: bool = False,
             for row in prefills
         ])
         print(f"{'planned_rows':20s} {planned:10.1f}")
+        jit_rows = _mean([
+            float(sum(layer.get("jit_stage_rows", 0)
+                      for layer in row.get("layers", [])))
+            for row in prefills
+        ])
+        print(f"{'jit_rows':20s} {jit_rows:10.1f}")
 
     print("\nPER-STEP TREE / ACCEPTANCE / ENGINE")
     print(
         "step valid depth accepted emitted draftGPU targetGPU verifyGPU "
-        "repair plan accepted_path path_tokens path_prob"
+        "repair jit plan accepted_path path_tokens path_prob"
     )
     for step in steps:
         tree = step["tree"]
         acceptance = step["acceptance"]
         layers = step["layers"]
         repair_rows = sum(layer.get("repair_rows", 0) for layer in layers)
+        jit_rows = sum(layer.get("jit_stage_rows", 0) for layer in layers)
         planned_rows = sum(
             copy.get("rows") or 0 for copy in step.get("prefetch_copies", [])
         )
@@ -75,7 +82,7 @@ def summarize(config: dict, show_tree: bool = False,
             f"{_timing(step, 'draft_tree', 'gpu'):8.2f} "
             f"{_timing(step, 'target_verify', 'gpu'):9.2f} "
             f"{_timing(step, 'verify_commit', 'gpu'):9.2f} "
-            f"{repair_rows:6d} {planned_rows:4d} {slots:>14s} "
+            f"{repair_rows:6d} {jit_rows:3d} {planned_rows:4d} {slots:>14s} "
             f"{path_tokens:>18s} {probabilities}"
         )
         if show_tree:
@@ -132,8 +139,10 @@ def summarize(config: dict, show_tree: bool = False,
             for layer in step["layers"]:
                 print(
                     f"    layer={layer['layer']} budget={layer.get('budget')} "
+                    f"staging={layer.get('staging_mode')} "
                     f"routed={layer.get('routed_experts')} "
                     f"staged_before={layer.get('staged_experts_before_repair')} "
+                    f"jit_staged={layer.get('jit_staged_experts')} "
                     f"missing={layer.get('missing_experts')} "
                     f"repair_rows={layer.get('repair_rows')} "
                     f"slots={layer.get('slot_counts')} demand="
@@ -200,13 +209,13 @@ def summarize(config: dict, show_tree: bool = False,
         "attention", "attention_qkv", "attention_rope", "attention_kv_mask",
         "attention_sdpa", "attention_output", "moe_prepare", "moe_total",
         "route", "expert_ids_d2h",
-        "repair", "routing_snapshot", "expert_gemm", "cold_cpu",
+        "jit_stage", "repair", "routing_snapshot", "expert_gemm", "cold_cpu",
         "prefetch_release",
     )
     print("\nLAYER HOTSPOTS (mean ms and rows / verification step)")
     print(
-        "layer  attnGPU prepGPU moeGPU routeGPU idsHost repairGPU gemmGPU "
-        "miss plan"
+        "layer  attnGPU prepGPU moeGPU routeGPU idsHost jitGPU repairGPU "
+        "gemmGPU jitR miss plan"
     )
     layer_count = max(len(step["layers"]) for step in steps)
     for layer_index in range(layer_count):
@@ -230,19 +239,21 @@ def summarize(config: dict, show_tree: bool = False,
             _timing(row, "expert_ids_d2h", "host") for row in rows
         ])
         misses = _mean([float(row.get("repair_rows", 0)) for row in rows])
+        jit_rows = _mean([float(row.get("jit_stage_rows", 0)) for row in rows])
         print(
             f"{layer_index:5d} {values['attention']:8.2f} "
             f"{values['moe_prepare']:7.2f} {values['moe_total']:6.2f} "
             f"{values['route']:8.2f} {ids_host:7.2f} "
-            f"{values['repair']:9.2f} {values['expert_gemm']:7.2f} "
-            f"{misses:4.1f} {_mean([float(v) for v in planned]):4.1f}"
+            f"{values['jit_stage']:6.2f} {values['repair']:9.2f} "
+            f"{values['expert_gemm']:7.2f} {jit_rows:4.1f} {misses:4.1f} "
+            f"{_mean([float(v) for v in planned]):4.1f}"
         )
 
     print("\nTARGET BREAKDOWN (sum of layer means, ms / step)")
     for phase in (
         "attention", "attention_qkv", "attention_rope", "attention_kv_mask",
         "attention_sdpa", "attention_output", "moe_prepare", "moe_total",
-        "route", "repair", "expert_gemm",
+        "route", "jit_stage", "repair", "expert_gemm",
     ):
         total = 0.0
         for layer_index in range(layer_count):
@@ -264,7 +275,8 @@ def summarize(config: dict, show_tree: bool = False,
     ])
     print(f"{'prefetch_slot_wait':20s} {prefetch_wait_gpu:10.2f}")
     print(f"{'prefetch_h2d(side)':20s} {prefetch_gpu:10.2f}")
-    print("Note: route/repair/expert_gemm are nested inside moe_total; side H2D overlaps.")
+    print("Note: route/jit_stage/repair/expert_gemm are nested inside moe_total; "
+          "only predictive side H2D can overlap.")
 
 
 def main() -> None:

@@ -212,6 +212,46 @@ def test_layer_prefetcher_bitmap_copies_only_predicted_rows(rng):
     assert pf.staged_rows_total == 13           # pass 1: 8 full; pass 2: 4 + 1
 
 
+def test_layer_prefetcher_jit_stages_only_exact_routed_rows(rng):
+    from treemoe.model.weights import LayerWeights
+
+    num_experts, intermediate, hidden = 4, 6, 8
+
+    def layer():
+        return LayerWeights(
+            input_layernorm=torch.ones(hidden), post_attn_layernorm=torch.ones(hidden),
+            attn={}, router=torch.zeros(num_experts, hidden),
+            w1=torch.randn(num_experts, intermediate, hidden, generator=rng),
+            w2=torch.randn(num_experts, hidden, intermediate, generator=rng),
+            w3=torch.randn(num_experts, intermediate, hidden, generator=rng),
+            experts_on_gpu=False,
+        )
+
+    layers = [layer(), layer()]
+    pf = LayerPrefetcher(layers, depth=1, auto_bitmap=True, jit_staging=True)
+    pf.set_bitmap(torch.ones(2, num_experts, dtype=torch.bool))
+    pf.begin(is_verification=True)
+
+    assert pf._staged_rows[0] == set()
+    assert pf.staged_rows_total == 0
+    buf = pf.acquire(0)
+    assert pf.prepare_experts(0, {1, 3}) == (2, 0)
+    assert pf._staged_rows[0] == {1, 3}
+    assert torch.equal(buf["w1"][1], layers[0].w1[1])
+    assert torch.equal(buf["w2"][3], layers[0].w2[3])
+    pf.release(0)
+
+    buf = pf.acquire(1)
+    assert pf._staged_rows[1] == set()
+    assert pf.prepare_experts(1, {2}) == (1, 0)
+    assert torch.equal(buf["w3"][2], layers[1].w3[2])
+    assert pf.staged_rows_total == 3
+    assert pf.jit_rows_total == 3
+    assert pf.jit_verify_rows_total == 3
+    assert pf.repair_rows_total == 0
+    assert pf.repair_misses == 0
+
+
 def test_layer_budget_plan_overrides_temporal_bitmap_and_counts_repair(rng):
     from treemoe.model.weights import LayerWeights
 
@@ -259,7 +299,7 @@ def _repairing_moe_fn(pf):
     def fn(x, lw, layer_idx):
         gates = torch.softmax(F.linear(x.float(), lw.router.float()), dim=-1)
         ids = set(gates.topk(2, dim=-1).indices.flatten().tolist())
-        pf.repair(layer_idx, ids)
+        pf.prepare_experts(layer_idx, ids)
         return naive_moe(x, lw, layer_idx)
 
     return fn
@@ -290,6 +330,31 @@ def test_layer_prefetcher_repair_makes_bitmap_lossless(tiny_config, rng):
 
     assert pf.repair_misses > 0                 # the bad bitmap really missed
     assert torch.equal(resident, off)           # ...and repair kept it lossless
+
+
+def test_layer_prefetcher_jit_forward_matches_resident(tiny_config, rng):
+    from test_parity import random_weights
+    from treemoe.model.kv_cache import PagedKVCache
+    from treemoe.model.mixtral import MixtralForward, naive_moe
+
+    w = random_weights(tiny_config, rng)
+    ids = torch.randint(0, tiny_config.vocab_size, (5,), generator=rng)
+    pos = torch.arange(5)
+
+    kv1 = PagedKVCache(tiny_config, num_blocks=8, device="cpu", dtype=tiny_config.dtype)
+    resident = MixtralForward(w, kv1, moe_fn=naive_moe).forward(ids, pos)
+
+    w_off = _offload_all(w)
+    pf = LayerPrefetcher(w_off.layers, depth=2, auto_bitmap=True, jit_staging=True)
+    kv2 = PagedKVCache(tiny_config, num_blocks=8, device="cpu", dtype=tiny_config.dtype)
+    off = MixtralForward(
+        w_off, kv2, moe_fn=_repairing_moe_fn(pf), prefetcher=pf,
+    ).forward(ids, pos)
+
+    assert torch.equal(resident, off)
+    assert pf.jit_rows_total > 0
+    assert pf.repair_rows_total == 0
+    assert pf.repair_misses == 0
 
 
 def test_layer_prefetcher_auto_bitmap_temporal(tiny_config, rng):

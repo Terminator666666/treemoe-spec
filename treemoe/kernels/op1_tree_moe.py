@@ -7,9 +7,9 @@ v1 = two-kernel fallback declared in spec §3.1 risk table, structured as:
   Kernel B1 grouped w1/w3 + SiLU-mul  (expert-stationary tiles, Triton)
   Kernel B2 grouped w2 + gate-scaled scatter-add, split-k over I (Triton)
 
-Static shapes everywhere: launch grids sized for the worst case (all 2N slots
-to one expert); padding blocks carry expert_id = -1 and exit immediately
-(DeepGEMM masked-layout semantics).
+Static shapes everywhere: launch grids use a tight power-of-two upper bound on
+the compact active expert blocks. Remaining padding blocks carry expert_id=-1
+and exit immediately (DeepGEMM masked-layout semantics).
 """
 
 from __future__ import annotations
@@ -60,6 +60,21 @@ GEMM2_WARPS, GEMM2_STAGES = 8, 3   # 4090 sweep top-1 (ties within noise)
 # Kernel A — exact-HF router followed by fused budget/demand/bucket
 # --------------------------------------------------------------------------
 
+def compact_block_limit(
+    num_slots: int, expert_budget: int, block_m: int = BM,
+) -> int:
+    """Tight upper bound for compact blocks with S slots and <=B experts."""
+    active_upper = min(num_slots, expert_budget)
+    return active_upper + (num_slots - active_upper) // block_m
+
+
+def compact_block_capacity(
+    num_slots: int, expert_budget: int, block_m: int = BM,
+) -> int:
+    """Power-of-two storage capacity for a compact expert-major bucket."""
+    logical = compact_block_limit(num_slots, expert_budget, block_m)
+    return 1 << max(logical - 1, 0).bit_length()
+
 def route_and_bucket(
     x: torch.Tensor,
     router_weight: torch.Tensor,
@@ -73,9 +88,9 @@ def route_and_bucket(
 ):
     """Returns (topk_ids, topk_gates, padded_slots, block_expert_ids, num_blocks_max).
 
-    padded_slots: [E * ceil(2N/BM) * BM] slot ids (token*2+k), -1 padded so every
-    BM-row block belongs to exactly one expert. block_expert_ids: [max_blocks]
-    expert id per block, -1 for unused blocks. Shapes depend only on (N, E).
+    padded_slots contains compact expert-major BM-row blocks followed by -1
+    capacity padding. block_expert_ids gives the expert for each block and -1
+    for unused capacity. Shapes depend only on (N, expert_budget).
     """
     n, _ = x.shape
     e = router_weight.shape[0]
@@ -94,8 +109,9 @@ def route_and_bucket(
     order = torch.argsort(flat_expert, stable=True)          # DFS-stable in-expert
     counts = torch.bincount(flat_expert, minlength=e)        # [E]
     blocks_per_expert = (counts + block_m - 1) // block_m    # [E]
-    max_blocks_per_expert = (2 * n + block_m - 1) // block_m
-    max_blocks = e * max_blocks_per_expert
+    block_starts = torch.zeros(e, dtype=torch.long, device=x.device)
+    block_starts[1:] = blocks_per_expert.cumsum(0)[:-1]
+    max_blocks = compact_block_capacity(2 * n, expert_budget, block_m)
 
     device = x.device
     padded_slots = torch.full((max_blocks * block_m,), -1, dtype=torch.long, device=device)
@@ -105,14 +121,18 @@ def route_and_bucket(
     seg_starts = torch.zeros(e, dtype=torch.long, device=device)
     seg_starts[1:] = counts.cumsum(0)[:-1]
     pos_in_expert = torch.arange(2 * n, device=device) - seg_starts[flat_expert[order]]
-    dest = flat_expert[order] * (max_blocks_per_expert * block_m) + pos_in_expert
+    dest = block_starts[flat_expert[order]] * block_m + pos_in_expert
     padded_slots[dest] = order
 
     blk_idx = torch.arange(max_blocks, device=device)
-    blk_expert = blk_idx // max_blocks_per_expert
-    blk_local = blk_idx % max_blocks_per_expert
-    used = blk_local < blocks_per_expert[blk_expert]
-    block_expert_ids[used] = blk_expert[used]
+    owns = (
+        (blk_idx[:, None] >= block_starts[None, :])
+        & (blk_idx[:, None] < (
+            block_starts + blocks_per_expert
+        )[None, :])
+    )
+    used = owns.any(dim=1)
+    block_expert_ids[used] = owns[used].long().argmax(dim=1)
 
     # inverse permutation: slot id (token*2+k) -> padded row, for the
     # deterministic combine kernel (fixed-order reduction, no atomics)
@@ -139,7 +159,7 @@ if HAS_TRITON:
         block_expert_ids_ptr, slot_to_row_ptr, demand_ptr,
         expert_budget, tau,
         N: tl.constexpr, E: tl.constexpr, EP: tl.constexpr,   # EP = 16 (pow2 pad)
-        MAX_BPE: tl.constexpr, BLOCK_M: tl.constexpr, MAX_BLOCKS: tl.constexpr,
+        BLOCK_M: tl.constexpr, MAX_BLOCKS: tl.constexpr,
         CRITICAL_PATH: tl.constexpr,
     ):
         """Fuse acceptance-weighted budgeting and bucketing in one program.
@@ -228,7 +248,22 @@ if HAS_TRITON:
         eq = fe[:, None] == fe[None, :]
         lower = slots[None, :] < slots[:, None]
         rank = tl.sum((eq & lower).to(tl.int32), axis=1)      # stable in-expert rank
-        dest = fe.to(tl.int64) * (MAX_BPE * BLOCK_M) + rank.to(tl.int64)
+        counts = tl.sum(
+            (fe[None, :] == offs_e[:, None]).to(tl.int32), axis=1,
+        )
+        blocks_needed = (counts + BLOCK_M - 1) // BLOCK_M
+        previous = offs_e[None, :] < offs_e[:, None]
+        block_starts = tl.sum(
+            tl.where(previous, blocks_needed[None, :], 0), axis=1,
+        )
+        slot_block = tl.sum(
+            tl.where(
+                fe[:, None] == offs_e[None, :], block_starts[None, :], 0,
+            ), axis=1,
+        )
+        dest = (
+            slot_block.to(tl.int64) * BLOCK_M + rank.to(tl.int64)
+        )
         tl.store(slot_to_row_ptr + slots, dest)
 
         # padded_slots as an inverse scatter computed in registers: one plain
@@ -244,13 +279,17 @@ if HAS_TRITON:
             tl.store(padded_slots_ptr + pos, val.to(tl.int64))
 
         # ---- 5. per-block expert ids (blocks past ceil(count/BM) masked -1) ----
-        counts = tl.sum((fe[None, :] == offs_e[:, None]).to(tl.int32), axis=1)  # [EP]
-        blocks_needed = (counts + BLOCK_M - 1) // BLOCK_M
         blk = tl.arange(0, MAX_BLOCKS)
-        blk_e = blk // MAX_BPE
-        need = tl.sum(tl.where(blk_e[:, None] == offs_e[None, :],
-                               blocks_needed[None, :], 0), axis=1)
-        used = (blk % MAX_BPE) < need
+        owns = (
+            (blk[:, None] >= block_starts[None, :])
+            & (blk[:, None] < (
+                block_starts + blocks_needed
+            )[None, :])
+        )
+        used = tl.sum(owns.to(tl.int32), axis=1) > 0
+        blk_e = tl.sum(
+            tl.where(owns, offs_e[None, :], 0), axis=1,
+        )
         tl.store(block_expert_ids_ptr + blk,
                  tl.where(used, blk_e, -1).to(tl.int64))
 
@@ -495,7 +534,7 @@ class _Workspace:
     """Static buffers reused across steps (CUDA Graph friendly)."""
 
     def __init__(self, n: int, e: int, hidden: int, inter: int, device, dtype):
-        max_blocks = e * ((2 * n + BM - 1) // BM)
+        max_blocks = compact_block_capacity(2 * n, e, BM)
         self.max_blocks = max_blocks
         self.num_experts = e
         self.rows = max_blocks * BM
@@ -531,10 +570,11 @@ class Routing:
 
     __slots__ = ("ws", "router_gates", "topk_ids", "gates_flat",
                  "padded_slots", "block_expert_ids", "slot_to_row",
-                 "max_blocks", "demand")
+                 "max_blocks", "launch_blocks", "demand")
 
     def __init__(self, ws, router_gates, topk_ids, gates_flat, padded_slots,
-                 block_expert_ids, slot_to_row, max_blocks, demand):
+                 block_expert_ids, slot_to_row, max_blocks, launch_blocks,
+                 demand):
         self.ws = ws
         self.router_gates = router_gates
         self.topk_ids = topk_ids
@@ -543,12 +583,13 @@ class Routing:
         self.block_expert_ids = block_expert_ids
         self.slot_to_row = slot_to_row
         self.max_blocks = max_blocks
+        self.launch_blocks = launch_blocks
         self.demand = demand
 
     def expert_ids(self) -> list[int]:
         """Experts actually routed this layer. ONE small D2H sync
-        (max_blocks int64s) -- the price of the exact-offload contract."""
-        ids = self.block_expert_ids[: self.max_blocks].tolist()
+        (at most compact max_blocks int64s) -- the price of exact offload."""
+        ids = self.block_expert_ids[: self.launch_blocks].tolist()
         return sorted({int(i) for i in ids if i >= 0})
 
     def exclude_experts(self, expert_ids) -> list[tuple[int, torch.Tensor, torch.Tensor]]:
@@ -563,12 +604,18 @@ class Routing:
         partial rows so the fixed-order combine adds exact zeros. The GPU
         output then equals a pass that never routed these experts."""
         ws = self.ws
-        seg_rows = self.padded_slots.shape[0] // ws.num_experts
         picked: list[tuple[int, torch.Tensor, torch.Tensor]] = []
         all_slots = []
         for e in expert_ids:
-            seg = self.padded_slots[e * seg_rows:(e + 1) * seg_rows]
-            slots = seg[seg >= 0]
+            block_ids = torch.where(
+                self.block_expert_ids[:self.launch_blocks] == e,
+            )[0]
+            rows = (
+                block_ids[:, None] * BM
+                + torch.arange(BM, device=self.padded_slots.device)[None, :]
+            ).reshape(-1)
+            candidate_slots = self.padded_slots[rows]
+            slots = candidate_slots[candidate_slots >= 0]
             if slots.numel() == 0:
                 continue
             picked.append((int(e), (slots // 2).cpu(),
@@ -614,7 +661,8 @@ def route_experts(
     if ws is None:
         ws = _ws_cache[key] = _Workspace(n, e, hidden, inter, x.device, x.dtype)
 
-    max_bpe = (2 * n + BM - 1) // BM
+    max_blocks = compact_block_capacity(2 * n, expert_budget, BM)
+    launch_blocks = compact_block_limit(2 * n, expert_budget, BM)
     # Exact-HF router math followed by a single-CTA budget+bucket kernel.
     # N<=64 compiles with zero spill. N=128's O((2N)^2) rank matrix spills
     # ~0.5KB/thread and has shown cross-warp argmax miscompilation on sm_89;
@@ -631,7 +679,7 @@ def route_experts(
             ws.block_expert_ids, ws.slot_to_row, ws.demand,
             expert_budget, top1_threshold,
             N=n, E=e, EP=16,
-            MAX_BPE=max_bpe, BLOCK_M=BM, MAX_BLOCKS=ws.max_blocks,
+            BLOCK_M=BM, MAX_BLOCKS=max_blocks,
             CRITICAL_PATH=routing_objective == "critical_path",
             # 32 warps: ptxas shows the O((2N)^2) rank matrix spills 7.6KB/thread
             # at 4 warps; spreading it over 1024 threads -> regs 255->64,
@@ -640,7 +688,8 @@ def route_experts(
         )
         return Routing(ws, gates, ws.topk_flat.view(n, 2), ws.gates_flat,
                ws.padded_slots,
-                   ws.block_expert_ids, ws.slot_to_row, ws.max_blocks,
+                   ws.block_expert_ids, ws.slot_to_row, max_blocks,
+                   launch_blocks,
                    ws.demand)
     (_topk_ids, topk_gates, padded_slots, block_expert_ids,
      slot_to_row, max_blocks, demand) = route_and_bucket(
@@ -653,7 +702,7 @@ def route_experts(
     gates_flat = topk_gates.reshape(-1).float().contiguous()   # index by slot id
     return Routing(ws, gates, _topk_ids, gates_flat, padded_slots,
                    block_expert_ids,
-                   slot_to_row, max_blocks, demand)
+                   slot_to_row, max_blocks, launch_blocks, demand)
 
 
 def tree_moe_forward(
@@ -697,7 +746,8 @@ def tree_moe_forward(
     ws = routing.ws
     gates_flat = routing.gates_flat
     padded_slots, block_expert_ids = routing.padded_slots, routing.block_expert_ids
-    slot_to_row, max_blocks = routing.slot_to_row, routing.max_blocks
+    slot_to_row = routing.slot_to_row
+    max_blocks = routing.launch_blocks
 
     # per-shape tile params: tiny interpreter configs (H=64, I=128) must not
     # read past the reduction dim; tl.dot still needs K>=16

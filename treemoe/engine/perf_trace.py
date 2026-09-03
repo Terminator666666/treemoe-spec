@@ -18,7 +18,10 @@ class ExecutionTracer:
     inference path does not instantiate this class and pays no tracing cost.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, detail: str = "full") -> None:
+        if detail not in {"full", "progressive"}:
+            raise ValueError(f"unknown trace detail: {detail}")
+        self.detail = detail
         self.prefills: list[dict] = []
         self.steps: list[dict] = []
         self.current_record: dict | None = None
@@ -116,7 +119,7 @@ class ExecutionTracer:
 
     def begin_draft_level(self, depth: int, frontier_nodes: int,
                           cached_nodes: int) -> dict:
-        if self.current_record is None:
+        if self.current_record is None or self.detail != "full":
             return {}
         level = {
             "depth": depth,
@@ -141,6 +144,9 @@ class ExecutionTracer:
     def phase(self, record: dict | None, name: str,
               cuda: bool | None = None):
         if record is None:
+            yield
+            return
+        if self.detail == "progressive":
             yield
             return
         timing = record.setdefault("timing_ms", {}).setdefault(
@@ -225,6 +231,8 @@ class ExecutionTracer:
         accepted_slots: list[int],
         top_k: int = 8,
     ) -> None:
+        if self.detail != "full":
+            return
         valid = tree.num_valid
         scores = logits[:valid].float()
         log_probs = torch.log_softmax(scores, dim=-1)

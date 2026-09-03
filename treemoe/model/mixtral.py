@@ -279,7 +279,7 @@ class MixtralForward:
         # one D2H for the whole step instead of int(positions[0]) per layer
         start_pos = 0 if is_tree else int(positions[0])
         if self.prefetcher is not None:
-            self.prefetcher.begin()
+            self.prefetcher.begin(is_verification=is_tree)
         for layer_idx, lw in enumerate(self.w.layers):
             tracer = self.performance_tracer
             layer_record = tracer.begin_layer(layer_idx) if tracer else None

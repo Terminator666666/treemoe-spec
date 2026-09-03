@@ -129,7 +129,7 @@ class HostExpertPool:
 
 
 class LayerPrefetcher:
-    """Ahead-of-time H2D staging of offloaded layers (engine side of spec §3.2).
+    """H2D staging of offloaded layers (engine side of spec §3.2).
 
     Each of the `depth` buffers is a stacked w1/w2/w3 triple shaped like one
     layer's experts, so op1's expert-stationary kernel consumes it directly —
@@ -137,7 +137,12 @@ class LayerPrefetcher:
     ahead of the compute stream; two event rings order overwrite-after-use
     (free) and use-after-copy (ready).
 
-    Bitmap mode (`set_bitmap`, [L, E] bool from RouterPredictor.predict_bitmap):
+    JIT mode waits until the current layer's exact routed expert set is known,
+    then copies only those rows on the compute stream. It gives up speculative
+    copy/compute overlap, but never transfers a wrongly predicted row and needs
+    no repair. Call `prepare_experts()` after routing and before the GEMMs.
+
+    Predictive bitmap mode (`set_bitmap`, [L, E] bool):
     only predicted experts' rows are copied. On its own this is lossy
     (unpredicted rows keep stale data); consumers that call `repair()` with
     the routed expert set between routing and the expert GEMMs make it EXACT:
@@ -161,11 +166,13 @@ class LayerPrefetcher:
     buffer-cycling logic is identical and testable without a GPU.
     """
 
-    def __init__(self, layers, depth: int = 2, auto_bitmap: bool = False):
+    def __init__(self, layers, depth: int = 2, auto_bitmap: bool = False,
+                 jit_staging: bool = False):
         self.layers = layers
         self.offload_ids = [i for i, lw in enumerate(layers) if not lw.experts_on_gpu]
         self.depth = max(1, min(depth, max(1, len(self.offload_ids))))
         self.auto_bitmap = auto_bitmap
+        self.jit_staging = jit_staging
         self.use_router_hint = True         # gate for the draft-guided hint
         self._hint: torch.Tensor | None = None      # [L, E] fp32 router demand
         self._hint_budget = 0
@@ -180,7 +187,9 @@ class LayerPrefetcher:
         self._used_prev: dict[int, set[int]] = {}  # repair() observations, last pass
         self._used_cur: dict[int, set[int]] = {}
         self.repair_misses = 0              # cumulative mispredicted experts
-        self.staged_rows_total = 0          # expert rows copied ahead of use
+        self.staged_rows_total = 0          # predicted or exact-JIT rows copied
+        self.jit_rows_total = 0             # exact rows copied after routing
+        self.jit_verify_rows_total = 0      # exact rows in tree verification
         self.repair_rows_total = 0          # expert rows copied synchronously
         self.performance_tracer = None
         if self.offload_ids:
@@ -195,6 +204,7 @@ class LayerPrefetcher:
         self._stream = None
         self._ready: list[torch.cuda.Event] = []
         self._free: list[torch.cuda.Event] = []
+        self._verification_pass = False
 
     @property
     def staged_bytes_total(self) -> int:
@@ -228,7 +238,9 @@ class LayerPrefetcher:
         per-layer row cap; prediction only affects staging, repair() keeps
         every pass exact. Gated behind auto_bitmap so the --no-auto-bitmap
         full-copy baseline stays prediction-free."""
-        if not (self.auto_bitmap and self.use_router_hint and self.offload_ids):
+        if self.jit_staging or not (
+            self.auto_bitmap and self.use_router_hint and self.offload_ids
+        ):
             return
         if self._routers is None:
             self._routers = torch.stack([lw.router for lw in self.layers]).float()
@@ -248,21 +260,24 @@ class LayerPrefetcher:
             {k: torch.empty_like(getattr(lw, k), device=dev) for k in ("w1", "w2", "w3")}
             for _ in range(self.depth)
         ]
-        if self._cuda:
+        if self._cuda and not self.jit_staging:
             self._stream = torch.cuda.Stream()
             self._ready = [torch.cuda.Event() for _ in range(self.depth)]
             self._free = [torch.cuda.Event() for _ in range(self.depth)]
 
-    def begin(self) -> None:
+    def begin(self, is_verification: bool = False) -> None:
         """Start a forward pass: schedule the first `depth` offloaded layers."""
         if not self.offload_ids:
             return
+        self._verification_pass = is_verification
         if self._bufs is None:
             self._ensure_buffers(self.layers[self.offload_ids[0]])
         if self._used_cur:
             self._used_prev = self._used_cur
         self._used_cur = {}
-        if self._budget_plan_active:
+        if self.jit_staging:
+            self._bitmap = None
+        elif self._budget_plan_active:
             self.set_bitmap(self._budget_plan_bitmap)
         elif self.auto_bitmap:
             num_experts = self.layers[self.offload_ids[0]].w1.shape[0]
@@ -301,6 +316,9 @@ class LayerPrefetcher:
         slot = len(self._buf_of) % self.depth
         self._buf_of[layer_idx] = slot
         lw, buf = self.layers[layer_idx], self._bufs[slot]
+        if self.jit_staging:
+            self._staged_rows[layer_idx] = set()
+            return
         rows = (None if self._bitmap is None
                 else self._bitmap[layer_idx].nonzero().flatten().tolist())
         self._staged_rows[layer_idx] = None if rows is None else set(rows)
@@ -345,9 +363,34 @@ class LayerPrefetcher:
     def acquire(self, layer_idx: int) -> dict[str, torch.Tensor]:
         """Return the staged w1/w2/w3 for this layer, ordered after its copy."""
         slot = self._buf_of[layer_idx]
-        if self._cuda:
+        if self._cuda and not self.jit_staging:
             self._ready[slot].wait(torch.cuda.current_stream())  # use-after-copy
         return self._bufs[slot]
+
+    def prepare_experts(self, layer_idx: int, expert_ids) -> tuple[int, int]:
+        """Materialize routed experts and return (jit_rows, repair_rows)."""
+        if not self.jit_staging:
+            return 0, self.repair(layer_idx, expert_ids)
+
+        ids = {int(i) for i in expert_ids}
+        self._used_cur[layer_idx] = ids
+        staged = self._staged_rows[layer_idx]
+        missing = sorted(ids - staged)
+        if not missing:
+            return 0, 0
+
+        slot = self._buf_of[layer_idx]
+        lw, buf = self.layers[layer_idx], self._bufs[slot]
+        for k in ("w1", "w2", "w3"):
+            src, dst = getattr(lw, k), buf[k]
+            for expert in missing:
+                dst[expert].copy_(src[expert], non_blocking=True)
+        staged.update(missing)
+        self.staged_rows_total += len(missing)
+        self.jit_rows_total += len(missing)
+        if self._verification_pass:
+            self.jit_verify_rows_total += len(missing)
+        return len(missing), 0
 
     def repair(self, layer_idx: int, expert_ids) -> int:
         """Exact-offload contract: make the staged buffer correct for the
@@ -391,7 +434,7 @@ class LayerPrefetcher:
     def release(self, layer_idx: int) -> None:
         """Mark the layer consumed (compute enqueued) and refill the pipeline."""
         slot = self._buf_of[layer_idx]
-        if self._cuda:
+        if self._cuda and not self.jit_staging:
             self._free[slot].record(torch.cuda.current_stream())
         if self._queue:
             self._schedule_next()

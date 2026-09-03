@@ -113,7 +113,11 @@ def main() -> None:
     w3 = torch.randn(E, I, H, device="cuda", dtype=torch.bfloat16, generator=g) * 0.02
     router = torch.randn(E, H, device="cuda", dtype=torch.bfloat16, generator=g) * 0.1
 
-    print(f"{'N':>5} {'det(us)':>10} {'atomic(us)':>11} {'GB/s':>8} {'util':>6} {'vllm(us)':>10} {'ratio':>7}")
+    print(
+        f"{'N':>5} {'blocks':>7} {'grid':>4} {'cap':>4} {'det(us)':>10} "
+        f"{'atomic(us)':>11} {'GB/s':>8} {'util':>6} "
+        f"{'vllm(us)':>10} {'ratio':>7}"
+    )
     for n in args.tree_sizes:
         x = torch.randn(n, H, device="cuda", dtype=torch.bfloat16, generator=g)
         # All ones disable low-probability top-1 degradation. With B=E=8,
@@ -125,14 +129,26 @@ def main() -> None:
         t_det = bench_ours(x, w1, w2, w3, router, accept, args.budget, deterministic=True)
         t_ours = bench_ours(x, w1, w2, w3, router, accept, args.budget, deterministic=False)
         t_vllm = bench_vllm(x, w1, w2, w3, router)
-        # dominant traffic on the atomic path: the full weight stream (all
-        # experts touched at these budgets); h workspace is MBs, negligible
-        byts = w1.nbytes + w2.nbytes + w3.nbytes
+        from treemoe.kernels.op1_tree_moe import route_experts
+        routing = route_experts(x, router, accept, args.budget, I)
+        active_blocks = int((
+            routing.block_expert_ids[:routing.launch_blocks] >= 0
+        ).sum())
+        # Every BM-row block is a separate CTA group and streams its expert's
+        # weights once. Skewed experts spanning multiple blocks therefore
+        # reread weights; count blocks, not unique experts.
+        expert_bytes = (w1.nbytes + w2.nbytes + w3.nbytes) / E
+        byts = active_blocks * expert_bytes
         gbs = byts / (t_ours * 1e-6) / 1e9
         util = f"{gbs / peak:5.0%}" if peak else "   n/a"
         ratio = f"{t_ours / t_vllm:.2f}" if t_vllm else "n/a"
-        print(f"{n:>5} {t_det:>10.1f} {t_ours:>11.1f} {gbs:>8.0f} {util:>6} "
-              f"{t_vllm or float('nan'):>10.1f} {ratio:>7}")
+        result = (
+            f"{n:>5} {active_blocks:>7} {routing.launch_blocks:>4} "
+            f"{routing.max_blocks:>4} {t_det:>10.1f} {t_ours:>11.1f} "
+            f"{gbs:>8.0f} {util:>6} "
+            f"{t_vllm or float('nan'):>10.1f} {ratio:>7}"
+        )
+        print(result)
         if args.profile:
             profile_ours(x, w1, w2, w3, router, accept, args.budget)
         if n == 64 and t_vllm:

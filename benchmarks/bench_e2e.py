@@ -132,6 +132,9 @@ def run_config(engine_factory, budget: int, tree_size: int, prompts: list[torch.
     target_steps = eng.stats.steps
     staged_rows = getattr(pf, "staged_rows_total", 0) if pf is not None else 0
     repair_rows = getattr(pf, "repair_rows_total", 0) if pf is not None else 0
+    jit_verify_rows = (
+        getattr(pf, "jit_verify_rows_total", 0) if pf is not None else 0
+    )
     budget_histogram = (
         eng.layer_budget_allocator.budget_histogram.tolist()
         if eng.layer_budget_allocator is not None else None
@@ -139,22 +142,34 @@ def run_config(engine_factory, budget: int, tree_size: int, prompts: list[torch.
     allocator = eng.layer_budget_allocator
     planned_rows = (
         sum(budget * count for budget, count in enumerate(budget_histogram))
-        if budget_histogram is not None else 0
+        if budget_histogram is not None
+        else budget * eng.target.cfg.num_layers * target_steps
     )
     row_gib = getattr(pf, "expert_row_bytes", 0) / 2**30 if pf is not None else 0.0
     r = {
         "budget": budget,
         "tree_size": tree_size,
+        "generated_tokens": total_tokens,
         "tpot_ms": inference_wall / total_tokens * 1e3,
         "accept_len": eng.stats.mean_accept_len,
         "target_steps": target_steps,
         "hit_rate": float("nan"),
         "cold": getattr(pf, "cold_total", 0) if pf is not None else 0,
+        "staging_mode": (
+            "jit_exact" if pf is not None and pf.jit_staging
+            else "predictive" if pf is not None else "resident"
+        ),
         "staged_rows": staged_rows,
+        "jit_rows": getattr(pf, "jit_rows_total", 0) if pf is not None else 0,
+        "jit_verify_rows": jit_verify_rows,
         "repair_rows": repair_rows,
         "staged_gib": staged_rows * row_gib,
         "repair_gib": repair_rows * row_gib,
         "planned_rows_per_step": planned_rows / max(target_steps, 1),
+        "jit_rows_per_step": jit_verify_rows / max(target_steps, 1),
+        "stage_rows_per_step": (
+            jit_verify_rows if pf is not None and pf.jit_staging else planned_rows
+        ) / max(target_steps, 1),
         "repair_rows_per_step": repair_rows / max(target_steps, 1),
         "h2d_gib_per_token": (staged_rows + repair_rows) * row_gib / total_tokens,
         "layer_budgets": (
@@ -175,7 +190,7 @@ def run_config(engine_factory, budget: int, tree_size: int, prompts: list[torch.
         ),
         "profiler_artifacts": profiler_artifacts,
     }
-    if pf is not None and pf.routed_total:
+    if pf is not None and pf.routed_total and not pf.jit_staging:
         r["hit_rate"] = 1.0 - pf.repair_misses / pf.routed_total
     # the engine/prefetcher/kv sit in closure reference cycles (moe_fn attrs):
     # without an explicit collect the previous config's staging ring survives
@@ -266,10 +281,17 @@ def main() -> None:
     ap.add_argument("--tree-sizes", type=int, nargs="+", default=[64])
     ap.add_argument("--num-prompts", type=int, default=20)
     ap.add_argument("--max-new-tokens", type=int, default=128)
+    ap.add_argument("--warmup-new-tokens", type=int, default=0,
+                    help="run one unmeasured prompt first to compile kernels "
+                         "and initialize CUDA libraries")
     ap.add_argument("--layout", choices=["resident", "offload"], default="resident",
                     help="offload: all expert weights pinned in host RAM, streamed "
                          "by op2 LayerPrefetcher with exact bitmap repair")
     ap.add_argument("--prefetch-depth", type=int, default=2)
+    ap.add_argument("--predictive-prefetch", action="store_true",
+                    help="offload ablation: restore previous-pass/router-hint "
+                         "prefetch plus synchronous repair; default stages "
+                         "the exact routed experts just in time")
     ap.add_argument("--no-auto-bitmap", action="store_true",
                     help="offload only: disable the temporal predictor "
                          "(every pass copies all experts; isolates repair overhead)")
@@ -315,6 +337,9 @@ def main() -> None:
                     default="mass",
                     help="select the layer expert set by aggregate mass or "
                          "protect experts needed by high-acceptance nodes")
+    ap.add_argument("--atomic-moe", action="store_true",
+                    help="performance ablation: use nondeterministic atomic "
+                         "GEMM2 accumulation instead of fixed-order combine")
     ap.add_argument("--compare-routing-objectives", action="store_true",
                     help="run mass then critical_path after one weight load")
     ap.add_argument("--ar-baseline", action="store_true",
@@ -332,6 +357,13 @@ def main() -> None:
     ap.add_argument("--execution-trace-json", type=Path, default=None,
                     help="write opt-in full-stage CUDA/host timings, routing, "
                          "prefetch, tree topology, and accepted paths")
+    ap.add_argument("--execution-trace-baseline-first", action="store_true",
+                    help="run the same configurations without tracing first and "
+                         "store their TPOT as the performance baseline")
+    ap.add_argument("--execution-trace-detail",
+                    choices=["full", "progressive"], default="full",
+                    help="progressive stores only tree, accepted path, natural "
+                         "top-2 routing, row bytes, and timings")
     ap.add_argument("--torch-profiler-dir", type=Path, default=None,
                     help="write full CPU/CUDA kernel Chrome trace, operator "
                          "table, and optional GPU memory timeline")
@@ -344,6 +376,13 @@ def main() -> None:
     args = ap.parse_args()
     if args.check_lossless and args.top1_threshold != 0:
         ap.error("--check-lossless requires --top1-threshold 0")
+    if args.check_lossless and args.atomic_moe:
+        ap.error("--check-lossless requires deterministic MoE reduction")
+    if args.execution_trace_baseline_first \
+            and args.execution_trace_json is None:
+        ap.error(
+            "--execution-trace-baseline-first requires --execution-trace-json"
+        )
 
     from treemoe.engine.loop import SpecDecodeEngine
     from treemoe.engine.layer_budget import LayerBudgetAllocator
@@ -420,14 +459,21 @@ def main() -> None:
             ids = tok(text, return_tensors="pt", add_special_tokens=False).input_ids
             prompts.append(ids[0].cuda())
 
-    def factory(budget: int, tree_size: int, routing_objective: str | None = None):
+    def factory(budget: int, tree_size: int, routing_objective: str | None = None,
+                enable_trace: bool | None = None):
         objective = routing_objective or args.routing_objective
-        tracer = ExecutionTracer() if args.execution_trace_json is not None else None
+        if enable_trace is None:
+            enable_trace = args.execution_trace_json is not None
+        tracer = (
+            ExecutionTracer(detail=args.execution_trace_detail)
+            if enable_trace else None
+        )
         kv = PagedKVCache(cfg, num_blocks=256)
         pf = None
         if args.layout == "offload":
             pf = LayerPrefetcher(weights.layers, depth=args.prefetch_depth,
-                                 auto_bitmap=not args.no_auto_bitmap)
+                                 auto_bitmap=not args.no_auto_bitmap,
+                                 jit_staging=not args.predictive_prefetch)
             pf.use_router_hint = not args.no_router_hint
             pf.routed_total = 0  # bench counter alongside pf.repair_misses
             pf.cold_total = 0    # experts computed on host CPU (hybrid arm)
@@ -467,10 +513,11 @@ def main() -> None:
             staged_snapshot = None
             missing_before_repair = []
             staged_nonrouted = None
+            jit_stage_rows = 0
             if pf is not None:
-                # exact-offload contract: one small D2H, then on-demand copies
-                # for mispredicted experts BEFORE the GEMMs read lw.w1/w2/w3
-                # (lw.* aliases the prefetcher's staged ring buffer here)
+                # One small D2H exposes the actual routed set. Default JIT mode
+                # copies exactly that set; the predictive ablation repairs any
+                # misses. In both modes lw.* aliases the staging ring buffer.
                 if args.budget_trace_json is not None \
                         and layer_budget < cfg.num_experts:
                     if layer_idx == 0:
@@ -481,8 +528,10 @@ def main() -> None:
                 staged = pf._staged_rows.get(layer_idx)
                 staged_snapshot = None if staged is None else set(staged)
                 if args.cpu_expert_threshold > 0 and staged is not None:
-                    counts = (routing.padded_slots.view(
-                        routing.ws.num_experts, -1) >= 0).sum(-1).tolist()
+                    counts = torch.bincount(
+                        routing.topk_ids.reshape(-1),
+                        minlength=routing.ws.num_experts,
+                    ).tolist()
                     cold = [e for e in ids if e not in staged
                             and counts[e] < args.cpu_expert_threshold]
                     if cold:
@@ -495,30 +544,60 @@ def main() -> None:
                         for e, toks, gates in routing.exclude_experts(cold):
                             dev_toks = toks.to(x.device)
                             cold_x.append((e, dev_toks, gates, x[dev_toks].cpu()))
-                if staged_snapshot is not None:
+                if staged_snapshot is not None and not pf.jit_staging:
                     missing_before_repair = sorted(set(ids) - staged_snapshot)
                     staged_nonrouted = sorted(staged_snapshot - set(ids))
                 pf.routed_total += len(ids)
-                phase = tracer.phase(layer_record, "repair") \
+                phase_name = "jit_stage" if pf.jit_staging else "repair"
+                phase = tracer.phase(layer_record, phase_name) \
                     if tracer else nullcontext()
                 with phase:
-                    repair_rows = pf.repair(layer_idx, ids)
+                    jit_stage_rows, repair_rows = pf.prepare_experts(layer_idx, ids)
             else:
                 repair_rows = 0
             if tracer is not None:
                 phase = tracer.phase(layer_record, "routing_snapshot")
-                with phase:
-                    slot_counts = (routing.padded_slots.view(
-                        routing.ws.num_experts, -1) >= 0).sum(-1).tolist()
-                    demand = routing.demand.detach().float().cpu().tolist()
-                    original_prob, original_ids = routing.router_gates.topk(2, dim=-1)
-                    routing_detail = torch.cat([
-                        routing.router_gates,
-                        original_ids.float(), original_prob,
-                        routing.topk_ids.float(), routing.gates_flat.view(-1, 2),
-                    ], dim=-1).detach().float().cpu().tolist()
-                staged = pf._staged_rows.get(layer_idx) if pf is not None else None
-                layer_record.update({
+                if tracer.detail == "progressive":
+                    with phase:
+                        original_ids = routing.router_gates.topk(
+                            2, dim=-1,
+                        ).indices.detach().cpu().tolist()
+                    layer_record.update({
+                        "budget": layer_budget,
+                        "tree_nodes": x.shape[0],
+                        "staging_mode": (
+                            "jit_exact" if pf is not None and pf.jit_staging
+                            else "predictive" if pf is not None else "resident"
+                        ),
+                        "jit_stage_rows": jit_stage_rows,
+                        "repair_rows": repair_rows,
+                        "nodes": [
+                            {"node": node, "original_top2_experts": experts}
+                            for node, experts in enumerate(original_ids)
+                        ],
+                        "expert_row_bytes": (
+                            pf.expert_row_bytes if pf is not None else 0
+                        ),
+                    })
+                else:
+                    with phase:
+                        slot_counts = torch.bincount(
+                            routing.topk_ids.reshape(-1),
+                            minlength=routing.ws.num_experts,
+                        ).tolist()
+                        demand = routing.demand.detach().float().cpu().tolist()
+                        original_prob, original_ids = routing.router_gates.topk(
+                            2, dim=-1,
+                        )
+                        routing_detail = torch.cat([
+                            routing.router_gates,
+                            original_ids.float(), original_prob,
+                            routing.topk_ids.float(), routing.gates_flat.view(-1, 2),
+                        ], dim=-1).detach().float().cpu().tolist()
+                    staged = (
+                        pf._staged_rows.get(layer_idx) if pf is not None else None
+                    )
+                    layer_record.update({
                     "budget": layer_budget,
                     "tree_nodes": x.shape[0],
                     "routed_experts": routed_ids,
@@ -531,6 +610,14 @@ def main() -> None:
                         None if staged is None else sorted(staged)
                     ),
                     "staged_nonrouted_experts": staged_nonrouted,
+                    "staging_mode": (
+                        "jit_exact" if pf is not None and pf.jit_staging
+                        else "predictive" if pf is not None else "resident"
+                    ),
+                    "jit_stage_rows": jit_stage_rows,
+                    "jit_staged_experts": (
+                        sorted(ids) if pf is not None and pf.jit_staging else []
+                    ),
                     "repair_rows": repair_rows,
                     "missing_experts": missing_before_repair,
                     "slot_counts": slot_counts,
@@ -560,13 +647,14 @@ def main() -> None:
                     "expert_row_bytes": (
                         pf.expert_row_bytes if pf is not None else 0
                     ),
-                })
+                    })
             phase = tracer.phase(layer_record, "expert_gemm") \
                 if tracer else nullcontext()
             with phase:
                 out = tree_moe_forward(
                     x, lw.w1, lw.w2, lw.w3, lw.router,
                     accept, layer_budget, routing=routing,
+                    deterministic=not args.atomic_moe,
                 )
             phase = tracer.phase(layer_record, "cold_cpu") \
                 if tracer and cold_x else nullcontext()
@@ -629,7 +717,7 @@ def main() -> None:
         torch.cuda.synchronize()
         wall = time.perf_counter() - t0
         hit = float("nan")
-        if pf is not None and pf.routed_total:
+        if pf is not None and pf.routed_total and not pf.jit_staging:
             hit = 1.0 - pf.repair_misses / pf.routed_total
         print(f"{'AR':>3} {'-':>5} {wall / total * 1e3:>10.2f} {'-':>11} "
               f"{hit:>9.3f} {'-':>6}", flush=True)
@@ -637,18 +725,47 @@ def main() -> None:
 
     trace_rows = []
     execution_trace_rows = []
+    staging_mode = "predictive" if args.predictive_prefetch else "jit_exact"
+    if args.warmup_new_tokens > 0:
+        print(
+            f"warming up {args.warmup_new_tokens} generated tokens", flush=True,
+        )
+        warm_engine, warm_prefetcher = factory(
+            budget=args.budgets[0], tree_size=args.tree_sizes[0],
+            routing_objective=args.routing_objective, enable_trace=False,
+        )
+        warm_engine.generate(
+            prompts[0], max_new_tokens=args.warmup_new_tokens,
+        )
+        torch.cuda.synchronize()
+        del warm_engine, warm_prefetcher
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+    print(f"staging mode: {staging_mode}", flush=True)
+    print(
+        f"moe reduction: {'atomic' if args.atomic_moe else 'deterministic'}",
+        flush=True,
+    )
+    stage_rows_label = "planR/s" if args.predictive_prefetch else "jitR/s"
     objectives = (
         ["mass", "critical_path"]
         if args.compare_routing_objectives else [args.routing_objective]
     )
     print(f"{'B':>3} {'N':>5} {'TPOT(ms)':>10} {'accept_len':>11} {'steps':>6} "
-          f"{'expert_hit':>10} {'budget_hist':>18} {'planR/s':>8} "
+            f"{'expert_hit':>10} {'budget_hist':>18} {stage_rows_label:>8} "
           f"{'repairR/s':>9} {'H2DGiB/tok':>10} {'cold':>6}", flush=True)
     for objective in objectives:
         print(f"routing objective: {objective}", flush=True)
         configured_factory = partial(factory, routing_objective=objective)
         for n in args.tree_sizes:
             for b in args.budgets:
+                baseline = None
+                if args.execution_trace_baseline_first:
+                    baseline = run_config(
+                        partial(configured_factory, enable_trace=False),
+                        b, n, prompts, max_new_tokens=args.max_new_tokens,
+                    )
                 r = run_config(configured_factory, b, n, prompts,
                                max_new_tokens=args.max_new_tokens,
                                profiler_dir=args.torch_profiler_dir,
@@ -671,10 +788,27 @@ def main() -> None:
                 if args.execution_trace_json is not None:
                     execution_trace_rows.append({
                         "routing_objective": objective,
+                        "staging_mode": staging_mode,
+                        "moe_reduction": (
+                            "atomic" if args.atomic_moe else "deterministic"
+                        ),
+                        "trace_detail": args.execution_trace_detail,
+                        "num_layers": cfg.num_layers,
+                        "num_experts": cfg.num_experts,
                         "budget": b,
                         "tree_size": n,
                         "num_prompts": args.num_prompts,
                         "max_new_tokens": args.max_new_tokens,
+                        "tpot_ms": r["tpot_ms"],
+                        "baseline_tpot_ms": (
+                            baseline["tpot_ms"] if baseline is not None else None
+                        ),
+                        "mean_accept_len": r["accept_len"],
+                        "generated_tokens": (
+                            baseline["generated_tokens"]
+                            if baseline is not None else r["generated_tokens"]
+                        ),
+                        "target_steps": r["target_steps"],
                         "trace": r["execution_trace"],
                         "profiler_artifacts": r["profiler_artifacts"],
                     })
@@ -690,7 +824,7 @@ def main() -> None:
                     f"{r['budget']:>3} {r['tree_size']:>5} {r['tpot_ms']:>10.2f} "
                     f"{r['accept_len']:>11.2f} {r['target_steps']:>6} "
                     f"{r['hit_rate']:>10.3f} {plan_hist:>18} "
-                    f"{r['planned_rows_per_step']:>8.1f} "
+                    f"{r['stage_rows_per_step']:>8.1f} "
                     f"{r['repair_rows_per_step']:>9.1f} "
                     f"{r['h2d_gib_per_token']:>10.2f} {r['cold']:>6}",
                     flush=True,
