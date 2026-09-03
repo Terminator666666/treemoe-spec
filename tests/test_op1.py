@@ -181,8 +181,9 @@ def test_fused_route_bucket_triton_matches_torch(n, budget):
     padded = torch.full((max_blocks * BM,), -2, dtype=torch.long, device="cuda")
     blk = torch.full((max_blocks,), -2, dtype=torch.long, device="cuda")
     s2r = torch.zeros(2 * n, dtype=torch.long, device="cuda")
+    demand = torch.zeros(e, dtype=torch.float32, device="cuda")
     _route_bucket_fused_kernel[(1,)](
-        x, router, accept, topk, gates, padded, blk, s2r,
+        x, router, accept, topk, gates, padded, blk, s2r, demand,
         budget, 0.05, N=n, E=e, EP=16, H=h, BK=128,
         MAX_BPE=(2 * n + BM - 1) // BM, BLOCK_M=BM, MAX_BLOCKS=max_blocks,
     )
@@ -191,6 +192,11 @@ def test_fused_route_bucket_triton_matches_torch(n, budget):
     assert torch.equal(padded, padded_t)
     assert torch.equal(blk, blk_t)
     assert torch.equal(s2r, s2r_t)
+    ref_demand = (
+        accept.float().unsqueeze(1)
+        * torch.softmax(torch.nn.functional.linear(x, router).float(), dim=-1)
+    ).sum(0)
+    torch.testing.assert_close(demand, ref_demand, rtol=1e-3, atol=1e-3)
 
 
 @pytest.mark.gpu

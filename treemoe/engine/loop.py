@@ -16,6 +16,7 @@ from dataclasses import dataclass
 import torch
 
 from treemoe.engine.tree import build_eagle2_tree
+from treemoe.engine.layer_budget import LayerBudgetAllocator
 from treemoe.kernels.op4_commit import fused_verify_commit
 from treemoe.model.mixtral import MixtralForward
 
@@ -39,6 +40,7 @@ class SpecDecodeEngine:
         max_depth: int = 6,
         expert_budget: int = 8,       # B=8 == lossless mode (spec §3.3)
         temperature: float = 0.0,
+        layer_budget_allocator: LayerBudgetAllocator | None = None,
     ):
         self.target = target
         self.draft = draft
@@ -46,7 +48,19 @@ class SpecDecodeEngine:
         self.max_depth = max_depth
         self.expert_budget = expert_budget
         self.temperature = temperature
+        self.layer_budget_allocator = layer_budget_allocator
         self.stats = GenerationStats()
+
+    def _configure_moe(self, budgets: torch.Tensor, observe_demand: bool) -> None:
+        fn = getattr(self.target, "moe_fn", None)
+        if fn is None:
+            return
+        fn.current_layer_budgets = budgets
+        fn.demand_observer = (
+            self.layer_budget_allocator.observe
+            if observe_demand and self.layer_budget_allocator is not None
+            else None
+        )
 
     @torch.inference_mode()
     def prefill(self, token_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -63,6 +77,17 @@ class SpecDecodeEngine:
             # prompt tokens are all real: acceptance prob 1 (op3 spec §3.3)
             fn.current_accept_prob = torch.ones(
                 token_ids.shape[0], device=token_ids.device)
+        self._configure_moe(
+            torch.full(
+                (self.target.cfg.num_layers,), self.target.cfg.num_experts,
+                dtype=torch.long,
+            ),
+            observe_demand=False,
+        )
+        pf = getattr(self.target, "prefetcher", None)
+        if self.layer_budget_allocator is not None and pf is not None \
+                and hasattr(pf, "set_budget_plan"):
+            pf.set_budget_plan(None)
         logits, hidden = self.target.forward(token_ids, positions, return_hidden=True)
         if hasattr(self.draft, "extend_committed") and token_ids.shape[0] > 1:
             self.draft.extend_committed(token_ids[1:], hidden[:-1], positions[1:])
@@ -82,11 +107,25 @@ class SpecDecodeEngine:
             device=last_token.device.type,
         )
 
-        # op2 draft-guided router hint (spec §3.2): the tree's draft features
-        # approximate the target's hidden trajectory, so each layer's own
-        # router predicts which experts the verification pass will stage.
+        allocator = self.layer_budget_allocator
+        if allocator is None:
+            layer_budgets = torch.full(
+                (self.target.cfg.num_layers,), self.expert_budget,
+                dtype=torch.long,
+            )
+        else:
+            layer_budgets = allocator.plan.budgets
+            allocator.record_plan_use()
+            allocator.start_observation()
+        self._configure_moe(layer_budgets, observe_demand=allocator is not None)
+
+        # Adaptive mode installs the previous target pass's joint budget/bitmap
+        # plan. The legacy draft-router hint remains only for old ablations.
         pf = getattr(self.target, "prefetcher", None)
-        if pf is not None and hasattr(pf, "router_hint"):
+        if allocator is not None and pf is not None \
+                and hasattr(pf, "set_budget_plan"):
+            pf.set_budget_plan(allocator.plan.prefetch_bitmap)
+        if allocator is None and pf is not None and hasattr(pf, "router_hint"):
             pf.router_hint(tree.features, self.expert_budget, tree.accept_prob)
 
         # op3 acceptance-weighted budget routing (spec §3.3): expose the tree's
@@ -102,6 +141,8 @@ class SpecDecodeEngine:
             tree.tokens.clamp(min=0), positions,
             tree_mask=tree.attn_mask, return_hidden=True,
         )
+        if allocator is not None:
+            allocator.finish_observation()
 
         draft_probs = torch.zeros_like(logits)  # greedy mode: unused by verifier
         res = fused_verify_commit(
@@ -148,6 +189,8 @@ class SpecDecodeEngine:
                  eos_token_id: int = 2) -> list[int]:
         self.target.kv.reset()
         self.draft.reset()  # before prefill: prefill seeds the draft's committed KV
+        if self.layer_budget_allocator is not None:
+            self.layer_budget_allocator.reset()
         logits, feature = self.prefill(prompt_ids)
         last = logits.argmax()
         out = [int(last)]

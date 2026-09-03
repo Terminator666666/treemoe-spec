@@ -7,7 +7,7 @@
 >
 > **Current Architecture**: Python draft/tree loop → tree-aware MoE 验证；专家 H2D 在侧流预取；
 > greedy verify/KV commit 使用 Triton，随后由主机读回接受结果并维护序列状态。
-> 论文将接受概率感知的树级专家预算，以及 EAGLE feature 引导的零训练预取与 offload 协同列为
+> 论文将接受概率感知的层内专家选择，以及全局传输约束下的层自适应专家预算列为
 > 两项核心贡献；MoE Triton kernel 和 GPU verify/KV commit 作为系统实现优化。
 >
 > **Tech Stack**: Python 3.12 + PyTorch + Triton + transformers + safetensors + pytest。实际硬件为
@@ -125,23 +125,32 @@ treemoe-spec/
 
 ---
 
-## Phase 4 — 核心贡献：零训练预取与 offload 协同（已实现，消融待补）
+## Phase 4 — 核心贡献：全局传输约束的层自适应预算（代码已实现，真机消融待补）
 
 ### Task 4.1 训练式跨层路由预测器（取消）
 - `RouterPredictor` 和 `measurements/train_predictor.py` 保留为实验原型；
 - 未采集 ShareGPT 训练集，未生成或加载 predictor checkpoint；
-- 最终方案使用上一轮真实专家集合，加上 EAGLE feature 直接运行目标 router 的 hint，全程无需训练。
+- EAGLE feature hint 已完成 pilot，但相对 temporal-only 只有 0.74% TPOT 差异且命中率相同，不再作为贡献。
 
 ### Task 4.2 可修复预取执行路径（已实现）
 - offload 配置使用 host pinned BF16 权重、深度缓冲和侧流 H2D；
 - `repair()` 在真实路由后补齐漏预测专家，因此预测错误不影响输出正确性；
-- 正式消融比较 hint+temporal、temporal-only 和 full-copy。
+- 累计报告 staged/repair expert rows 与真实字节，不能用表面 hit rate 代替传输成本。
+
+### Task 4.3 层自适应预算分配（已实现，4090 待测）
+- `treemoe/engine/layer_budget.py` 从上一轮完整 target router demand 构造 EMA；
+- 在 $2\le B_l\le8$、$\sum_lB_l=L B_{avg}$ 下按边际保留需求分配，输出预算和预取位图；
+- prefill 强制 B=8/full-copy，首轮 verification 使用 uniform/full-copy，prompt 间重置历史；
+- `bench_e2e.py --adaptive-layer-budget` 与 `--uniform-layer-budget` 在相同 $B_{avg}$ 下比较
+  TPOT、接受长度、质量及
+  staged/repair GiB；CPU 与 Triton interpreter 回归已覆盖，RTX 4090 实测待完成。
 
 ---
 
 ## Phase 5 — 论文实验与收尾（进行中）
 
-- RTX 4090 上完成 AR、B∈{2,3,4,5,6,8} 主实验、tree-size 和预取消融；
+- RTX 4090 上完成 AR、B∈{2,3,4,5,6,8} uniform 主实验、tree-size，以及固定总传输预算下的
+  adaptive-vs-uniform 消融；
 - 使用 MT-Bench 验证 B<8 质量，B=8 作为 lossless 对照；
 - 所有最终配置和结果维护在 `measurements/final_experiments.csv`。
 
@@ -155,5 +164,5 @@ treemoe-spec/
 | M1 | 正确的最小推测解码系统 | 3 周 |
 | M2 | 树级专家预算与支撑 MoE kernel 落地 | 7 周 |
 | M3 | greedy Triton verify/KV commit；CUDA Graph 取消 | 已完成（不含 Graph） |
-| M4 | 零训练预取接入，正式消融待测 | 进行中 |
+| M4 | 全局约束层预算与精确可修复预取接入，正式消融待测 | 进行中 |
 | M5 | 4090 论文实验齐全 | 进行中 |

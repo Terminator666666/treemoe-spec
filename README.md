@@ -2,6 +2,9 @@
 
 树感知 MoE 推测解码框架：Mixtral-8x7B-Instruct + EAGLE-2，专家权重原生 BF16。
 
+核心机制是接受概率感知的层内专家选择，以及固定全局 H2D expert-row 预算下的层自适应分配；
+缺失权重在 GEMM 前精确修复。系统不训练路由预测器，也未在生产路径使用 CUDA Graph。
+
 - 设计规格：[docs/specs/treemoe-spec-design.md](docs/specs/treemoe-spec-design.md)
 - 实施计划：[docs/plans/2026-08-18-treemoe-spec-implementation.md](docs/plans/2026-08-18-treemoe-spec-implementation.md)
 

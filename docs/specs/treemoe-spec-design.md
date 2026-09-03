@@ -1,8 +1,8 @@
-# TreeMoE-Spec 当前实现规格（v3）
+# TreeMoE-Spec 当前实现规格（v4）
 
 > 一个不依赖 vLLM/SGLang 的 MoE 推测解码原型，目标模型为 Mixtral-8x7B-Instruct，草稿模型使用
-> EAGLE-2 动态树。当前论文贡献收敛为两个已接入端到端路径的机制：接受概率感知的树级专家预算，
-> 以及 EAGLE feature 引导的零训练专家预取与 offload 协同。树感知 MoE 核、greedy 树验证和 KV
+> EAGLE-2 动态树。当前论文贡献收敛为两个已接入端到端路径的机制：接受概率感知的层内专家选择，
+> 以及全局传输约束下的层自适应专家预算。树感知 MoE 核、可修复权重流送、greedy 树验证和 KV
 > 提交是承载上述机制的系统实现优化，不作为独立算法创新。
 > 参考库：Tencent HPC-Ops、DeepSeek DeepGEMM、Databricks MegaBlocks、FlashInfer、vLLM fused_moe。
 
@@ -10,8 +10,9 @@
 
 | 模块 | 当前状态 | 论文口径 |
 |---|---|---|
-| 接受概率感知的树级专家预算 | 已内嵌路由核，B=8 可回到原始 top-2 | 核心贡献 |
-| EAGLE feature 引导的零训练预取与 offload 协同 | 已实现 temporal/history 合并，miss repair 保证 staged 权重正确 | 核心贡献 |
+| 接受概率感知的层内专家选择 | 已内嵌路由核，B=8 可回到原始 top-2 | 核心贡献 1 |
+| 全局传输约束下的层自适应专家预算 | 已实现在线分配、EMA、计划位图和传输计数；4090 对照实验待跑 | 核心贡献 2 |
+| EAGLE feature router hint | 已完成 pilot，但相对 temporal-only 仅改善 0.74% TPOT，且未改变聚合命中率 | 失败消融，不作为贡献 |
 | 树感知 expert-stationary MoE | 已实现并接入，承载预算后的专家分桶和计算 | 系统实现优化，不单列创新 |
 | greedy 树验证与 KV 提交 | 已实现 Triton 三核路径 | 系统实现优化 |
 | 训练式 `RouterPredictor` | 仅有实验类和训练脚本，未训练、未加载到运行时 | 不作为论文贡献或实验配置 |
@@ -66,7 +67,7 @@ EAGLE-2 树验证一次前向送入 N=64 个 token，**64 个 token 的 top-2 �
 |---|---|---|
 | Cascade (NVIDIA) | 发现 MoE 验证膨胀，动态调 K | 纯调度策略，无 kernel 创新 |
 | MoE-Spec | 验证期专家预算（drop 长尾） | 未与 kernel 融合；未用树结构概率 |
-| SP-MoE / MoE-SpeQ | 专家 offload 预取 | 本项目改用零训练 temporal history 与 EAGLE 特征直接跑目标 router |
+| SP-MoE / MoE-SpeQ | 专家 offload 预取 | 本项目联合决定各层预算与预取位图，并以同步 repair 保证权重读取正确 |
 | HPC-Ops | split-k decode GroupGEMM、fused sampler、Route GEMM | 无推测解码/树感知；Megakernel 在 roadmap 未实现 |
 | DeepGEMM | masked grouped GEMM（CUDA Graph 友好） | 面向通用 grouped GEMM；不负责本项目的树节点路由、预算与修复 |
 
@@ -77,11 +78,12 @@ EAGLE-2 树验证一次前向送入 N=64 个 token，**64 个 token 的 top-2 �
 ```text
 Python 控制循环
   EAGLE-2 分层扩展 + 动态树构建
-       ├── EAGLE features 直接运行各层 target router，形成预取 hint
-       └── tree tokens / mask / accept_prob
+    └── tree tokens / mask / accept_prob
                     ↓
+  上一轮目标路由需求 → EMA → 全局约束分配 {B_l, prefetch bitmap}
+        ↓
   目标模型 tree forward（主流） || 专家 H2D 预取（侧流）
-       attention + 树感知 MoE（内嵌预算路由与 miss repair）
+    attention + 接受概率感知 MoE（逐层 B_l，缺失权重同步 repair）
                     ↓
   Triton argmax → greedy 树验证 → KV commit
                     ↓
@@ -147,23 +149,43 @@ def tree_moe_forward(
 按权重字节估算的有效带宽和峰值利用率。安装 vLLM 时额外报告同一输入输出边界下的 `fused_moe`；
 当前环境没有完成 MegaBlocks、DeepGEMM 或 CUTLASS 的公平实测，不把它们列入最终结果表。
 
-### 3.2 核心贡献：EAGLE feature 引导的零训练专家预取与 offload 协同
+### 3.2 核心贡献：全局传输约束下的层自适应专家预算
 
-当前系统没有训练额外预测网络。预取位图来自两个无需训练的信号：
+统一的标量 B 默认假设 32 个 MoE 层具有相同的预算收益曲线。实际上一些层的需求集中在少数专家，继续增加
+预算收益很小；另一些层分布平坦，少一个专家就会丢掉较多接受概率质量。因此系统在固定总预取量下在线决定
+$B_l$，而不是给每层相同预算。
 
-1. **Temporal history**：复用上一轮 verification 中每层实际命中的专家集合；
-2. **EAGLE router hint**：将 EAGLE 树的 feature 直接输入目标模型各层已有的 router，按节点接受概率聚合
-   expert demand。该特征只是目标层 hidden state 的近似，因此 hint 只决定提前搬哪些权重，不参与最终路由。
+第 t 轮 verification 在预算裁剪前直接复用 Kernel A 已算出的完整需求，不增加 router GEMM：
 
-两种信号在每层最多保留 `max(B, |previous_set|)` 个专家，避免为提高表面命中率而搬运过多权重。
-host pinned 权重通过侧流复制到深度为 2 的 GPU 环形缓冲。目标层的真实路由完成后，`repair()` 检查
-缺失专家，并在 expert GEMM 前补拷贝。预测错误只损失性能，不会让 GEMM 读取陈旧权重。
+$$d^{(t)}_{l,e}=\sum_n p_{\mathrm{accept}}(n)g^{(t)}_{l,n,e},\qquad
+q^{(t)}_{l,e}=d^{(t)}_{l,e}/\sum_jd^{(t)}_{l,j}.$$
 
-`RouterPredictor` 类和 `measurements/train_predictor.py` 是早期实验原型，没有模型 checkpoint，也没有在
-`bench_e2e.py` 中加载。论文评估使用 staged expert 数、真实路由命中率、repair miss 和 TPOT，不报告
-训练预测器的 recall@2/recall@4。
+对 $q$ 做 EMA 后，将每层专家按需求降序记为 $q_{l,(1)}\ge\cdots\ge q_{l,(8)}$。给定平均预算
+$B_{avg}$ 和下界 $B_{min}=2$，分配器求解：
 
-### 3.3 核心贡献：接受概率感知的树级专家预算（内嵌于算子 1 Kernel A）
+$$\max_{B_1,\ldots,B_L}\sum_l\sum_{k=1}^{B_l}\bar q_{l,(k)},\quad
+B_{min}\le B_l\le8,\quad\sum_lB_l=L B_{avg}.$$
+
+实现先给每层 $B_{min}$，再按归一化边际收益 $\bar q_{l,(k)}$ 全局降序分配剩余 expert row。该离散问题
+具有前缀收益递减结构，因此贪心分配得到最优整数解，并且严格满足总计划传输量。上一轮需求形成第 t+1 轮
+的 `LayerBudgetPlan`：`budgets[l]` 控制本层接受概率感知路由，需求排名前 $B_l$ 的专家形成同一计划的
+prefetch bitmap。每次只需回传 $L\times E=256$ 个 FP32 数，即 1 KiB。
+
+**因果与边界规则**：当前层需求只有执行目标 router 后才真实可知，因此本轮不能用本轮所有层需求反过来
+决定自身预算。首个 verification 使用统一 $B_{avg}$ 且全量预取；之后使用上一轮计划。不同 prompt 之间
+重置 EMA。prompt prefill 始终使用 B=8 和全量权重，预算近似只作用于 verification。
+
+**精确流送**：计划预取量在稳态严格为 $\sum_lB_l=L B_{avg}$ 个 expert row。host pinned 权重在侧流送入
+深度为 2 的环形缓冲；若当前真实路由集合与上一轮计划不一致，`repair()` 在 expert GEMM 前同步补拷贝。
+因此实际 H2D 成本为“计划 staged bytes + repair bytes”，后者是优化是否有效的关键指标。repair 保证 GEMM
+不读取陈旧权重，但 B<8 的路由近似仍会改变模型 logits。
+
+旧 EAGLE feature hint 将同一个 draft final-like feature 输入 32 个 target 中间层 router，分布语义并不匹配；
+而且 temporal 集合已占满 B 时，temporal-first capped merge 不会改变 staged 集合。两 prompt pilot 中它相对
+temporal-only 只改善 0.74% TPOT，聚合命中率同为 0.650，因此降为失败消融。系统不训练预测器，也不使用
+CUDA Graph。
+
+### 3.3 核心贡献：接受概率感知的层内专家选择（内嵌于算子 1 Kernel A）
 
 逐层执行，输入本层真实 router 输出（非预测）：
 
@@ -177,7 +199,8 @@ host pinned 权重通过侧流复制到深度为 2 的 GPU 环形缓冲。目标
 4. 可选近似：$p_{\text{accept}}(n) < \tau$ 的节点退化为 top-1。正式主实验默认 $\tau=0$；
   $\tau=0.05$ 只作为消融，因为它会改变验证 logits，却不能减少已 staged 的 PCIe 字节。
 
-B 的选择：静态扫描 B∈{2,3,4,5,6,8}，得到接受长度、质量和 TPOT 的 Pareto 曲线。
+B 的选择：静态扫描统一 B∈{2,3,4,5,6,8} 得到基线 Pareto 曲线；自适应模式在相同
+$L B_{avg}$ 计划传输量下比较，不通过多搬专家换取质量或接受长度。
 
 **正确性红线**：预算路由改变了目标模型输出分布，严格的 speculative sampling 无损性不再成立。
 论文处理方式（与 MoE-Spec 相同）：报告下游任务分数（GSM8K/HumanEval/MT-Bench judge）证明无统计显著退化，
@@ -216,11 +239,14 @@ temperature>0 的 rejection sampling 仍走 PyTorch 参考实现，不属于当�
 2. 本框架 AR（无推测，隔离框架本身开销）；
 3. 本框架 + EAGLE-2，关闭预取位图并全量搬运专家（隔离预取收益）。
 
-**指标**：TPOT、每步接受长度 τ、端到端加速比、预取命中率、repair miss，以及 B<8 时的
+**指标**：TPOT、每步接受长度 τ、端到端加速比、每层预算分布、计划 staged rows/bytes、同步
+repair rows/bytes，以及 B<8 时的
 MT-Bench 质量分数。当前 AutoDL 容器没有 Nsight Compute 计数器权限，不把 `dram__bytes_read` 作为必填实测项。
 
-**消融**：B 扫描；树大小 16/32/64；默认 hint+temporal、temporal-only 与 full-copy 三种预取策略；
-top-1 阈值 0/0.05。项目不报告 CUDA Graph、训练预测器或量化消融。最终配置和待测结果统一维护在
+**消融**：在 $B_{avg}\in\{3,4,6\}$ 下比较 `--uniform-layer-budget` 与
+`--adaptive-layer-budget`，二者使用相同的 demand bitmap、首轮策略和 repair，且总计划预算完全相同；扫描
+EMA decay 和 $B_{min}$；树大小 16/32/64；full-copy 作为传输上界；top-1 阈值 0/0.05。旧 hint 结果只作为
+失败 pilot。项目不报告 CUDA Graph、训练预测器或量化消融。最终配置和待测结果统一维护在
 `measurements/final_experiments.csv`。
 
 **风险与回退**：
@@ -228,6 +254,6 @@ top-1 阈值 0/0.05。项目不报告 CUDA Graph、训练预测器或量化消�
 | 风险 | 概率 | 回退 |
 |---|---|---|
 | Kernel B split-k 在 M=16 仍打不满带宽 | 中 | 双专家/CTA 绑定（E=8→4 CTA 组）+ 增大 BK |
-| 零训练 hint 命中率不足 | 中 | `repair()` 保持正确性，并与 temporal-only/full-copy 做消融 |
+| 相邻 verification 的层需求漂移导致 repair 过多 | 中 | `repair()` 保证权重正确；报告额外字节并扫描 EMA，收益不足则回退 uniform |
 | 预算路由伤接受率（τ 掉 >15%） | 低 | τ 阈值分支降级关闭，只保留 top-B |
 | BF16 全模型超出 4090 显存 | 已发生 | 全部专家权重放在 host pinned memory，按层预取和修复 |

@@ -33,3 +33,11 @@ op1_n32,microbenchmark,synthetic,resident,op1,8,32,,,0,,,,,5,pending,,,,,,,,,,,,
 op1_n64,microbenchmark,synthetic,resident,op1,8,64,,,0,,,,,5,pending,,,,,,,,,,,,,,,,,
 op1_n128,microbenchmark,synthetic,resident,op1,8,128,,,0,,,,,5,pending,,,,,,,,,,,,,,,,,
 op2_transfer_overlap,microbenchmark,synthetic,offload,op2,,,,,0,2,,,,5,pending,,,,,,,,,,,,,,,,,Record pinned and pageable H2D bandwidth plus op1 slowdown under active prefetch
+layer_budget_uniform_b3,layer_budget_ablation,MT-Bench,offload,spec,3,64,20,128,0,2,true,false,0,3,pending,,,,,,,,,,,,,,,,,Strict fixed-transfer control via --uniform-layer-budget; prefill B=8; record staged and repair GiB from console
+layer_budget_adaptive_b3,layer_budget_ablation,MT-Bench,offload,spec,3,64,20,128,0,2,true,false,0,3,pending,,,,,,,,,,,,,,,,,Run --adaptive-layer-budget --layer-budget-min 2 --budget-ema-decay 0.8; same planned rows as paired uniform arm
+layer_budget_uniform_b4,layer_budget_ablation,MT-Bench,offload,spec,4,64,20,128,0,2,true,false,0,3,pending,,,,,,,,,,,,,,,,,Strict fixed-transfer control via --uniform-layer-budget; prefill B=8; record staged and repair GiB from console
+layer_budget_adaptive_b4,layer_budget_ablation,MT-Bench,offload,spec,4,64,20,128,0,2,true,false,0,3,pending,,,,,,,,,,,,,,,,,Run --adaptive-layer-budget --layer-budget-min 2 --budget-ema-decay 0.8; same planned rows as paired uniform arm
+layer_budget_uniform_b6,layer_budget_ablation,MT-Bench,offload,spec,6,64,20,128,0,2,true,false,0,3,pending,,,,,,,,,,,,,,,,,Strict fixed-transfer control via --uniform-layer-budget; prefill B=8; record staged and repair GiB from console
+layer_budget_adaptive_b6,layer_budget_ablation,MT-Bench,offload,spec,6,64,20,128,0,2,true,false,0,3,pending,,,,,,,,,,,,,,,,,Run --adaptive-layer-budget --layer-budget-min 2 --budget-ema-decay 0.8; same planned rows as paired uniform arm
+layer_budget_quality_uniform_b4,quality,MT-Bench,offload,spec,4,64,80,128,0,2,true,false,0,1,pending,,,,,,,,,MT-Bench judge,,,,,,,,Strict fixed-transfer quality control via --uniform-layer-budget
+layer_budget_quality_adaptive_b4,quality,MT-Bench,offload,spec,4,64,80,128,0,2,true,false,0,1,pending,,,,,,,,,MT-Bench judge,,,,,,,,Run --adaptive-layer-budget --layer-budget-min 2 --budget-ema-decay 0.8; compare with paired uniform quality arm

@@ -101,6 +101,47 @@ def test_reused_engine_resets_target_kv_between_prompts(engine_pair):
     assert reused_output == clean_output
 
 
+def test_adaptive_budget_engine_uses_full_prefill_then_observes_verification(
+        engine_pair):
+    import torch.nn.functional as F
+
+    from treemoe.engine.layer_budget import LayerBudgetAllocator
+
+    fresh, cfg = engine_pair
+    calls = []
+
+    def observed_moe(x, lw, layer_idx):
+        budgets = observed_moe.current_layer_budgets
+        calls.append((x.shape[0], layer_idx, int(budgets[layer_idx])))
+        observer = observed_moe.demand_observer
+        if observer is not None:
+            gates = torch.softmax(F.linear(x, lw.router).float(), dim=-1)
+            accept = observed_moe.current_accept_prob.float()
+            observer(layer_idx, (accept[:, None] * gates).sum(0))
+        return naive_moe(x, lw, layer_idx)
+
+    observed_moe.current_accept_prob = torch.ones(1)
+    target = fresh(moe_fn=observed_moe)
+    allocator = LayerBudgetAllocator(
+        cfg.num_layers, cfg.num_experts, average_budget=3,
+        min_budget=2, ema_decay=0.0,
+    )
+    engine = SpecDecodeEngine(
+        target, TinyDraft(cfg.vocab_size), tree_size=8, max_depth=3,
+        expert_budget=3, layer_budget_allocator=allocator,
+    )
+    prompt = torch.arange(5)
+    logits, feature = engine.prefill(prompt)
+    assert [budget for _, _, budget in calls] == [cfg.num_experts] * cfg.num_layers
+
+    calls.clear()
+    engine.step(logits.argmax(), feature)
+    assert [budget for _, _, budget in calls] == [3] * cfg.num_layers
+    assert allocator.budget_histogram[3] == cfg.num_layers
+    assert int(allocator.plan.budgets.sum()) == cfg.num_layers * 3
+    assert torch.equal(allocator.plan.prefetch_bitmap.sum(1), allocator.plan.budgets)
+
+
 def test_e2e_lossless_check_writes_matching_artifact(engine_pair, tmp_path):
     from benchmarks.bench_e2e import run_lossless_check
 

@@ -60,6 +60,22 @@ def run_config(engine_factory, budget: int, tree_size: int, prompts: list[torch.
         "accept_len": eng.stats.mean_accept_len,
         "hit_rate": float("nan"),
         "cold": getattr(pf, "cold_total", 0) if pf is not None else 0,
+        "staged_rows": getattr(pf, "staged_rows_total", 0) if pf is not None else 0,
+        "repair_rows": getattr(pf, "repair_rows_total", 0) if pf is not None else 0,
+        "staged_gib": (
+            getattr(pf, "staged_bytes_total", 0) / 2**30 if pf is not None else 0.0
+        ),
+        "repair_gib": (
+            getattr(pf, "repair_bytes_total", 0) / 2**30 if pf is not None else 0.0
+        ),
+        "layer_budgets": (
+            eng.layer_budget_allocator.plan.budgets.tolist()
+            if eng.layer_budget_allocator is not None else None
+        ),
+        "budget_histogram": (
+            eng.layer_budget_allocator.budget_histogram.tolist()
+            if eng.layer_budget_allocator is not None else None
+        ),
     }
     if pf is not None and pf.routed_total:
         r["hit_rate"] = 1.0 - pf.repair_misses / pf.routed_total
@@ -168,6 +184,17 @@ def main() -> None:
     ap.add_argument("--no-router-hint", action="store_true",
                     help="offload ablation: keep the temporal bitmap but disable "
                          "the draft-guided router hint")
+    budget_policy = ap.add_mutually_exclusive_group()
+    budget_policy.add_argument("--adaptive-layer-budget", action="store_true",
+                               help="reallocate per-layer budgets under a fixed "
+                                    "global expert-row budget")
+    budget_policy.add_argument("--uniform-layer-budget", action="store_true",
+                               help="strict control: fixed B per layer with the "
+                                    "same demand bitmap and repair machinery")
+    ap.add_argument("--layer-budget-min", type=int, default=2,
+                    help="minimum experts retained per layer in adaptive mode")
+    ap.add_argument("--budget-ema-decay", type=float, default=0.8,
+                    help="EMA decay for adaptive layer demand")
     ap.add_argument("--random-weights", action="store_true",
                     help="no checkpoint needed: random weights at real Mixtral "
                          "shapes. TPOT/hit_rate/streaming numbers are valid "
@@ -193,6 +220,7 @@ def main() -> None:
         ap.error("--check-lossless requires --top1-threshold 0")
 
     from treemoe.engine.loop import SpecDecodeEngine
+    from treemoe.engine.layer_budget import LayerBudgetAllocator
     from treemoe.kernels.op1_tree_moe import route_experts, tree_moe_forward
     from treemoe.kernels.op2_prefetch import LayerPrefetcher
     from treemoe.model.config import MixtralConfig
@@ -282,16 +310,22 @@ def main() -> None:
             accept = moe_fn.current_accept_prob
             if accept.shape[0] != x.shape[0]:
                 accept = torch.ones(x.shape[0], device=x.device)
-            routing = route_experts(x, lw.router, accept, _b,
+            layer_budgets = getattr(moe_fn, "current_layer_budgets", None)
+            layer_budget = (
+                int(layer_budgets[layer_idx]) if layer_budgets is not None else _b
+            )
+            routing = route_experts(x, lw.router, accept, layer_budget,
                                     inter=lw.w1.shape[1],
                                     top1_threshold=args.top1_threshold)
+            observer = getattr(moe_fn, "demand_observer", None)
+            if observer is not None:
+                observer(layer_idx, routing.demand)
             cold_x = []
             if pf is not None:
                 # exact-offload contract: one small D2H, then on-demand copies
                 # for mispredicted experts BEFORE the GEMMs read lw.w1/w2/w3
                 # (lw.* aliases the prefetcher's staged ring buffer here)
                 ids = routing.expert_ids()
-                pf.routed_total += len(ids)
                 staged = pf._staged_rows.get(layer_idx)
                 if args.cpu_expert_threshold > 0 and staged is not None:
                     counts = (routing.padded_slots.view(
@@ -308,9 +342,10 @@ def main() -> None:
                         for e, toks, gates in routing.exclude_experts(cold):
                             dev_toks = toks.to(x.device)
                             cold_x.append((e, dev_toks, gates, x[dev_toks].cpu()))
+                pf.routed_total += len(ids)
                 pf.repair(layer_idx, ids)
             out = tree_moe_forward(x, lw.w1, lw.w2, lw.w3, lw.router,
-                                   accept, _b, routing=routing)
+                                   accept, layer_budget, routing=routing)
             for e, dev_toks, gates, xc in cold_x:
                 hw = host_layers[layer_idx]
                 y = (F.silu(xc @ hw.w1[e].t()) * (xc @ hw.w3[e].t())) @ hw.w2[e].t()
@@ -325,9 +360,21 @@ def main() -> None:
         draft_kw = {} if args.random_weights else dict(rms_eps=1e-6, rope_theta=1e4)
         draft = EagleDraftModel(eagle_w, cfg, weights.embed_tokens, weights.lm_head,
                                 **draft_kw)
-        return SpecDecodeEngine(target, draft, tree_size=tree_size, expert_budget=budget), pf
+        allocator = None
+        if args.adaptive_layer_budget or args.uniform_layer_budget:
+            allocator = LayerBudgetAllocator(
+                cfg.num_layers, cfg.num_experts, average_budget=budget,
+                min_budget=args.layer_budget_min,
+                ema_decay=args.budget_ema_decay,
+                adaptive=args.adaptive_layer_budget,
+            )
+        return SpecDecodeEngine(
+            target, draft, tree_size=tree_size, expert_budget=budget,
+            layer_budget_allocator=allocator,
+        ), pf
 
-    print(f"{'B':>3} {'N':>5} {'TPOT(ms)':>10} {'accept_len':>11} {'hit_rate':>9} {'cold':>6}",
+    print(f"{'B':>3} {'N':>5} {'TPOT(ms)':>10} {'accept_len':>11} {'expert_hit':>10} "
+          f"{'budget_hist':>18} {'stageGiB':>10} {'repairGiB':>10} {'cold':>6}",
           flush=True)
     if args.check_lossless:
         run_lossless_check(
@@ -362,8 +409,18 @@ def main() -> None:
         for b in args.budgets:
             r = run_config(factory, b, n, prompts,
                            max_new_tokens=args.max_new_tokens)
+            histogram = r["budget_histogram"]
+            if histogram is None:
+                plan_hist = "-"
+            else:
+                plan_hist = "/".join(
+                    f"{budget}x{count}" for budget, count in enumerate(histogram)
+                    if count
+                )
             print(f"{r['budget']:>3} {r['tree_size']:>5} {r['tpot_ms']:>10.2f} "
-                  f"{r['accept_len']:>11.2f} {r['hit_rate']:>9.3f} {r['cold']:>6}", flush=True)
+                  f"{r['accept_len']:>11.2f} {r['hit_rate']:>9.3f} "
+                  f"{plan_hist:>18} {r['staged_gib']:>10.1f} "
+                  f"{r['repair_gib']:>10.1f} {r['cold']:>6}", flush=True)
 
 
 if __name__ == "__main__":

@@ -88,7 +88,7 @@ def _mixtral_specs() -> list[Spec]:
             "op1 Kernel A (fused route+bucket)", op1._route_bucket_fused_kernel,
             {"x_ptr": bf16, "router_ptr": bf16, "accept_ptr": f32,
              "topk_ids_ptr": i64, "gates_flat_ptr": f32, "padded_slots_ptr": i64,
-             "block_expert_ids_ptr": i64, "slot_to_row_ptr": i64,
+             "block_expert_ids_ptr": i64, "slot_to_row_ptr": i64, "demand_ptr": f32,
              "expert_budget": "i32", "tau": "fp32",
              "N": "constexpr", "E": "constexpr", "EP": "constexpr",
              "H": "constexpr", "BK": "constexpr", "MAX_BPE": "constexpr",

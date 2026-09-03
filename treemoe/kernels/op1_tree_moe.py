@@ -67,6 +67,7 @@ def route_and_bucket(
     expert_budget: int,
     block_m: int = BM,
     top1_threshold: float = 0.05,
+    return_demand: bool = False,
 ):
     """Returns (topk_ids, topk_gates, padded_slots, block_expert_ids, num_blocks_max).
 
@@ -109,7 +110,12 @@ def route_and_bucket(
     # deterministic combine kernel (fixed-order reduction, no atomics)
     slot_to_row = torch.empty(2 * n, dtype=torch.long, device=device)
     slot_to_row[order] = dest
-    return topk_ids, topk_gates, padded_slots, block_expert_ids, slot_to_row, max_blocks
+    result = (topk_ids, topk_gates, padded_slots, block_expert_ids,
+              slot_to_row, max_blocks)
+    if return_demand:
+        demand = (node_accept_prob.float().unsqueeze(1) * gates).sum(0)
+        return (*result, demand)
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -122,7 +128,7 @@ if HAS_TRITON:
     def _route_bucket_fused_kernel(
         x_ptr, router_ptr, accept_ptr,
         topk_ids_ptr, gates_flat_ptr, padded_slots_ptr,
-        block_expert_ids_ptr, slot_to_row_ptr,
+        block_expert_ids_ptr, slot_to_row_ptr, demand_ptr,
         expert_budget, tau,
         N: tl.constexpr, E: tl.constexpr, EP: tl.constexpr,   # EP = 16 (pow2 pad)
         H: tl.constexpr, BK: tl.constexpr,
@@ -164,6 +170,7 @@ if HAS_TRITON:
         accept = tl.load(accept_ptr + offs_n).to(tl.float32)  # [N]
         scores = tl.sum(accept[:, None] * gates, axis=0)      # [EP]
         scores = tl.where(e_valid, scores, -float("inf"))
+        tl.store(demand_ptr + offs_e, scores, mask=e_valid)
         keep = tl.zeros((EP,), dtype=tl.int1)
         for i in tl.static_range(E):                          # top-B, first-occurrence ties
             cand = tl.where(keep, -float("inf"), scores)
@@ -478,6 +485,7 @@ class _Workspace:
         self.padded_slots = torch.full((self.rows,), -1, dtype=torch.long, device=device)
         self.block_expert_ids = torch.full((max_blocks,), -1, dtype=torch.long, device=device)
         self.slot_to_row = torch.zeros(2 * n, dtype=torch.long, device=device)
+        self.demand = torch.zeros(e, dtype=torch.float32, device=device)
 
     def get_partial(self, hidden: int, device):
         if self.partial is None:
@@ -499,16 +507,17 @@ class Routing:
     repaired into an exact one (cf. DualDeadline 2026 / MoE-SpeQ 2025)."""
 
     __slots__ = ("ws", "gates_flat", "padded_slots", "block_expert_ids",
-                 "slot_to_row", "max_blocks")
+                 "slot_to_row", "max_blocks", "demand")
 
     def __init__(self, ws, gates_flat, padded_slots, block_expert_ids,
-                 slot_to_row, max_blocks):
+                 slot_to_row, max_blocks, demand):
         self.ws = ws
         self.gates_flat = gates_flat
         self.padded_slots = padded_slots
         self.block_expert_ids = block_expert_ids
         self.slot_to_row = slot_to_row
         self.max_blocks = max_blocks
+        self.demand = demand
 
     def expert_ids(self) -> list[int]:
         """Experts actually routed this layer. ONE small D2H sync
@@ -585,7 +594,7 @@ def route_experts(
         _route_bucket_fused_kernel[(1,)](
             x, router_weight, node_accept_prob,
             ws.topk_flat, ws.gates_flat, ws.padded_slots,
-            ws.block_expert_ids, ws.slot_to_row,
+            ws.block_expert_ids, ws.slot_to_row, ws.demand,
             expert_budget, top1_threshold,
             N=n, E=e, EP=16, H=hidden, BK=bk1,
             MAX_BPE=max_bpe, BLOCK_M=BM, MAX_BLOCKS=ws.max_blocks,
@@ -595,14 +604,17 @@ def route_experts(
             num_warps=32,
         )
         return Routing(ws, ws.gates_flat, ws.padded_slots,
-                       ws.block_expert_ids, ws.slot_to_row, ws.max_blocks)
-    _topk_ids, topk_gates, padded_slots, block_expert_ids, slot_to_row, max_blocks = route_and_bucket(
+                   ws.block_expert_ids, ws.slot_to_row, ws.max_blocks,
+                   ws.demand)
+    (_topk_ids, topk_gates, padded_slots, block_expert_ids,
+     slot_to_row, max_blocks, demand) = route_and_bucket(
         x, router_weight, node_accept_prob, expert_budget,
         top1_threshold=top1_threshold,
+        return_demand=True,
     )
     gates_flat = topk_gates.reshape(-1).float().contiguous()   # index by slot id
     return Routing(ws, gates_flat, padded_slots, block_expert_ids,
-                   slot_to_row, max_blocks)
+                   slot_to_row, max_blocks, demand)
 
 
 def tree_moe_forward(

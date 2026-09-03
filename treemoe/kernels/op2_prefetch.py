@@ -151,6 +151,10 @@ class LayerPrefetcher:
     Requires repair()-calling consumers (it both records usage and restores
     exactness on misses).
 
+    Adaptive budget mode uses set_budget_plan(): its bitmap takes precedence
+    over temporal/hint prediction. None then means an explicit full-copy
+    startup or prefill pass, rather than "no adaptive plan installed".
+
     On CPU tensors (tiny-config tests) copies degrade to synchronous — the
     buffer-cycling logic is identical and testable without a GPU.
     """
@@ -168,19 +172,46 @@ class LayerPrefetcher:
         self._buf_of: dict[int, int] = {}   # layer idx -> buffer slot (this pass)
         self._queue: list[int] = []         # offloaded layers not yet scheduled
         self._bitmap: torch.Tensor | None = None
+        self._budget_plan_bitmap: torch.Tensor | None = None
+        self._budget_plan_active = False
         self._staged_rows: dict[int, set[int] | None] = {}  # None = all rows
         self._used_prev: dict[int, set[int]] = {}  # repair() observations, last pass
         self._used_cur: dict[int, set[int]] = {}
         self.repair_misses = 0              # cumulative mispredicted experts
+        self.staged_rows_total = 0          # expert rows copied ahead of use
+        self.repair_rows_total = 0          # expert rows copied synchronously
+        if self.offload_ids:
+            first = self.layers[self.offload_ids[0]]
+            self.expert_row_bytes = sum(
+                getattr(first, name)[0].numel() * getattr(first, name).element_size()
+                for name in ("w1", "w2", "w3")
+            )
+        else:
+            self.expert_row_bytes = 0
         self._cuda = False
         self._stream = None
         self._ready: list[torch.cuda.Event] = []
         self._free: list[torch.cuda.Event] = []
 
+    @property
+    def staged_bytes_total(self) -> int:
+        return self.staged_rows_total * self.expert_row_bytes
+
+    @property
+    def repair_bytes_total(self) -> int:
+        return self.repair_rows_total * self.expert_row_bytes
+
     def set_bitmap(self, bitmap: torch.Tensor | None) -> None:
         """[L, E] bool, rows to copy per layer; None = all (lossless). Moved to
         CPU here (one sync), so per-layer scheduling stays sync-free."""
         self._bitmap = None if bitmap is None else bitmap.detach().to("cpu", torch.bool)
+
+    def set_budget_plan(self, bitmap: torch.Tensor | None) -> None:
+        """Set the previous target pass's globally allocated prefetch plan."""
+        self._budget_plan_active = True
+        self._budget_plan_bitmap = (
+            None if bitmap is None else bitmap.detach().to("cpu", torch.bool)
+        )
 
     def router_hint(self, features: torch.Tensor, budget: int,
                     accept_prob: torch.Tensor | None = None) -> None:
@@ -228,7 +259,9 @@ class LayerPrefetcher:
         if self._used_cur:
             self._used_prev = self._used_cur
         self._used_cur = {}
-        if self.auto_bitmap:
+        if self._budget_plan_active:
+            self.set_bitmap(self._budget_plan_bitmap)
+        elif self.auto_bitmap:
             num_experts = self.layers[self.offload_ids[0]].w1.shape[0]
             if self._hint is not None:
                 # capped merge of the two zero-training predictors. In the
@@ -268,6 +301,9 @@ class LayerPrefetcher:
         rows = (None if self._bitmap is None
                 else self._bitmap[layer_idx].nonzero().flatten().tolist())
         self._staged_rows[layer_idx] = None if rows is None else set(rows)
+        self.staged_rows_total += (
+            self.layers[layer_idx].w1.shape[0] if rows is None else len(rows)
+        )
 
         def copy_rows():
             for k in ("w1", "w2", "w3"):
@@ -316,6 +352,7 @@ class LayerPrefetcher:
                     dst[e].copy_(src[e], non_blocking=True)
             staged.update(missing)
             self.repair_misses += len(missing)
+            self.repair_rows_total += len(missing)
         return len(missing)
 
     def temporal_bitmap(self, num_experts: int) -> torch.Tensor | None:

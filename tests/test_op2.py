@@ -209,6 +209,43 @@ def test_layer_prefetcher_bitmap_copies_only_predicted_rows(rng):
     got = pf.acquire(1)                         # depth=1: same buffer, row-copy
     assert torch.equal(got["w1"][0], layers[1].w1[0])   # predicted row is fresh
     assert torch.equal(got["w1"][1], layers[0].w1[1])   # unpredicted row: stale
+    assert pf.staged_rows_total == 13           # pass 1: 8 full; pass 2: 4 + 1
+
+
+def test_layer_budget_plan_overrides_temporal_bitmap_and_counts_repair(rng):
+    from treemoe.model.weights import LayerWeights
+
+    num_experts, intermediate, hidden = 4, 6, 8
+
+    def layer():
+        return LayerWeights(
+            input_layernorm=torch.ones(hidden), post_attn_layernorm=torch.ones(hidden),
+            attn={}, router=torch.zeros(num_experts, hidden),
+            w1=torch.randn(num_experts, intermediate, hidden, generator=rng),
+            w2=torch.randn(num_experts, hidden, intermediate, generator=rng),
+            w3=torch.randn(num_experts, intermediate, hidden, generator=rng),
+            experts_on_gpu=False,
+        )
+
+    pf = LayerPrefetcher([layer(), layer()], depth=2, auto_bitmap=True)
+    plan = torch.tensor([
+        [True, True, False, False],
+        [True, True, True, False],
+    ])
+    pf.set_budget_plan(plan)
+    pf.begin()
+
+    assert pf._bitmap is not None and torch.equal(pf._bitmap, plan)
+    assert pf.staged_rows_total == 5
+    assert pf.staged_bytes_total == 5 * pf.expert_row_bytes
+    assert pf.repair(0, {0, 2, 3}) == 2
+    assert pf.repair_rows_total == 2
+    assert pf.repair_bytes_total == 2 * pf.expert_row_bytes
+
+    pf.set_budget_plan(None)                    # initial/prefill plan means full
+    pf.begin()
+    assert pf._bitmap is None
+    assert all(rows is None for rows in pf._staged_rows.values())
 
 
 def _repairing_moe_fn(pf):
