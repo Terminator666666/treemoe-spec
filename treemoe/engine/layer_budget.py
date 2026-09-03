@@ -104,6 +104,7 @@ class LayerBudgetAllocator:
         self._seen = torch.zeros(num_layers, dtype=torch.bool)
         self.budget_histogram = torch.zeros(num_experts + 1, dtype=torch.long)
         self.budget_trace: list[list[int]] = []
+        self.demand_trace: list[list[list[float]]] = []
 
     def reset(self) -> None:
         self.plan = LayerBudgetPlan(
@@ -142,6 +143,7 @@ class LayerBudgetAllocator:
             raise RuntimeError(f"missing router demand for layers {missing}")
         current = self._observed.cpu()
         current = current / current.sum(dim=1, keepdim=True).clamp_min(1e-12)
+        self.demand_trace.append(current.tolist())
         if self._ema_demand is None:
             self._ema_demand = current
         else:

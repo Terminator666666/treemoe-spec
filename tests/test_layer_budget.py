@@ -77,6 +77,8 @@ def test_allocator_builds_top_expert_bitmap_with_matching_row_counts():
     plan = allocator.finish_observation()
 
     assert torch.equal(plan.budgets, torch.tensor([2, 4]))
+    assert len(allocator.demand_trace) == 1
+    assert len(allocator.demand_trace[0]) == 2
     assert torch.equal(plan.prefetch_bitmap.sum(1), plan.budgets)
     assert torch.equal(plan.prefetch_bitmap[0], torch.tensor([True, True, False, False]))
     assert plan.prefetch_bitmap[1].all()

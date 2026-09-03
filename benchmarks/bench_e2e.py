@@ -60,6 +60,7 @@ def run_config(engine_factory, budget: int, tree_size: int, prompts: list[torch.
         eng.layer_budget_allocator.budget_histogram.tolist()
         if eng.layer_budget_allocator is not None else None
     )
+    allocator = eng.layer_budget_allocator
     planned_rows = (
         sum(budget * count for budget, count in enumerate(budget_histogram))
         if budget_histogram is not None else 0
@@ -86,9 +87,12 @@ def run_config(engine_factory, budget: int, tree_size: int, prompts: list[torch.
         ),
         "budget_histogram": budget_histogram,
         "budget_trace": (
-            eng.layer_budget_allocator.budget_trace
-            if eng.layer_budget_allocator is not None else None
+            allocator.budget_trace if allocator is not None else None
         ),
+        "demand_trace": (
+            allocator.demand_trace if allocator is not None else None
+        ),
+        "expert_trace": getattr(eng.target.moe_fn, "expert_trace", None),
     }
     if pf is not None and pf.routed_total:
         r["hit_rate"] = 1.0 - pf.repair_misses / pf.routed_total
@@ -349,6 +353,13 @@ def main() -> None:
                 # for mispredicted experts BEFORE the GEMMs read lw.w1/w2/w3
                 # (lw.* aliases the prefetcher's staged ring buffer here)
                 ids = routing.expert_ids()
+                if args.budget_trace_json is not None \
+                        and layer_budget < cfg.num_experts:
+                    if layer_idx == 0:
+                        moe_fn.expert_trace.append(
+                            [None for _ in range(cfg.num_layers)]
+                        )
+                    moe_fn.expert_trace[-1][layer_idx] = ids.copy()
                 staged = pf._staged_rows.get(layer_idx)
                 if args.cpu_expert_threshold > 0 and staged is not None:
                     counts = (routing.padded_slots.view(
@@ -377,6 +388,7 @@ def main() -> None:
             return out
 
         moe_fn.current_accept_prob = torch.ones(tree_size, device="cuda")
+        moe_fn.expert_trace = []
         target = MixtralForward(weights, kv, moe_fn=moe_fn, prefetcher=pf)
         # real EAGLE checkpoint facts (official config.json): rms_norm_eps=1e-6,
         # no rope_theta field -> Llama-default 10000 (target uses 1e-5 / 1e6)
@@ -443,6 +455,8 @@ def main() -> None:
                     "target_steps": r["target_steps"],
                     "mean_accept_len": r["accept_len"],
                     "budget_trace": r["budget_trace"],
+                    "demand_trace": r["demand_trace"],
+                    "expert_trace": r["expert_trace"],
                 })
             histogram = r["budget_histogram"]
             if histogram is None:
