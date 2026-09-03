@@ -53,29 +53,38 @@ def run_config(engine_factory, budget: int, tree_size: int, prompts: list[torch.
               file=sys.stderr, flush=True)
     torch.cuda.synchronize()
     wall = time.perf_counter() - t0
+    target_steps = eng.stats.steps
+    staged_rows = getattr(pf, "staged_rows_total", 0) if pf is not None else 0
+    repair_rows = getattr(pf, "repair_rows_total", 0) if pf is not None else 0
+    budget_histogram = (
+        eng.layer_budget_allocator.budget_histogram.tolist()
+        if eng.layer_budget_allocator is not None else None
+    )
+    planned_rows = (
+        sum(budget * count for budget, count in enumerate(budget_histogram))
+        if budget_histogram is not None else 0
+    )
+    row_gib = getattr(pf, "expert_row_bytes", 0) / 2**30 if pf is not None else 0.0
     r = {
         "budget": budget,
         "tree_size": tree_size,
         "tpot_ms": wall / total_tokens * 1e3,
         "accept_len": eng.stats.mean_accept_len,
+        "target_steps": target_steps,
         "hit_rate": float("nan"),
         "cold": getattr(pf, "cold_total", 0) if pf is not None else 0,
-        "staged_rows": getattr(pf, "staged_rows_total", 0) if pf is not None else 0,
-        "repair_rows": getattr(pf, "repair_rows_total", 0) if pf is not None else 0,
-        "staged_gib": (
-            getattr(pf, "staged_bytes_total", 0) / 2**30 if pf is not None else 0.0
-        ),
-        "repair_gib": (
-            getattr(pf, "repair_bytes_total", 0) / 2**30 if pf is not None else 0.0
-        ),
+        "staged_rows": staged_rows,
+        "repair_rows": repair_rows,
+        "staged_gib": staged_rows * row_gib,
+        "repair_gib": repair_rows * row_gib,
+        "planned_rows_per_step": planned_rows / max(target_steps, 1),
+        "repair_rows_per_step": repair_rows / max(target_steps, 1),
+        "h2d_gib_per_token": (staged_rows + repair_rows) * row_gib / total_tokens,
         "layer_budgets": (
             eng.layer_budget_allocator.plan.budgets.tolist()
             if eng.layer_budget_allocator is not None else None
         ),
-        "budget_histogram": (
-            eng.layer_budget_allocator.budget_histogram.tolist()
-            if eng.layer_budget_allocator is not None else None
-        ),
+        "budget_histogram": budget_histogram,
     }
     if pf is not None and pf.routed_total:
         r["hit_rate"] = 1.0 - pf.repair_misses / pf.routed_total
@@ -373,8 +382,9 @@ def main() -> None:
             layer_budget_allocator=allocator,
         ), pf
 
-    print(f"{'B':>3} {'N':>5} {'TPOT(ms)':>10} {'accept_len':>11} {'expert_hit':>10} "
-          f"{'budget_hist':>18} {'stageGiB':>10} {'repairGiB':>10} {'cold':>6}",
+        print(f"{'B':>3} {'N':>5} {'TPOT(ms)':>10} {'accept_len':>11} {'steps':>6} "
+            f"{'expert_hit':>10} {'budget_hist':>18} {'planR/s':>8} "
+            f"{'repairR/s':>9} {'H2DGiB/tok':>10} {'cold':>6}",
           flush=True)
     if args.check_lossless:
         run_lossless_check(
@@ -418,9 +428,11 @@ def main() -> None:
                     if count
                 )
             print(f"{r['budget']:>3} {r['tree_size']:>5} {r['tpot_ms']:>10.2f} "
-                  f"{r['accept_len']:>11.2f} {r['hit_rate']:>9.3f} "
-                  f"{plan_hist:>18} {r['staged_gib']:>10.1f} "
-                  f"{r['repair_gib']:>10.1f} {r['cold']:>6}", flush=True)
+                f"{r['accept_len']:>11.2f} {r['target_steps']:>6} "
+                f"{r['hit_rate']:>10.3f} {plan_hist:>18} "
+                f"{r['planned_rows_per_step']:>8.1f} "
+                f"{r['repair_rows_per_step']:>9.1f} "
+                f"{r['h2d_gib_per_token']:>10.2f} {r['cold']:>6}", flush=True)
 
 
 if __name__ == "__main__":

@@ -241,8 +241,10 @@ temperature>0 的 rejection sampling 仍走 PyTorch 参考实现，不属于当�
 2. 本框架 AR（无推测，隔离框架本身开销）；
 3. 本框架 + EAGLE-2，关闭预取位图并全量搬运专家（隔离预取收益）。
 
-**指标**：TPOT、每步接受长度 τ、端到端加速比、每层预算分布、计划 staged rows/bytes、同步
-repair rows/bytes，以及 B<8 时的
+**指标**：TPOT、每步接受长度 τ、target verification 次数、端到端加速比、每层预算分布、每个
+verification 的计划 rows、每步 repair rows，以及包含 prefill/首轮 full-copy 的总 H2D GiB/token。
+总 staged GiB 会随接受长度导致的 verification 次数变化，不能单独用来判断固定全局预算是否成立。
+另外报告 B<8 时的
 MT-Bench 质量分数。当前 AutoDL 容器没有 Nsight Compute 计数器权限，不把 `dram__bytes_read` 作为必填实测项。
 
 **消融**：在 $B_{avg}\in\{3,4,6\}$ 下比较 `--uniform-layer-budget` 与
