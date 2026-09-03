@@ -18,12 +18,15 @@ def allocate_layer_budgets(
     total_budget: int,
     min_budget: int = 2,
     max_budget: int | None = None,
+    objective: str = "log_mass",
 ) -> torch.Tensor:
-    """Maximize retained demand under an exact global expert-row budget.
+    """Allocate an exact global expert-row budget by marginal utility.
 
     Each layer first receives ``min_budget`` experts. Remaining rows are
-    assigned by descending marginal retained demand. Inputs and outputs live
-    on CPU because the result is consumed as Python launch-time integers.
+    assigned by descending marginal utility. ``log_mass`` maximizes the
+    product of per-layer retained router mass, while ``mass`` retains the
+    original additive objective for ablation. Inputs and outputs live on CPU
+    because the result is consumed as Python launch-time integers.
     """
     if demand.ndim != 2:
         raise ValueError(f"demand must be [layers, experts], got {tuple(demand.shape)}")
@@ -39,17 +42,25 @@ def allocate_layer_budgets(
         )
     if not torch.isfinite(demand).all() or (demand < 0).any():
         raise ValueError("demand must be finite and non-negative")
+    if objective not in {"mass", "log_mass"}:
+        raise ValueError("objective must be 'mass' or 'log_mass'")
 
     scores = demand.detach().float().cpu()
     scores = scores / scores.sum(dim=1, keepdim=True).clamp_min(1e-12)
     sorted_scores = scores.sort(dim=1, descending=True, stable=True).values
+    retained = sorted_scores.cumsum(dim=1)
     budgets = torch.full((num_layers,), min_budget, dtype=torch.long)
     remaining = total_budget - minimum_total
-    candidates = [
-        (-float(sorted_scores[layer, rank]), layer, rank)
-        for layer in range(num_layers)
-        for rank in range(min_budget, upper)
-    ]
+    candidates = []
+    for layer in range(num_layers):
+        for rank in range(min_budget, upper):
+            if objective == "mass":
+                utility = float(sorted_scores[layer, rank])
+            else:
+                before = retained[layer, rank - 1].clamp_min(1e-12)
+                after = retained[layer, rank].clamp_min(1e-12)
+                utility = float(torch.log(after) - torch.log(before))
+            candidates.append((-utility, layer, rank))
     candidates.sort()
     for _, layer, _ in candidates[:remaining]:
         budgets[layer] += 1
@@ -68,6 +79,7 @@ class LayerBudgetAllocator:
         max_budget: int | None = None,
         ema_decay: float = 0.8,
         adaptive: bool = True,
+        objective: str = "log_mass",
     ) -> None:
         upper = num_experts if max_budget is None else max_budget
         if not min_budget <= average_budget <= upper <= num_experts:
@@ -84,6 +96,7 @@ class LayerBudgetAllocator:
         self.max_budget = upper
         self.ema_decay = ema_decay
         self.adaptive = adaptive
+        self.objective = objective
         initial = torch.full((num_layers,), average_budget, dtype=torch.long)
         self.plan = LayerBudgetPlan(initial, None)
         self._ema_demand: torch.Tensor | None = None
@@ -139,6 +152,7 @@ class LayerBudgetAllocator:
                 self.total_budget,
                 min_budget=self.min_budget,
                 max_budget=self.max_budget,
+                objective=self.objective,
             )
         else:
             budgets = torch.full(

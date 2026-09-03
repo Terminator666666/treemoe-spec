@@ -207,6 +207,10 @@ def main() -> None:
                          "(default: all experts)")
     ap.add_argument("--budget-ema-decay", type=float, default=0.8,
                     help="EMA decay for adaptive layer demand")
+    ap.add_argument("--layer-budget-objective", choices=["log_mass", "mass"],
+                    default="log_mass",
+                    help="global allocation utility; log_mass protects "
+                         "multiplicative fidelity, mass is the additive ablation")
     ap.add_argument("--random-weights", action="store_true",
                     help="no checkpoint needed: random weights at real Mixtral "
                          "shapes. TPOT/hit_rate/streaming numbers are valid "
@@ -380,6 +384,7 @@ def main() -> None:
                 max_budget=args.layer_budget_max,
                 ema_decay=args.budget_ema_decay,
                 adaptive=args.adaptive_layer_budget,
+                objective=args.layer_budget_objective,
             )
         return SpecDecodeEngine(
             target, draft, tree_size=tree_size, expert_budget=budget,

@@ -26,6 +26,32 @@ def test_allocate_layer_budgets_is_scale_invariant_and_deterministic():
     )
 
 
+def test_log_mass_protects_multiplicative_layer_fidelity():
+    demand = torch.tensor([
+        [0.50, 0.30, 0.18, 0.02, 0.00],
+        [0.26, 0.25, 0.17, 0.16, 0.16],
+    ])
+    additive = allocate_layer_budgets(
+        demand, total_budget=5, min_budget=2, objective="mass",
+    )
+    multiplicative = allocate_layer_budgets(
+        demand, total_budget=5, min_budget=2, objective="log_mass",
+    )
+
+    assert torch.equal(additive, torch.tensor([3, 2]))
+    assert torch.equal(multiplicative, torch.tensor([2, 3]))
+    normalized = demand / demand.sum(1, keepdim=True)
+    order = normalized.argsort(dim=1, descending=True)
+
+    def retained_product(budgets):
+        values = []
+        for layer, budget in enumerate(budgets.tolist()):
+            values.append(normalized[layer, order[layer, :budget]].sum())
+        return torch.stack(values).prod()
+
+    assert retained_product(multiplicative) > retained_product(additive)
+
+
 @pytest.mark.parametrize("total", [3, 9])
 def test_allocate_layer_budgets_rejects_infeasible_total(total):
     with pytest.raises(ValueError, match="total_budget"):
@@ -112,6 +138,11 @@ def test_allocator_trust_region_preserves_exact_global_budget():
 def test_allocator_rejects_infeasible_trust_region():
     with pytest.raises(ValueError, match="min_budget <= average_budget"):
         LayerBudgetAllocator(4, 8, average_budget=4, min_budget=3, max_budget=3)
+
+
+def test_allocator_rejects_unknown_objective():
+    with pytest.raises(ValueError, match="objective"):
+        allocate_layer_budgets(torch.ones(2, 4), 6, objective="unknown")
 
 
 def test_marginal_greedy_matches_exhaustive_prefix_optimum():

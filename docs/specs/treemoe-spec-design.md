@@ -165,10 +165,13 @@ q^{(t)}_{l,e}=d^{(t)}_{l,e}/\sum_jd^{(t)}_{l,j}.$$
 对 $q$ 做 EMA 后，将每层专家按需求降序记为 $q_{l,(1)}\ge\cdots\ge q_{l,(8)}$。给定平均预算
 $B_{avg}$ 和信赖域 $[B_{min},B_{max}]$，分配器求解：
 
-$$\max_{B_1,\ldots,B_L}\sum_l\sum_{k=1}^{B_l}\bar q_{l,(k)},\quad
+$$\max_{B_1,\ldots,B_L}\sum_l\log\left(\sum_{k=1}^{B_l}\bar q_{l,(k)}\right),\quad
 B_{min}\le B_l\le B_{max},\quad\sum_lB_l=L B_{avg}.$$
 
-实现先给每层 $B_{min}$，再按归一化边际收益 $\bar q_{l,(k)}$ 全局降序分配剩余 expert row。默认
+该目标等价于最大化各层 retained router mass 的乘积，避免线性总质量允许“一层严重受损、另一层过量补偿”
+这一不符合串行网络误差传播的行为。实现先给每层 $B_{min}$，再按对数边际收益
+$\log(R_l+q)-\log R_l$ 全局降序分配剩余 expert row；边际收益单调递减，因此贪心仍得到精确整数解。
+旧线性 mass 目标通过 `--layer-budget-objective mass` 保留为失败消融。默认
 $B_{max}=8$；保守配置可限制 $B_l\in[B_{avg}-1,B_{avg}+1]$，避免少数层过度增配并迫使大量层降至
 低预算。该离散问题
 具有前缀收益递减结构，因此贪心分配得到最优整数解，并且严格满足总计划传输量。上一轮需求形成第 t+1 轮

@@ -139,8 +139,8 @@ treemoe-spec/
 
 ### Task 4.3 层自适应预算分配（已实现，4090 待测）
 - `treemoe/engine/layer_budget.py` 从上一轮完整 target router demand 构造 EMA；
-- 在可配置信赖域 $B_{min}\le B_l\le B_{max}$、$\sum_lB_l=L B_{avg}$ 下按边际保留需求分配，
-  输出预算和预取位图；
+- 在可配置信赖域 $B_{min}\le B_l\le B_{max}$、$\sum_lB_l=L B_{avg}$ 下最大化各层 retained mass
+  的乘积，按对数边际收益分配并输出预算和预取位图；线性 mass 目标只保留为消融；
 - prefill 强制 B=8/full-copy，首轮 verification 使用 uniform/full-copy，prompt 间重置历史；
 - `bench_e2e.py --adaptive-layer-budget` 与 `--uniform-layer-budget` 在相同 $B_{avg}$ 下比较
   TPOT、接受长度、质量及
