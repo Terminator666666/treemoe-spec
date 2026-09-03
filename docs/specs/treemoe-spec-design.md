@@ -162,8 +162,9 @@ def tree_moe_forward(
 lossless red-line 同时使用。论文分别报告两条路径，不把尚未实现的持久化巨核列为贡献。
 
 **验收基准**：`benchmarks/bench_op1.py` 测 N∈{32,64,128} 的确定性与 atomic 路径，报告时延、
-active block/cap、按 active block 权重重读估算的有效带宽和峰值利用率。安装 vLLM 时额外报告同一输入输出
-边界下的 `fused_moe`；
+active expert/block/cap、每个活跃专家读一次的权重流量估计，以及按 active block 统计的逻辑 load 流量。
+后者包含可命中 L2 的重复加载，因此不得解释为 DRAM 带宽或峰值利用率；物理 HBM bytes 以 Nsight Compute
+计数器为准。安装 vLLM 时额外报告同一输入输出边界下的 `fused_moe`；
 当前环境没有完成 MegaBlocks、DeepGEMM 或 CUTLASS 的公平实测，不把它们列入最终结果表。
 
 ### 3.2 候选贡献：渐进式精确 target tree verification

@@ -147,8 +147,9 @@ def main() -> None:
     router = torch.randn(E, H, device="cuda", dtype=torch.bfloat16, generator=g) * 0.1
 
     print(
-        f"{'N':>5} {'blocks':>7} {'grid':>4} {'cap':>4} {'det(us)':>10} "
-        f"{'atomic(us)':>11} {'GB/s':>8} {'util':>6} "
+        f"{'N':>5} {'blocks':>7} {'experts':>7} {'grid':>4} {'cap':>4} "
+        f"{'det(us)':>10} {'atomic(us)':>11} {'uniqGB/s':>9} {'uniq%':>6} "
+        f"{'loadGB/s':>9} "
         f"{'vllm(us)':>10} {'ratio':>7}"
     )
     for n in args.tree_sizes:
@@ -167,18 +168,20 @@ def main() -> None:
         active_blocks = int((
             routing.block_expert_ids[:routing.launch_blocks] >= 0
         ).sum())
-        # Every BM-row block is a separate CTA group and streams its expert's
-        # weights once. Skewed experts spanning multiple blocks therefore
-        # reread weights; count blocks, not unique experts.
+        active_experts = len(routing.expert_ids())
+        # uniqGB/s estimates compulsory weight traffic if each active expert
+        # is fetched once. loadGB/s counts every block's logical load; repeated
+        # blocks of one expert can hit L2, so this value may exceed HBM peak.
         expert_bytes = (w1.nbytes + w2.nbytes + w3.nbytes) / E
-        byts = active_blocks * expert_bytes
-        gbs = byts / (t_ours * 1e-6) / 1e9
-        util = f"{gbs / peak:5.0%}" if peak else "   n/a"
+        unique_gbs = active_experts * expert_bytes / (t_ours * 1e-6) / 1e9
+        logical_gbs = active_blocks * expert_bytes / (t_ours * 1e-6) / 1e9
+        unique_util = f"{unique_gbs / peak:5.0%}" if peak else "   n/a"
         ratio = f"{t_ours / t_vllm:.2f}" if t_vllm else "n/a"
         result = (
-            f"{n:>5} {active_blocks:>7} {routing.launch_blocks:>4} "
-            f"{routing.max_blocks:>4} {t_det:>10.1f} {t_ours:>11.1f} "
-            f"{gbs:>8.0f} {util:>6} "
+            f"{n:>5} {active_blocks:>7} {active_experts:>7} "
+            f"{routing.launch_blocks:>4} {routing.max_blocks:>4} "
+            f"{t_det:>10.1f} {t_ours:>11.1f} "
+            f"{unique_gbs:>9.0f} {unique_util:>6} {logical_gbs:>9.0f} "
             f"{t_vllm or float('nan'):>10.1f} {ratio:>7}"
         )
         print(result)
@@ -187,6 +190,8 @@ def main() -> None:
         if n == 64 and t_vllm:
             gate = t_ours <= 0.8 * t_vllm
             print(f"  gate(N=64, <=0.8x vLLM): {'PASS' if gate else 'FAIL (check dram bytes)'}")
+        print("traffic: uniqGB/s reads each active expert once; loadGB/s counts per-block "
+                    "loads and includes cache reuse. Use Nsight Compute for measured DRAM.")
     print(bench_megablocks_note())
 
 
