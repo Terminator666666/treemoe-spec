@@ -50,8 +50,12 @@ def main() -> None:
     ap.add_argument("--n", type=int, default=64)
     ap.add_argument("--budget", type=int, default=8)
     ap.add_argument("--iters", type=int, default=30)
+    ap.add_argument("--confirm-gemm1", action="store_true",
+                    help="interleave the default with BK1=128 finalists")
     args = ap.parse_args()
     assert torch.cuda.is_available()
+    if args.confirm_gemm1 and args.gemm != 1:
+        ap.error("--confirm-gemm1 requires --gemm 1")
 
     from treemoe.kernels import op1_tree_moe as op1
     from treemoe.ref.tree_moe_ref import tree_moe_forward_ref
@@ -99,6 +103,71 @@ def main() -> None:
         med = statistics.median(times)
         cv = statistics.pstdev(times) / med if med else 0.0
         return med, cv
+
+    if args.confirm_gemm1:
+        finalists = [
+            ("default", dict(defaults)),
+            ("bk128", {**defaults, "BK1": 128}),
+            ("bn32_bk128", {**defaults, "BN1": 32, "BK1": 128}),
+            ("sweep_best", {
+                "BN1": 32, "BK1": 128,
+                "GEMM1_WARPS": 4, "GEMM1_STAGES": 4,
+            }),
+        ]
+
+        def forward(cfg):
+            for key, value in cfg.items():
+                setattr(op1, key, value)
+            return op1.tree_moe_forward(
+                x, w1, w2, w3, router, accept, args.budget,
+                deterministic=False,
+            )
+
+        for _, cfg in finalists:
+            for _ in range(5):
+                out = forward(cfg)
+            err = (out.float() - ref).abs().max().item()
+            if err > err_tol:
+                raise ValueError(f"wrong result, max|d|={err:.3f}")
+        torch.cuda.synchronize()
+
+        samples = {label: [] for label, _ in finalists}
+        for rep in range(args.iters):
+            offset = rep % len(finalists)
+            order = finalists[offset:] + finalists[:offset]
+            for label, cfg in order:
+                t0 = torch.cuda.Event(enable_timing=True)
+                t1 = torch.cuda.Event(enable_timing=True)
+                t0.record()
+                forward(cfg)
+                t1.record()
+                t1.synchronize()
+                samples[label].append(t0.elapsed_time(t1) * 1e3)
+
+        for key, value in defaults.items():
+            setattr(op1, key, value)
+        op1._ws_cache.clear()
+
+        base_samples = samples["default"]
+        print(f"device: {torch.cuda.get_device_name(0)}  confirming gemm1 "
+              f"(N={args.n}, budget={args.budget}, paired rounds={args.iters})")
+        print(f"{'candidate':>16} {'median(us)':>12} {'cv':>7} "
+              f"{'paired':>9} {'margin':>9} {'verdict':>10}")
+        for label, _ in finalists:
+            values = samples[label]
+            median = statistics.median(values)
+            cv = statistics.pstdev(values) / median if median else 0.0
+            if label == "default":
+                print(f"{label:>16} {median:>12.1f} {cv:>7.1%}")
+                continue
+            ratios = [base / candidate for base, candidate in zip(base_samples, values)]
+            speedup = statistics.median(ratios)
+            ratio_cv = statistics.pstdev(ratios) / speedup if speedup else 0.0
+            margin = 1 + max(EPS, K_CV * ratio_cv)
+            verdict = "COMMIT" if speedup >= margin else "KEEP"
+            print(f"{label:>16} {median:>12.1f} {cv:>7.1%} "
+                  f"{speedup:>8.3f}x {margin:>8.3f}x {verdict:>10}")
+        return
 
     print(f"device: {torch.cuda.get_device_name(0)}  sweeping gemm{args.gemm} "
           f"(N={args.n}, budget={args.budget}, atomic path)")
