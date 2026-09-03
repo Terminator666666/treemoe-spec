@@ -39,7 +39,8 @@ def make_inputs(n: int):
     w3 = torch.randn(E, I, H, device="cuda", dtype=torch.bfloat16, generator=g) * 0.02
     router = torch.randn(E, H, device="cuda", dtype=torch.bfloat16, generator=g) * 0.1
     x = torch.randn(n, H, device="cuda", dtype=torch.bfloat16, generator=g)
-    accept = torch.rand(n, device="cuda", generator=g)
+    # Match bench_op1's B=8 lossless gate: no low-probability top-1 degradation.
+    accept = torch.ones(n, device="cuda")
     return x, w1, w2, w3, router, accept
 
 

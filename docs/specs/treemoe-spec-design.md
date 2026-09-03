@@ -147,10 +147,11 @@ def tree_moe_forward(
   `arange`。buffer capacity 与 GEMM launch 上界分别保存：N=64、BM=16 时 B2/B4/B8 的 launch 上界为
   9/11/15，B8 buffer capacity 为 16；相对旧实现的 64 个 block-row，h workspace 从 1024 行降到
   256 行，deterministic partial 同比例缩小；
-- `bench_op1.py --block-m 32` 提供进程隔离的 BM32 候选消融。N=64、B8 时 logical launch 上界从 15
-  降至 11，均衡路由的 active block 可从约 13 降至 8，以增加 masked rows 为代价减少 w1/w3 重复加载。
-  BM32 使用 16 warps；sm90a 静态检查中 GEMM1/GEMM2 均为 25% occupancy、0 spill，且 Triton
-  interpreter parity 通过。该配置必须通过 4090 实测后才能替代 BM16 默认值；
+- `bench_op1.py --block-m 32` 保留为负消融。N=64、B8 真机上 active block 从 13 降至 8，但
+  atomic 总时延从 3065.8 μs 恶化至 3119.8 μs（+1.8%），GEMM1 从 2034 μs 恶化至 2078 μs。
+  BM32 使用 16 warps，sm90a 静态检查为 25% occupancy、0 spill，故退化不是 spill 所致；结果表明
+  BM16 重复 block 的权重 load 已由 L2/并发复用，减少 logical load 并未减少 compulsory DRAM bytes。
+  默认保持 BM16；
 - GEMM2 采用 `SPLIT_K=2`。**split-k 是小 M 场景的占用率关键**：M_e≈16 时仅按 token 维切分会产生
   太少 CTA；partial 结果用轻量 combine kernel 归约；
 - **专家驻留（weight-stationary）**：每个 CTA 绑定一个专家，w1/w3/w2 以 BF16 packed load 流式读取，
